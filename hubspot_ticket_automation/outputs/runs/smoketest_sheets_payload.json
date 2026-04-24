@@ -1,0 +1,56 @@
+{
+  "run_id": "smoketest-001",
+  "kpi": {
+    "run_id": "smoketest-001",
+    "run_started_at_utc": "2026-04-23T18:35:00Z",
+    "last_run_at_used": "2026-04-23T15:05:34.562Z",
+    "run_mode": "dry_run",
+    "tickets_matched": 2,
+    "tickets_processed": 2,
+    "tickets_skipped_dedupe": 0,
+    "tickets_skipped_error": 0,
+    "notes_posted": 0,
+    "urgent_emails_drafted": 0,
+    "items_queued_for_digest": 2,
+    "image_errors": 0,
+    "mcp_errors": 0,
+    "avg_classifier_confidence": 0.88,
+    "run_duration_sec": 42.3
+  },
+  "mispack": [
+    {
+      "ticket_id": "SMOKETEST-MISPACK-001",
+      "ticket_link": "https://app.hubspot.com/contacts/50830922/ticket/SMOKETEST-MISPACK-001",
+      "first_seen_utc": "2026-04-23T18:35:12Z",
+      "customer_name": "Test Merchant",
+      "customer_email": "test@example.com",
+      "company_name": "Test Co",
+      "order_number": "SMOKETEST-ORD-12345",
+      "tracking_number": "1Z999AA10123456784",
+      "sku_mentioned": "SKU-ABC-01",
+      "issue_description": "Customer received wrong variant color (smoketest — safe to delete).",
+      "requested_credit_usd": 45.00,
+      "reshipment_needed": true,
+      "classifier_confidence": 0.91,
+      "priority": "normal",
+      "draft_note_id": "SMOKETEST-NOTE-001"
+    }
+  ],
+  "carrier": [
+    {
+      "ticket_id": "SMOKETEST-CARRIER-001",
+      "ticket_link": "https://app.hubspot.com/contacts/50830922/ticket/SMOKETEST-CARRIER-001",
+      "first_seen_utc": "2026-04-23T18:35:20Z",
+      "customer_name": "Test Shipper",
+      "customer_email": "shipper@example.com",
+      "company_name": "Ship Corp",
+      "order_number": "SMOKETEST-ORD-67890",
+      "tracking_number": "770123456789",
+      "carrier_issue": "Damaged on arrival",
+      "insurance_on_package": false,
+      "classifier_confidence": 0.85,
+      "priority": "urgent",
+      "draft_note_id": "SMOKETEST-NOTE-002"
+    }
+  ]
+}

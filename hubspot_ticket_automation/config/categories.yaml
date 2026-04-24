@@ -1,0 +1,141 @@
+# -----------------------------------------------------------------------------
+# Form-topic → automation-category mapping
+# -----------------------------------------------------------------------------
+# Pack'N's intake form has a dropdown `topic_of_ticket` with 5 values.
+# When a ticket has this set, use it as a strong classifier prior.
+# The 15-category automation taxonomy (defined below) is used as a sub-category.
+form_topic_mapping:
+  "Carrier Issue (Provide Tracking)":
+    primary: wismo_tracking
+    # sub-category candidates (LLM picks best): wismo_tracking, shipping_delay, damaged_goods
+  "Mispack (Provide Order Number)":
+    primary: mispack_wrong_item
+    # sub-category candidates: mispack_wrong_item, damaged_goods
+  "Operations Inquiry":
+    primary: null  # let LLM classify across all operational categories
+    # sub-category candidates: inventory_discrepancy, inbound_asn_receiving, kitting_project,
+    #                          account_onboarding, integration_system, retailer_compliance
+  "General Inquiry":
+    primary: null  # let LLM classify; often billing, returns, or account
+    # sub-category candidates: billing_invoice, returns_rma, account_onboarding, other_unclassified
+  "Other":
+    primary: null  # pure LLM classification
+
+# -----------------------------------------------------------------------------
+# Auto-send topics — tickets that match BOTH
+#   (a) source_type == "FORM", AND
+#   (b) topic_of_ticket in this list
+# are auto-sent to the customer via scripts/send_customer_reply.py. Every
+# other ticket (non-form, or form with any other topic) is drafted as an
+# internal note and routed to the hourly digest for reviewer send.
+auto_send_form_topics:
+  - "Carrier Issue (Provide Tracking)"
+  - "Mispack (Provide Order Number)"
+
+# -----------------------------------------------------------------------------
+# Digest sectioning — which owner a category's tickets belong to in the
+# hourly digest. Used by hubspot-actions-digest to split the body into
+# "LUCA" and "CHARLIE" sections. Every category defined below must appear
+# here; if the digest encounters a ticket whose category is missing, it
+# defaults to charlie with a flag so operators can triage.
+# -----------------------------------------------------------------------------
+category_owners:
+  # Luca — high-level concerns (billing, account, escalation)
+  billing_invoice:        luca
+  account_onboarding:     luca
+  sla_escalation:         luca
+  retailer_compliance:    luca
+  # Charlie — warehouse operations + general questions
+  wismo_tracking:         charlie
+  shipping_delay:         charlie
+  damaged_goods:          charlie
+  mispack_wrong_item:     charlie
+  inventory_discrepancy:  charlie
+  inbound_asn_receiving:  charlie
+  returns_rma:            charlie
+  integration_system:     charlie
+  kitting_project:        charlie
+  address_recipient:      charlie
+  other_unclassified:     charlie   # flagged in digest for manual triage
+
+# -----------------------------------------------------------------------------
+# Digest reply-reminder suppression — for tickets in these categories, the
+# digest SKIPS the top `[ ] Send the drafted reply in HubSpot` checkbox
+# because the ticket resolves through backend action (trace, investigation,
+# claim) rather than a customer-facing reply. The drafted reply is still
+# posted as an internal note on the HubSpot ticket and rendered inline in
+# the digest for context — just not surfaced as an explicit action.
+# -----------------------------------------------------------------------------
+suppress_reply_reminder_categories:
+  - mispack_wrong_item
+  - wismo_tracking
+  - shipping_delay
+  - damaged_goods
+
+# -----------------------------------------------------------------------------
+# Ticket category matrix (automation taxonomy)
+# -----------------------------------------------------------------------------
+# `kb_file` = primary KB doc the classifier/drafter should consult.
+# Routing (auto-send vs draft) is NOT per-category anymore — it's driven by
+# the runtime rule above (source_type + topic_of_ticket). Any field previously
+# named `mode` has been removed.
+
+wismo_tracking:
+  kb_file: kb/tracking_wismo.md
+  description: "where is my order, tracking not updating, stuck in transit, delivered-not-received"
+
+shipping_delay:
+  kb_file: kb/tracking_wismo.md
+  description: "late ship, missed cutoff, carrier delay, ship-time SLA breach"
+
+damaged_goods:
+  kb_file: kb/damage_claims.md
+  description: "broken/crushed in transit, concealed damage, packaging failure, claims"
+
+mispack_wrong_item:
+  kb_file: kb/mispack_process.md
+  description: "wrong SKU, wrong quantity, wrong variant, missing item/component in kit"
+
+inventory_discrepancy:
+  kb_file: kb/inventory_accuracy.md
+  description: "cycle count variance, phantom stock, stock sync lag with storefront"
+
+inbound_asn_receiving:
+  kb_file: kb/integration_errors.md
+  description: "ASN vs physical mismatch, delayed putaway, unknown SKU on inbound, dock scheduling"
+
+returns_rma:
+  kb_file: kb/returns_rma.md
+  description: "RMA request, refund timing, disposition"
+
+integration_system:
+  kb_file: kb/integration_errors.md
+  description: "unknown SKU (new launch), failed order push, bad address rejections, API/EDI errors"
+
+billing_invoice:
+  kb_file: kb/billing_faq.md
+  description: "storage fees, long-term penalties, pick-pack rate, accessorials, chargebacks"
+
+sla_escalation:
+  kb_file: kb/brand_voice.md
+  description: "slow reply complaints, missed KPI, report requests"
+
+account_onboarding:
+  kb_file: kb/brand_voice.md
+  description: "new merchant setup, SOPs, label requirements, bill-to changes"
+
+kitting_project:
+  kb_file: kb/brand_voice.md
+  description: "promo builds, subscription boxes, custom packaging, inserts"
+
+address_recipient:
+  kb_file: kb/tracking_wismo.md
+  description: "wrong/incomplete address, PO box issues, carrier correction fees"
+
+retailer_compliance:
+  kb_file: kb/integration_errors.md
+  description: "Amazon/Walmart/Target routing guides, vendor chargebacks"
+
+other_unclassified:
+  kb_file: kb/brand_voice.md
+  description: "did not match other categories with confidence >= 0.5"

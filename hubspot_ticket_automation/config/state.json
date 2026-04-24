@@ -1,0 +1,75 @@
+{
+  "last_run_at": "2026-04-23T22:27:28.342Z",
+  "processed_ticket_ids": ["43531213637", "44708236804", "44767539490", "44754798684", "43844803890", "44707208507", "44704941957", "44801587854", "44784938273", "44806090398"],
+  "run_count": 7,
+  "last_run_mode": "skill-live-post-rework",
+  "notes_posted_by_run": {
+    "1": ["108452819625"],
+    "2": ["108455008390"],
+    "3": [],
+    "4": [],
+    "5": [],
+    "6": ["108536431927", "108519578207", "108519887664", "108529094779", "108523755656"],
+    "7": ["108546294623", "108545581129"]
+  },
+  "auto_sends_by_run": {
+    "7": ["108548002188"]
+  },
+  "ticket_fingerprints": {
+    "43531213637": {
+      "num_notes": 1,
+      "processed_at": "2026-04-23T13:50:00Z",
+      "hs_lastmodifieddate": null,
+      "note": "Backfilled from run #1 (Ofuure/returns_rma)."
+    },
+    "44708236804": {
+      "num_notes": 1,
+      "processed_at": "2026-04-23T14:09:08.311Z",
+      "hs_lastmodifieddate": "2026-04-23T15:05:34.562Z",
+      "note": "Backfilled from run #2 (Jacob Wilson/Carrier Issue). Multiple test engagements added during rework verification — treat as untouched by run #7."
+    },
+    "44767539490": {
+      "num_notes": 1,
+      "processed_at": "2026-04-23T19:01:12.342Z",
+      "hs_lastmodifieddate": "2026-04-23T18:54:54.096Z"
+    },
+    "44754798684": {
+      "num_notes": 1,
+      "processed_at": "2026-04-23T19:01:12.675Z",
+      "hs_lastmodifieddate": "2026-04-23T18:14:00.899Z"
+    },
+    "43844803890": {
+      "num_notes": 1,
+      "processed_at": "2026-04-23T19:01:12.957Z",
+      "hs_lastmodifieddate": "2026-04-23T18:24:51.392Z"
+    },
+    "44707208507": {
+      "num_notes": 1,
+      "processed_at": "2026-04-23T19:01:13.277Z",
+      "hs_lastmodifieddate": "2026-04-23T18:01:32.189Z"
+    },
+    "44704941957": {
+      "num_notes": 1,
+      "processed_at": "2026-04-23T19:01:13.490Z",
+      "hs_lastmodifieddate": "2026-04-23T18:04:13.329Z"
+    },
+    "44801587854": {
+      "num_notes": 1,
+      "processed_at": "2026-04-23T22:29:45Z",
+      "hs_lastmodifieddate": "2026-04-23T22:15:20.493Z",
+      "note": "Run #7 — WKR/partial ship, draft note posted, queued for digest."
+    },
+    "44784938273": {
+      "num_notes": 1,
+      "processed_at": "2026-04-23T22:29:45Z",
+      "hs_lastmodifieddate": "2026-04-23T22:17:27.513Z",
+      "note": "Run #7 — WKR/ship-out, draft note posted, queued for digest."
+    },
+    "44806090398": {
+      "num_notes": 1,
+      "processed_at": "2026-04-23T22:29:45Z",
+      "hs_lastmodifieddate": "2026-04-23T22:27:28.342Z",
+      "note": "Run #7 — AUTO-SEND first real production test. External contact nameplease02@gmail.com. Gmail 19dbc7679f97372c, note 108548002188, email engagement 108552954182."
+    }
+  }
+}

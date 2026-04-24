@@ -1,0 +1,38 @@
+{
+  "run_id": "2a4eef06-574d-4c7c-bb32-176a37fdf2c1",
+  "kpi": {
+    "run_id": "2a4eef06-574d-4c7c-bb32-176a37fdf2c1",
+    "run_started_at_utc": "2026-04-23T18:56:01.732394Z",
+    "last_run_at_used": "2026-04-23T15:05:34.562Z",
+    "run_mode": "live",
+    "tickets_matched": 6,
+    "tickets_processed": 5,
+    "tickets_skipped_dedupe": 1,
+    "tickets_skipped_error": 0,
+    "notes_posted": 5,
+    "urgent_emails_drafted": 0,
+    "items_queued_for_digest": 5,
+    "image_errors": 0,
+    "mcp_errors": 0,
+    "avg_classifier_confidence": 0.55,
+    "run_duration_sec": 348.49
+  },
+  "mispack": [],
+  "carrier": [
+    {
+      "ticket_id": "44767539490",
+      "ticket_link": "https://app.hubspot.com/contacts/50830922/ticket/44767539490",
+      "first_seen_utc": "2026-04-23T19:01:12.342Z",
+      "customer_name": "Jacob Wilson",
+      "customer_email": "jwilson@gopackn.com",
+      "company_name": "Vague",
+      "order_number": "TEST123",
+      "tracking_number": "1Z02D293YW21069996",
+      "carrier_issue": "No Movement",
+      "insurance_on_package": false,
+      "classifier_confidence": 0.90,
+      "priority": "normal",
+      "draft_note_id": "108536431927"
+    }
+  ]
+}

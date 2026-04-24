@@ -1,0 +1,162 @@
+# HubSpot ticket automation — runtime settings
+# Start with dry_run: true. Flip to false only after verifying a dry-run log.
+
+# ---- Safety ----
+dry_run: false               # when true, no HubSpot writes, no emails sent
+per_run_cap: 25              # max tickets processed per run of hubspot-tickets
+digest_min_items: 1          # minimum queued items before digest sends (raise to suppress quiet hours)
+
+# ---- HubSpot ----
+# Discovered 2026-04-23 from Pack'N's HubSpot account.
+hubspot_portal_id: 50830922  # portal ID for building ticket URLs
+hubspot_timezone: "US/Eastern"
+pipeline_id: "0"             # Support Pipeline (only pipeline in use)
+# Stage legend: 1=New, 2=Waiting on contact, 3=Waiting on us, 4=Closed
+# Active stages = where Pack'N needs to respond. Skip stage 2 (waiting on customer) and stage 4 (closed).
+active_stages:
+  - "1"                      # New
+  - "3"                      # Waiting on us
+
+# Additional filter: only process tickets where the customer was the last to message.
+# This avoids re-replying to tickets where an agent already responded.
+require_last_message_from_visitor: true
+
+# Ticket custom properties to always fetch (in addition to standard ones)
+# NOTE: hs_file_upload is intentionally excluded — attachment URLs pulled into
+# model context cause the HubSpot MCP to return inline image content blocks,
+# which poisons the conversation with 400 "Could not process image" errors.
+# Reviewers must open the HubSpot ticket directly to view attachments.
+ticket_custom_properties:
+  - topic_of_ticket          # form dropdown: classifier prior
+  - order_number
+  - tracking_number
+  - inquiry_description      # free-text form field (may be empty)
+  - supporting_information   # free-text form field (may be empty)
+  - hs_all_associated_contact_emails
+  - hs_last_message_from_visitor
+  # Sheets-export form fields (used by mispack_log / carrier_issue_log tabs)
+  - check_box_to_reship_order_immediately  # mispack form: bool
+  - requested_credit_amount                # mispack form: number
+  - insurance_on_package                   # carrier form: bool
+  - carrier_issue                          # carrier form: category string
+
+# Attachment handling: detect presence via association count only.
+# Never request file URLs, file contents, or file IDs through any MCP tool.
+attachments:
+  never_hydrate: true
+
+# Conversation: read last N associated `emails` objects
+conversation_email_limit: 10
+
+# ---- Notification ----
+# Recipients for urgent solo emails and hourly digests. Everyone listed receives both.
+notify_emails:
+  - lconner@gopackn.com
+  - chansen@gopackn.com
+
+# ---- Urgent signals ----
+# Any ticket matching one of these (case-insensitive substring in subject, body, or thread) forces priority=urgent.
+# Start conservative — tune after a week of observation.
+urgent_signals:
+  - "system down"
+  - "outage"
+  - "urgent"
+  - "ASAP"
+  - "lost shipment"
+  - "chargeback"
+  - "escalate"
+  - "legal"
+  - "attorney"
+  - "BBB"
+  - "refund now"
+  - "cancel contract"
+  - "terminate"
+  - "switching 3PL"
+  - "angry"
+  - "furious"
+  - "SLA breach"
+  - "P0"
+  - "P1"
+
+# ---- KB paths ----
+# Relative to project root. Reordering changes retrieval priority (earlier = higher).
+kb_dir: "kb"
+kb_always_include:
+  - "kb/brand_voice.md"
+  - "kb/glossary.md"
+
+# ---- Prompts ----
+prompts_dir: "prompts"
+
+# ---- State / output paths ----
+state_file: "config/state.json"
+pending_actions_file: "config/pending_actions.json"
+runs_dir: "outputs/runs"
+digests_dir: "outputs/digests"
+
+# ---- ShipSidekick (WMS) integration ----
+# Used by scripts/ssk_order_lookup.py to enrich the drafter's context for
+# Carrier Issue / WISMO tickets with live order + shipment state (carrier,
+# tracking status, est delivery, trackingUrl). Drafts cite real data instead
+# of hedged boilerplate. Token lives at config/.secrets/shipsidekick_token.txt.
+shipsidekick:
+  enabled: true
+  base_url: "https://www.shipsidekick.com/api/v1"
+  # test env: "https://test.shipsidekick.com/api/v1"
+  token_path: "config/.secrets/shipsidekick_token.txt"
+  # Categories that trigger live SSK hydration in step 2a.5 of hubspot-tickets.
+  # Extend cautiously — each category adds one SSK GET per ticket.
+  hydrate_categories:
+    - wismo_tracking
+    - shipping_delay
+    - damaged_goods
+    - mispack_wrong_item
+  # Form topics that trigger hydration even before classifier runs.
+  hydrate_topics:
+    - "Carrier Issue (Provide Tracking)"
+    - "Mispack (Provide Order Number)"
+
+# ---- Auto-send (customer-facing replies for form Mispack/Carrier) ----
+# Used by scripts/send_customer_reply.py. Sends via Gmail API (reusing the
+# existing token at config/.secrets/token.json) then logs the sent email as an
+# engagement on the HubSpot ticket so the ticket's activity timeline reflects
+# the reply. HubSpot Conversations API cannot create new threads for form-
+# sourced tickets — see plan file `i-also-want-to-snuggly-gadget.md`.
+auto_send:
+  # Envelope sender — the Gmail account that owns config/.secrets/token.json.
+  # Customer clicks Reply → mail routes to reply_to below.
+  # To upgrade to From: customercare@gopackn.com, configure Gmail "Send mail as"
+  # for that alias, verify SPF includes _spf.google.com, then set:
+  #   use_send_as_alias: true
+  #   send_as_address: "customercare@gopackn.com"
+  use_send_as_alias: true
+  send_as_address: "customercare@gopackn.com"
+  display_name: "Pack'N Customer Care"
+  reply_to: "customercare@gopackn.com"
+
+# ---- Google Sheets export ----
+# One workbook with three tabs; skill appends per-run KPIs and per-ticket rows.
+# Operator-owned columns (claim_status, coverage_usd, etc.) are never written
+# by the skill after a row's initial insertion — see CLAUDE.md invariants.
+sheets_export:
+  enabled: true
+  workbook_title: "Pack'N HubSpot Automation"
+  # Tab names → category rollup (which tickets land where):
+  #   mispack_log        ← mispack_wrong_item
+  #   carrier_issue_log  ← wismo_tracking, shipping_delay, damaged_goods
+  #   kpi_system         ← one row per skill run (always, no rollup)
+  tabs:
+    kpi: "kpi_system"
+    mispack: "mispack_log"
+    carrier: "carrier_issue_log"
+  # Editors for the workbook. bootstrap adds missing invites; existing ones skipped.
+  share_with:
+    - lconner@gopackn.com
+    - chansen@gopackn.com
+    - jwilson@gopackn.com
+  # Local CSV mirror for audit/recovery. Skill writes here even if Sheets API fails.
+  local_mirror_dir: "outputs/kpi"
+  # Queue of rows that failed to push to Sheets; flushed on next successful run.
+  pending_sync_file: "config/sheets_pending_sync.json"
+  # Runtime state (populated by scripts/sheets_bootstrap.py):
+  #   config/sheets_state.json holds spreadsheet_id, spreadsheet_url, tab_ids.

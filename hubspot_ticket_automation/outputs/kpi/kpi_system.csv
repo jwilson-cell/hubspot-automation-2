@@ -1,0 +1,6 @@
+run_id,run_started_at_utc,last_run_at_used,run_mode,tickets_matched,tickets_processed,tickets_skipped_dedupe,tickets_skipped_error,notes_posted,urgent_emails_drafted,items_queued_for_digest,image_errors,mcp_errors,avg_classifier_confidence,run_duration_sec
+smoketest-001,2026-04-23T18:35:00Z,2026-04-23T15:05:34.562Z,dry_run,2,2,0,0,0,0,2,0,0,0.88,42.3
+smoketest-001,2026-04-23T18:35:00Z,2026-04-23T15:05:34.562Z,dry_run,2,2,0,0,0,0,2,0,0,0.88,42.3
+2a4eef06-574d-4c7c-bb32-176a37fdf2c1,2026-04-23T18:56:01.732394Z,2026-04-23T15:05:34.562Z,live,6,5,1,0,5,0,5,0,0,0.55,348.49
+cr-smoketest-001,2026-04-23T19:20:00Z,2026-04-23T18:54:54.096Z,dry_run,3,2,1,0,2,0,2,0,0,0.78,34.12
+cr-smoketest-001,2026-04-23T19:20:00Z,2026-04-23T18:54:54.096Z,dry_run,3,2,1,0,2,0,2,0,0,0.78,34.12

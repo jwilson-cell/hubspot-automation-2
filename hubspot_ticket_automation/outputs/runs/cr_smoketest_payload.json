@@ -1,0 +1,56 @@
+{
+  "run_id": "cr-smoketest-001",
+  "kpi": {
+    "run_id": "cr-smoketest-001",
+    "run_started_at_utc": "2026-04-23T19:20:00Z",
+    "last_run_at_used": "2026-04-23T18:54:54.096Z",
+    "run_mode": "dry_run",
+    "tickets_matched": 3,
+    "tickets_processed": 2,
+    "tickets_skipped_dedupe": 1,
+    "tickets_skipped_error": 0,
+    "notes_posted": 2,
+    "urgent_emails_drafted": 0,
+    "items_queued_for_digest": 2,
+    "image_errors": 0,
+    "mcp_errors": 0,
+    "avg_classifier_confidence": 0.78,
+    "run_duration_sec": 34.12
+  },
+  "mispack": [
+    {
+      "ticket_id": "CR-SMOKETEST-MISPACK-001",
+      "ticket_link": "https://app.hubspot.com/contacts/50830922/ticket/CR-SMOKETEST-MISPACK-001",
+      "first_seen_utc": "2026-04-23T19:20:00Z",
+      "customer_name": "Zara A",
+      "customer_email": "zara@ofuure.com",
+      "company_name": "-Prime Logistics",
+      "order_number": "00045",
+      "tracking_number": "1Z02D293YW31486365",
+      "sku_mentioned": "SKU-OF-RED-LG",
+      "issue_description": "=HYPERLINK(\"http://evil\",\"click me\") — verifying formula-injection escape",
+      "requested_credit_usd": "$250.50",
+      "reshipment_needed": "true",
+      "classifier_confidence": 0.82,
+      "priority": "normal",
+      "draft_note_id": "CR-NOTE-001"
+    }
+  ],
+  "carrier": [
+    {
+      "ticket_id": "CR-SMOKETEST-CARRIER-001",
+      "ticket_link": "https://app.hubspot.com/contacts/50830922/ticket/CR-SMOKETEST-CARRIER-001",
+      "first_seen_utc": "2026-04-23T19:20:00Z",
+      "customer_name": "Jacob Wilson",
+      "customer_email": "jwilson@gopackn.com",
+      "company_name": "Pack'N",
+      "order_number": "TEST456",
+      "tracking_number": "TBA123456789012",
+      "carrier_issue": "Stuck in transit",
+      "insurance_on_package": "false",
+      "classifier_confidence": 0.75,
+      "priority": "normal",
+      "draft_note_id": "CR-NOTE-002"
+    }
+  ]
+}
