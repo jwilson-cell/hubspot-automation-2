@@ -1,12 +1,16 @@
 # HubSpot Ticket Automation — Pack'N
 
-Automated triage of HubSpot help desk tickets for a 3PL. Drafts grounded replies, extracts action items, delivers urgent items immediately and the rest in an hourly digest email.
+Automated triage of HubSpot help desk tickets for a 3PL. Drafts grounded replies, auto-sends low-risk categories end-to-end, extracts action items, and delivers a split reviewer digest three times a weekday.
+
+Deployed on a DigitalOcean Ubuntu droplet (`packn@167.99.229.91`) under cron. See `docs/server-setup.md` for the provisioning runbook.
 
 ## What it does
 
-- **Every 15 minutes** (`hubspot-tickets` skill): pulls new/updated tickets from your HubSpot help desk pipeline, classifies them into one of 15 3PL-specific categories, drafts a reply grounded in the local KB, and posts it as an **internal note** on the ticket for human review.
-- **Urgent items** (P0/legal/major escalations) email you immediately with ticket context and action items.
-- **Normal items** queue up and get flushed **hourly** (`hubspot-actions-digest` skill) in one consolidated email.
+- **Every 30 minutes** (`hubspot-tickets` skill): pulls new/updated tickets from the HubSpot help desk pipeline, classifies them into one of 15 3PL-specific categories, hydrates live ShipSidekick order state where relevant, and drafts a reply grounded in the local KB. Then:
+  - **FORM + topic Mispack or Carrier Issue** → auto-sends the reply to the customer from `customercare@gopackn.com` via Gmail, plus logs both a v1 email engagement and an `[AUTO-SENT TO CUSTOMER]` note on the ticket for reviewer visibility.
+  - **Everything else** (form with any other topic, email-sourced, WhatsApp-sourced, chat) → posts the reply as a `[DRAFT — REVIEW BEFORE SENDING]` internal note with an embedded `PACKN_METADATA_V1` JSON block so the digest can reconstruct action items.
+- **Urgent items** (P0/legal/major escalations / contract cancellation risk) fire a solo Gmail email immediately with ticket context + action items.
+- **Digest at 8am / 12pm / 3pm ET weekdays** (`hubspot-actions-digest` skill): queries HubSpot for undigested `PACKN_METADATA_V1` notes, composes a single email split into **Luca** (billing, account, escalation) and **Charlie** (warehouse, general) sections, sends from `customercare@gopackn.com`, and marks each included ticket with a `[DIGESTED at ...]` note so subsequent runs skip it. Email lands in lconner + chansen inboxes — no Drafts step, nothing to click send on.
 
 ## What ships out of the box
 
@@ -15,28 +19,45 @@ Automated triage of HubSpot help desk tickets for a 3PL. Drafts grounded replies
 - Classifier, drafter, and action-item extractor prompts in `prompts/`.
 - Dry-run-by-default config so nothing ships to HubSpot or Gmail until you verify a log.
 
-## Quickstart
+## Runtime
 
-### 1. One-time auth
+Cron entries on the server (`crontab -l` as `packn`):
 
-Your HubSpot MCP connector is already set up. The Gmail MCP connector has been authenticated against `lconner@gopackn.com`.
+```cron
+MAILTO=lconner@gopackn.com
+PATH=/usr/local/bin:/opt/packn/hubspot_ticket_automation/.venv/bin:/usr/local/sbin:/usr/sbin:/usr/bin:/bin
+ANTHROPIC_API_KEY=...
 
-**Gmail delivery note**: The Gmail MCP connector only supports **creating drafts**, not sending email. The automation creates drafts addressed to you with distinct subject prefixes:
-- `[HubSpot URGENT · Ticket #NNNN]` for urgent items
-- `[HubSpot Digest]` for hourly consolidated action items
+# Ticket processing — every 30 minutes
+*/30 * * * *  cd /opt/packn/hubspot_ticket_automation && claude -p /packn-tickets --dangerously-skip-permissions >> outputs/runs/cron-tickets.log 2>&1
 
-Optional one-time step: in Gmail, create a filter on `subject:"[HubSpot"` to star, label, or forward these drafts so they're easy to find. (Gmail filters can't convert drafts into sent messages, but they can make drafts more visible.)
-
-### 2. First run (dry-run)
-
-From the project directory:
-
-```
-# Invoke the skill (example — actual invocation depends on how you run Claude Code skills)
-# e.g., say to Claude: "Run the hubspot-tickets skill"
+# Digest — 8am / 12pm / 3pm ET weekdays (UTC during EDT: 12:00, 16:00, 19:00)
+0 12 * * 1-5  cd /opt/packn/hubspot_ticket_automation && claude -p /packn-digest --dangerously-skip-permissions >> outputs/runs/cron-digest.log 2>&1
+0 16 * * 1-5  cd /opt/packn/hubspot_ticket_automation && claude -p /packn-digest --dangerously-skip-permissions >> outputs/runs/cron-digest.log 2>&1
+0 19 * * 1-5  cd /opt/packn/hubspot_ticket_automation && claude -p /packn-digest --dangerously-skip-permissions >> outputs/runs/cron-digest.log 2>&1
 ```
 
-`config/settings.yaml` ships with `dry_run: true` and empty `pipeline_id` / `active_stages`. The skill's **discovery step** will pull the list of ticket pipelines and stages from HubSpot and ask you to fill them in.
+DST: these UTC hours are correct for EDT (UTC−4). When EST resumes on Sunday, Nov 1 2026, shift the digest hours by +1 → `13`, `17`, `20`. The ticket cron stays as-is. A scheduled email reminder is queued for Nov 1 morning.
+
+## Auth / secrets
+
+The server carries all credentials in `config/.secrets/` (gitignored):
+
+- `hubspot_token.txt` — HubSpot private-app access token. Scopes needed: `crm.objects.tickets.read/write`, `crm.objects.contacts.read`, `crm.objects.companies.read`, `crm.objects.notes.read/write`, `crm.objects.emails.read/write` (for v1 engagements), `tickets`, `conversations.read`.
+- `shipsidekick_token.txt` — ShipSidekick private-app bearer token (read orders + shipments).
+- `token.json` + `credentials.json` — Gmail OAuth with `gmail.modify` scope, authenticated against `lconner@gopackn.com` with a verified "Send mail as `customercare@gopackn.com`" alias. SPF/DKIM for gopackn.com include Google, so the alias sends cleanly.
+- `sheets_token.json` + `sheets_client.json` — Google Sheets OAuth for the rollup export.
+
+HubSpot MCP is set up on the server via `@hubspot/mcp-server` npm package, registered in Claude Code CLI at packn's user level via `claude mcp add hubspot --env HUBSPOT_ACCESS_TOKEN=...`.
+
+## First-time local run (optional development setup)
+
+To iterate on skills/KB/prompts from your laptop without affecting the server:
+
+1. `git clone https://github.com/jwilson-cell/hubspot-automation-2.git`
+2. Copy `.secrets/` from the server (or ask lconner for a debug set).
+3. Flip `config/settings.yaml:dry_run` to `true` and run locally via `claude /packn-tickets`.
+4. Commit changes → push → server picks them up on the next cron fire.
 
 Fill in `settings.yaml`:
 - `hubspot_portal_id` (integer — from your HubSpot URL)

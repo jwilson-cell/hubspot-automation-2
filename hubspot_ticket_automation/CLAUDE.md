@@ -4,10 +4,19 @@ This project is **Pack'N's HubSpot help desk ticket automation**. Pack'N is a 3P
 
 ## Architecture at a glance
 
-Two skills, run on cron:
+Two skills, run on cron on a DigitalOcean Ubuntu droplet (server IP `167.99.229.91`, runs as `packn` user, project rooted at `/opt/packn/hubspot_ticket_automation`):
 
-1. **`hubspot-tickets`** — every 15 minutes. Pulls new/updated tickets, classifies, drafts a reply grounded in `kb/`, posts as an internal HubSpot note. Action items: `urgent` → solo email immediately; `normal` → queued in `config/pending_actions.json`.
-2. **`hubspot-actions-digest`** — hourly. Flushes the queue to one consolidated email, archives, clears the queue.
+1. **`hubspot-tickets`** — every 30 minutes. Pulls new/updated tickets, classifies, drafts a reply grounded in `kb/`, hydrates live ShipSidekick order state when applicable, then either (a) auto-sends the reply to the customer via Gmail + logs an `[AUTO-SENT TO CUSTOMER]` note (for FORM + Mispack/Carrier tickets) or (b) posts a `[DRAFT — REVIEW BEFORE SENDING]` internal note (everything else). Action items: `urgent` → solo Gmail email immediately; `normal` → stays on the HubSpot ticket note with a `PACKN_METADATA_V1` block.
+2. **`hubspot-actions-digest`** — 8am / 12pm / 3pm ET on weekdays. Queries HubSpot for tickets whose automation notes haven't been digested yet, composes a single email split into Luca (billing/account/escalation) and Charlie (warehouse/general) sections, sends via Gmail, and posts `[DIGESTED at ...]` marker notes on each included ticket so the next run skips them. **HubSpot is the source of truth for the digest queue** (no local queue file) — this lets the skill run anywhere that has the private-app token + Gmail OAuth.
+
+Helpers on the server:
+- `scripts/send_customer_reply.py` — one-step Gmail send + HubSpot v1 engagement + `[AUTO-SENT]` note (auto-send path).
+- `scripts/send_digest_email.py` — one-step Gmail send for the digest (no Drafts intermediary).
+- `scripts/send_draft.py` — Gmail draft-to-sent promoter (legacy; used by the urgent email path).
+- `scripts/ssk_order_lookup.py` — ShipSidekick order + shipment state, injected into ticket_context before drafting.
+- `scripts/sheets_sync.py` — non-blocking Google Sheets export (KPI + mispack + carrier_issue rollups).
+
+GitHub repo: `https://github.com/jwilson-cell/hubspot-automation-2`. The server pulls from `main` each time cron starts Claude Code; doc/skill/config changes land by `git push` from the laptop clone + `git pull` on the server.
 
 ## Invariants (do not violate)
 
@@ -54,16 +63,20 @@ Two skills, run on cron:
 | `kb/returns_rma.md` | RMA flow |
 | `kb/billing_faq.md` | Billing dispute handling |
 | `kb/integration_errors.md` | Unknown SKU, address, EDI, retailer chargebacks |
+| `.claude/commands/packn-tickets.md` | Slash command for ticket processing (invoked by cron via `claude -p /packn-tickets`). |
+| `.claude/commands/packn-digest.md` | Slash command for the digest (invoked at 8/12/3 ET weekdays). |
+| `.claude/settings.json` | Pre-authorized tool allow-list so headless cron runs don't hang on permission prompts. |
 | `scripts/send_customer_reply.py` | Auto-send helper for form Mispack/Carrier tickets — Gmail send + v1 email engagement + v1 note engagement |
-| `scripts/send_digest_email.py` | Sends the hourly digest directly via Gmail (one-step send, no draft). Invoked by hubspot-actions-digest SKILL step 8. Requires `--send` for live send. |
+| `scripts/send_digest_email.py` | Sends the digest directly via Gmail (one-step send, no draft). Invoked by hubspot-actions-digest SKILL step 8. Requires `--send` for live send. |
 | `scripts/send_draft.py` | Promotes Gmail drafts to Sent (used by urgent solo emails) |
 | `scripts/sheets_sync.py` | Non-blocking Sheets export (KPI + mispack + carrier_issue rollups) |
 | `scripts/ssk_order_lookup.py` | WISMO hydration — looks up ShipSidekick order + shipment state by order_number or tracking_number; output injected into `ticket_context.ssk_state` ahead of the drafter |
+| `docs/server-setup.md` | DigitalOcean Ubuntu server provisioning + deployment runbook |
 | `config/.secrets/hubspot_token.txt` | HubSpot private-app access token (gitignored) |
 | `config/.secrets/shipsidekick_token.txt` | ShipSidekick API bearer token (gitignored) |
 | `config/.secrets/token.json` | Gmail OAuth refresh token (gitignored) |
-| `outputs/runs/` | Per-run logs |
-| `outputs/digests/` | Hourly digest archives |
+| `outputs/runs/` | Per-run logs (`cron-tickets.log` collects all server cron stdout/stderr for /packn-tickets; digests under `cron-digest.log`) |
+| `outputs/digests/` | Per-digest archives (subset of historical runs; the HubSpot-first digest no longer writes these but they're preserved for audit) |
 
 ## Pack'N-specific fill-ins (TODOs)
 
