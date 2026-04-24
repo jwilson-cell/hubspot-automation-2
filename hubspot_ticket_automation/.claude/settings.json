@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "mcp__hubspot__*",
+      "Bash",
+      "Read",
+      "Write",
+      "Edit",
+      "Glob",
+      "Grep"
+    ]
+  }
+}
