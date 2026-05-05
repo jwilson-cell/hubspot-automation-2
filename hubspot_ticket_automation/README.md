@@ -39,6 +39,146 @@ ANTHROPIC_API_KEY=...
 
 DST: these UTC hours are correct for EDT (UTC−4). When EST resumes on Sunday, Nov 1 2026, shift the digest hours by +1 → `13`, `17`, `20`. The ticket cron stays as-is. A scheduled email reminder is queued for Nov 1 morning.
 
+## Pack'N OS Control Panel integration (Phase 4)
+
+This automation is now coordinated with **Pack'N OS** — a separate
+internal web app at `https://os.gopackn.com` that wraps a control
+panel around this cron. After Phase 4 cutover:
+
+- **Pause/resume routines** via the Pack'N OS UI (`/automation`). When
+  paused, the next cron tick reads `automation_routines.enabled = false`
+  from the OS Postgres, writes a `status='skipped'` run record, and
+  exits without polling HubSpot. Pause latency is bounded by the cron
+  interval (max ~30 min for `/packn-tickets`).
+- **Customer-facing replies are no longer auto-sent.** This automation
+  now writes a `pending` row to `automation_drafts` for every reply.
+  Operators review + approve via `/automation/drafts/<id>` in Pack'N OS;
+  Pack'N OS sends via its own Gmail OAuth + writes a HubSpot engagement
+  note. Internal sends (urgent solo emails, `/packn-digest`) are
+  UNCHANGED — those still go through this repo's Gmail + scripts.
+- **Manual rerun** — operators can request a rerun of a single ticket
+  from Pack'N OS even while the routine is paused. The next cron tick
+  picks up rerun rows from `automation_rerun_requests` and processes
+  them BEFORE the normal HubSpot poll.
+- **Failure alerts** — the Pack'N OS alert-scan worker fires when this
+  cron has 2+ consecutive failures, no successes in 2× the cron
+  interval, or pending-draft count > 50. Email lands at
+  `lconner@gopackn.com` + dashboard banner in Pack'N OS.
+- **Centralized rate limit** — every `mcp__claude_ai_HubSpot__*` call is
+  preceded by a Redis Lua token acquire from
+  `rate:hubspot:existing-automation` (capacity 3/s); Pack'N OS shares
+  the parent budget at `rate:hubspot:packn-os` (capacity 2/s). Sum is
+  ≤ 5/s — HubSpot's account-wide Search cap.
+
+### New env vars (set in `/opt/packn/hubspot_ticket_automation/.env`, mode 0600)
+
+```
+PACKN_OS_DATABASE_URL=postgresql://packn_os_existing_automation:<password>@<host>:5432/<db>?sslmode=require
+REDIS_URL=<production_redis_url>
+HUBSPOT_RATE_LIMIT_AUTOMATION=3
+```
+
+`HUBSPOT_RATE_LIMIT_AUTOMATION` MUST sum with `HUBSPOT_RATE_LIMIT_OS`
+(set on the Pack'N OS side) to ≤ 5; Pack'N OS's env-schema enforces
+this at boot time. Default split: AUTOMATION=3, OS=2.
+
+### Postgres role + grants (run ONCE pre-cutover by lconner against the prod DB)
+
+```sql
+-- Create role with explicit password (replace placeholder)
+CREATE ROLE packn_os_existing_automation WITH LOGIN PASSWORD 'REPLACE_ME';
+
+-- Read-only on routines + rerun requests
+GRANT SELECT ON automation_routines TO packn_os_existing_automation;
+GRANT SELECT ON automation_rerun_requests TO packn_os_existing_automation;
+
+-- Insert on runs + drafts (no UPDATE/DELETE — append-only from this side)
+GRANT INSERT ON automation_runs TO packn_os_existing_automation;
+GRANT INSERT ON automation_drafts TO packn_os_existing_automation;
+
+-- Update on rerun_requests, only the processed/processed_at/resulting_draft_id columns
+GRANT UPDATE (processed, processed_at, resulting_draft_id)
+  ON automation_rerun_requests TO packn_os_existing_automation;
+
+-- Sequence usage for SERIAL/UUID PKs
+GRANT USAGE ON SCHEMA public TO packn_os_existing_automation;
+
+-- NO access to: audit_log, tasks, claims, adjustments, or any other Pack'N OS table.
+```
+
+The role has zero access to operator data outside the four
+`automation_*` tables. Verify with `\dp` after running the GRANTs.
+
+### Install (one-PR cutover)
+
+```bash
+cd /opt/packn/hubspot_ticket_automation
+git pull   # picks up the one-PR cutover diff
+pip install -r scripts/requirements.txt   # adds psycopg + redis
+pip install -e packn_os_hubspot_client/   # the helper module
+```
+
+### Smoke tests (post-install)
+
+```bash
+# Routine enabled check (must print True after Pack'N OS Plan 04-02 seed runs)
+python -c "from packn_os_hubspot_client import client; print(client.read_routine_enabled('tickets-process'))"
+# Expected: True
+
+# Returns False for unknown routines (fail-closed posture)
+python -c "from packn_os_hubspot_client import client; print(client.read_routine_enabled('nonexistent-routine'))"
+# Expected: False
+
+# Rate-limit token acquire (against the prod docker Redis)
+python -m packn_os_hubspot_client.rate_limit
+echo $?
+# Expected: 0
+```
+
+### Rollback playbook (if anything goes wrong post-cutover)
+
+The Pack'N OS infrastructure (the new tables + worker + UI) keeps
+working even after the existing-automation cutover is rolled back —
+pause/resume become no-ops because the existing automation no longer
+reads `automation_routines.enabled`, but no data is lost.
+
+1. Revert the merged PR commit on `hubspot-automation-2`:
+   ```bash
+   git log --oneline | head -5     # find the cutover merge SHA
+   git revert <sha> --no-edit       # creates a revert commit on main
+   git push                         # ships the revert
+   ```
+2. SSH to the droplet:
+   ```bash
+   cd /opt/packn/hubspot_ticket_automation
+   git pull                                 # picks up the revert
+   pip install -r scripts/requirements.txt  # restores the pre-cutover deps
+   ```
+3. Old SKILL.md path resumes — auto-send returns. Customer-facing replies
+   are auto-sent again.
+4. Document the rollback time + reason in
+   `.planning/phases/04-hubspot-automation-control-panel/04-HUMAN-UAT.md`
+   (in the Pack'N OS repo) under the Rollback section.
+
+Total time-to-rollback: < 5 minutes.
+
+### Module layout (helper at the repo root)
+
+| File | Purpose |
+| --- | --- |
+| `packn_os_hubspot_client/__init__.py` | Public surface; exports `client` + `rate_limit` |
+| `packn_os_hubspot_client/tenant.py` | `TENANT_ID = 'packn'` constant |
+| `packn_os_hubspot_client/db.py` | psycopg connection pool (min=1, max=2) |
+| `packn_os_hubspot_client/client.py` | 5 helper functions (read/write the automation_* tables) |
+| `packn_os_hubspot_client/rate_limit.py` | Redis Lua rate-limit token acquire |
+| `packn_os_hubspot_client/README.md` | Detailed module docs (canonical Pack'N OS source) |
+
+The Pack'N OS canonical source for the helper is at
+`https://github.com/jwilson-cell/packn-os` (private)
+`python/packn_os_hubspot_client/`. The copy in this repo is kept in
+sync via the cutover PR; future updates re-copy from the OS source.
+
+
 ## Auth / secrets
 
 The server carries all credentials in `config/.secrets/` (gitignored):

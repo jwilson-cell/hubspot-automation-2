@@ -42,6 +42,110 @@ If `pipeline_id` or `active_stages` are empty in `settings.yaml`:
 2. Call `mcp__claude_ai_HubSpot__search_properties` to list ticket pipelines and stages.
 3. Propose values to the user and pause. Do NOT guess pipeline IDs.
 
+## Pack'N OS Control Panel integration (Phase 4)
+
+This skill is now coordinated with **Pack'N OS** (the operator control panel
+that sits alongside this automation). At every tick the skill MUST:
+
+1. **Read `automation_routines.enabled` from Pack'N OS BEFORE doing anything**
+   (CONTEXT D-01 — cooperative DB-poll pause). If `enabled = false`, write a
+   `status='skipped'` run record and exit cleanly. The pause/resume toggle in
+   Pack'N OS becomes a real on/off switch via this gate.
+
+2. **Acquire a Redis rate-limit token BEFORE every `mcp__claude_ai_HubSpot__*`
+   call** (HUB-07 — cross-process bucket coordination). The cron acquires a
+   token from `rate:hubspot:existing-automation` (capacity 3/s); Pack'N OS
+   shares the parent budget at `rate:hubspot:packn-os` (capacity 2/s); the
+   sum is `≤ 5/s` (HubSpot's account-wide Search cap).
+
+3. **Replace customer-facing auto-send with `client.write_draft(...)`**
+   (CONTEXT D-04, D-05 — no shadow mode). For all customer-facing replies
+   (the FORM + Mispack/Carrier path that previously hit `scripts/
+   send_customer_reply.py`), this skill no longer auto-sends. Instead it
+   writes a `pending` row to `automation_drafts`; Pack'N OS owns the
+   approve→Gmail+HubSpot send chain. Internal sends (urgent solo emails,
+   `/packn-digest` recipient sends) are UNCHANGED.
+
+4. **Write an `automation_runs` row at tick start AND tick finish**
+   (CONTEXT D-03 — single source of truth for status panel + alert detection).
+
+5. **Process operator-initiated rerun requests at tick start** (CONTEXT D-09
+   — even when paused, operators can re-fetch a single ticket and have the
+   skill re-draft against the fresh snapshot). The `automation_rerun_requests`
+   table is the queue.
+
+The Pack'N OS helper module that exposes these is at the repo root:
+`packn_os_hubspot_client/`. See `packn_os_hubspot_client/README.md` for the
+install + env-var + Postgres GRANT setup.
+
+**Insertion points used in this file:**
+
+- Step 0 (NEW, below) — the routine_enabled gate + run_record start +
+  rerun_requests poll.
+- Step 1 (Fetch candidate tickets) — wraps `mcp__claude_ai_HubSpot__search_
+  crm_objects` with a token acquire.
+- Step 2a (Hydrate context) — wraps `mcp__claude_ai_HubSpot__search_crm_
+  objects` calls (for emails / contact / company) with a token acquire each.
+- Step 2f (Post the reply) — auto-send branch replaced with
+  `client.write_draft`; draft branch's `mcp__claude_ai_HubSpot__manage_crm_
+  objects` note-create still wrapped in a token acquire.
+- Step 5 (NEW, at end of run) — the run_record finish.
+
+## Step 0: Pack'N OS routine gate + run-record start (NEW — Phase 4)
+
+BEFORE entering the main loop, run this gate. The shell-out exit code
+discriminates:
+
+```bash
+py -c "from packn_os_hubspot_client import client; import sys; sys.exit(0 if client.read_routine_enabled('tickets-process') else 99)"
+```
+
+- **Exit 0** → routine is enabled; proceed to the rerun-queue poll below
+  and then to Step 1.
+- **Exit 99** → routine is paused. Write a status='skipped' run record:
+
+  ```bash
+  py -c "from packn_os_hubspot_client import client; client.write_run_record('tickets-process', 'skipped', None, 0, 0, '<run_started_at_utc ISO>', '<now ISO>')"
+  ```
+
+  Then exit the skill cleanly with a one-line note: "Routine paused via
+  Pack'N OS — skipping this tick." Do not call any HubSpot MCP. Do not
+  fetch tickets. The next cron fire will repeat the gate check.
+
+- **Exit anything else** (DB unreachable, role permission error, network
+  timeout) → fail-closed posture per CONTEXT D-01: treat as `skipped` so
+  the cron does not auto-send during a Pack'N OS outage. Same shell-out
+  for the `status='skipped'` run record (with `error_summary` set to the
+  exit-code reason), then exit.
+
+After the gate passes, poll the rerun-request queue. Operators can request
+a re-run via Pack'N OS even WHILE the routine is paused (D-09 — paused for
+new HubSpot polling, NOT for explicit operator-initiated work). The
+following are processed BEFORE the normal HubSpot poll:
+
+```bash
+py -c "
+import json
+from packn_os_hubspot_client import client
+rows = client.read_pending_rerun_requests('tickets-process')
+print(json.dumps([{'id': str(r['id']), 'ticket_id': r['ticket_id']} for r in rows]))
+"
+```
+
+For each row in the JSON output:
+1. Hydrate ticket context for `ticket_id` (steps 2a + 2a.5 below).
+2. Run classify + draft + extract_actions (steps 2b–2e).
+3. Call `client.write_draft(...)` with the draft (Step 2f auto-send branch
+   below — same path).
+4. Mark the rerun processed:
+   ```bash
+   py -c "from packn_os_hubspot_client import client; client.mark_rerun_processed('<rerun_request_id>', '<draft_id>')"
+   ```
+
+Reruns count toward `tickets_processed` + `drafts_created` in the run
+record but do NOT consume from `per_run_cap` (operator-initiated work
+is always allowed to land regardless of the cron's per-tick budget).
+
 ## Main loop
 
 At the start of the run, capture a **run envelope** you'll use for step 3.5:
@@ -72,7 +176,21 @@ Update these as you move through the loop; step 3.5 flushes them to the Sheets w
 
 ### 1. Fetch candidate tickets
 
-Call `mcp__claude_ai_HubSpot__search_crm_objects`:
+**BEFORE the call, acquire a HubSpot rate-limit token (Phase 4 HUB-07):**
+
+```bash
+py -m packn_os_hubspot_client.rate_limit
+```
+
+This blocks until a token is available against
+`rate:hubspot:existing-automation` (capacity 3/s; coordinated with
+Pack'N OS's `rate:hubspot:packn-os` so the sum is ≤ 5/s — HubSpot's
+account-wide Search cap). Exit 0 = token acquired (or degraded to
+passthrough on Redis outage — proceeds anyway, better to over-call
+than wedge the cron tick). Apply the same shell-out before EVERY
+`mcp__claude_ai_HubSpot__*` call below.
+
+Then call `mcp__claude_ai_HubSpot__search_crm_objects`:
 - objectType: `tickets`
 - filters (all AND'd):
   - `hs_lastmodifieddate > {last_run_at}`
@@ -103,6 +221,12 @@ Before any hydration or classification, check `state.json:ticket_fingerprints[ti
 **Fingerprint reset**: if a ticket's `hs_last_message_from_visitor` flips back to `true` AFTER being `false` (i.e., customer replied after an agent's public response), the implicit dedupe still triggers if num_notes hasn't changed. In that case, the operator can manually clear the ticket's fingerprint from `state.json` to force re-processing. Document this in run-log observations if you spot the pattern.
 
 #### 2a. Hydrate context
+
+**For each `mcp__claude_ai_HubSpot__*` call in this hydration step (and ALL
+HubSpot MCP calls hereafter), acquire a rate-limit token first via the
+`py -m packn_os_hubspot_client.rate_limit` shell-out (Phase 4 HUB-07).
+The token-bucket protects against bursts above the HubSpot 5/s account-wide
+Search cap when Pack'N OS is also making calls in parallel.**
 
 **For form-sourced tickets (`source_type == "FORM"`):**
 
@@ -265,31 +389,97 @@ Also compose an **auto-send subject** (used in both paths so the queued record h
 
 **Auto-send path** (`is_auto_send == true`):
 
-1. Determine the `to_email`:
-   - Prefer `ticket_context.contact.email`.
-   - Fall back to the first value in `hs_all_associated_contact_emails` if the contact email is empty.
-   - If still empty → abort auto-send for this ticket and fall through to the draft path with a run-log note `auto_send_skipped: no_recipient`.
-2. Build the payload (stdin JSON for `scripts/send_customer_reply.py`):
+> **Phase 4 cutover (CONTEXT D-04, D-05 — no shadow mode):** customer-facing
+> auto-send is REPLACED with a Pack'N OS draft write. The legacy
+> `scripts/send_customer_reply.py` invocation is no longer used for
+> customer-facing replies; Pack'N OS owns the approve→Gmail+HubSpot send
+> chain after the operator reviews the draft. The skill no longer auto-sends
+> customer replies. Internal sends (urgent solo emails to lconner+chansen,
+> `/packn-digest` recipient sends) are UNCHANGED — those still use Gmail
+> directly.
+
+1. Build the snapshot of the HubSpot ticket fields the draft was generated
+   against (CONTEXT D-05 — `hubspot_ticket_snapshot` JSONB on
+   `automation_drafts`). Required keys: `category`, `captured_at` (ISO-8601);
+   recommended: `subject`, `body`, `contact`, `custom_properties`.
+
    ```json
    {
-     "ticket_id":  "<ticket_id>",
-     "to_email":   "<resolved recipient>",
-     "to_name":    "<contact.name if present, else empty>",
-     "subject":    "<composed per rule above>",
-     "body_plain": "<drafted reply from step 2d>",
-     "body_html":  "<drafted reply rendered as HTML; derived server-side if omitted>",
-     "metadata_block": "--- PACKN_METADATA_V1 ---\n<single-line JSON with category, classifier_reason, topic_of_ticket, source_type, posted_as: \"auto_send\", urgent_emailed, action_items>\n--- PACKN_METADATA_END ---"
+     "subject":           "<ticket_context.subject>",
+     "body":              "<ticket_context.latest_customer_message>",
+     "category":          "<classifier.category>",
+     "topic_of_ticket":   "<ticket_context.topic_of_ticket>",
+     "source_type":       "<ticket_context.source_type>",
+     "contact":           {"name": "...", "email": "..."},
+     "custom_properties": {"order_number": "...", "tracking_number": "...", ...},
+     "captured_at":       "<run_started_at_utc ISO-8601>"
    }
    ```
-   The helper appends `metadata_block` (verbatim) to the end of the `[AUTO-SENT TO CUSTOMER]` note body so the remote digest can reconstruct the action items. Format matches the PACKN_METADATA_V1 block on draft notes.
-3. If `dry_run: true` → run `py scripts/send_customer_reply.py` **without** `--send` (it'll print the preview payload). Log the preview in the run log under the ticket's entry.
-4. If `dry_run: false` → run `py scripts/send_customer_reply.py --send`. Capture stdout (JSON with `gmail_message_id`, `note_engagement_id`, `email_engagement_id`). On exit code 0, record `posted_as: "auto_send"` plus all three IDs in the run log. Increment counter `auto_sends`.
-   - **Why both a note and an email engagement?** HubSpot Help Desk ticket timelines render only conversation-thread messages and note engagements — email engagements are hidden. The email engagement (v1 `type: EMAIL`) is an audit-trail artifact reachable via API / the contact timeline. The note engagement (v1 `type: NOTE`) prefixed `[AUTO-SENT TO CUSTOMER]` is what the reviewer actually sees on the ticket. Both are created by the helper in one run.
-5. **Exit code 7 (partial failure: Gmail sent but timeline-visible note failed to post)** → record with a `!! AUTO_SEND_NOTE_FAILED` marker in the run log including the `gmail_message_id`. The customer got the email but the reviewer has no on-ticket record; the operator should add a note manually. Do not re-send. Continue to step 2g.
-6. **Exit code 4 (Gmail API error)** → the customer did NOT receive the email. Fall through to the draft path: post as internal note instead. Mark `auto_send_failed: true` in the run log and counter `auto_send_failures`.
-7. **Other non-zero exit codes** (2/3/5/6) → log the error with the error message; fall through to the draft path for safety.
 
-**Auto-sent tickets with non-empty `action_items` ARE queued** to `pending_actions.json` so the digest can surface claim-filing, investigation, and other backend work to the reviewer — but with `posted_as: "auto_send"` so the digest skips the "send the drafted reply" reminder (the customer already got the reply). Auto-sent tickets with `action_items == []` are NOT queued — the digest has nothing to add for them.
+2. Acquire a HubSpot rate-limit token (the `client.write_draft` call itself
+   does not need one — it's a Postgres write — but defensively re-acquire
+   anyway in case any post-draft MCP call follows in this iteration):
+
+   *(no token required for Postgres writes; skip the rate_limit shellout)*
+
+3. Call `client.write_draft` to INSERT a `pending` row into
+   `automation_drafts`. Idempotency triple is `(tenant_id, routine_name,
+   ticket_id, prompt_version)` — replays return the existing draft_id, so
+   it's safe to re-run the cron over a ticket that's already been drafted
+   in a prior tick.
+
+   ```bash
+   py -c "
+   import json
+   from packn_os_hubspot_client import client
+   draft_id = client.write_draft(
+       ticket_id='<ticket_id>',
+       routine_name='tickets-process',
+       draft_body='<drafted reply from step 2d, plain text>',
+       model='claude-sonnet-4-5',
+       prompt_version='v3.2.1',
+       hubspot_ticket_snapshot=<the JSON dict from step 1, dumped via json.dumps()>,
+   )
+   print(draft_id)
+   "
+   ```
+
+4. If `dry_run: true` → log the would-be call (full payload) in the run log;
+   do NOT actually call `client.write_draft`. Continue to step 2g for action
+   items + digest queue.
+
+5. If `dry_run: false` → run the shell-out above. Capture stdout (the new
+   draft_id, a UUID string). On exit 0, record `posted_as: "draft"` and
+   `draft_id` in the run log. Increment counter `notes_posted`.
+
+   - **Replay safety (CONTEXT D-05):** the unique constraint
+     `automation_drafts_idem_uniq` guarantees the same `(routine_name,
+     ticket_id, prompt_version)` triple INSERTs at most one row. A
+     re-fired cron tick over the same un-resolved ticket returns the
+     existing draft_id without writing a duplicate.
+   - **No customer email is sent.** The operator reviews the draft via
+     `/automation/drafts/<draft_id>` in Pack'N OS and clicks Approve+send;
+     Pack'N OS then sends via its own Gmail OAuth + writes a HubSpot
+     engagement note (Phase 2 D-31, D-38).
+
+6. **Exception during write_draft** (e.g., Postgres unreachable, ValueError
+   from missing `category` or `captured_at` in the snapshot) → log the
+   error with full traceback in the run log under this ticket's entry.
+   Counter `auto_send_failures` (kept for legacy semantics — now means
+   "write_draft failed"). Do NOT fall through to a HubSpot internal note
+   — the operator surface for this is the run-log + the eventual
+   `automation_runs.error_summary` field. Continue to step 2g.
+
+**Auto-sent tickets with non-empty `action_items` ARE queued** to
+`pending_actions.json` so the digest can surface claim-filing,
+investigation, and other backend work to the reviewer. With Phase 4
+cutover the customer reply is no longer sent automatically (it's a
+draft) — but the operator-facing action items still need to land in the
+digest. Set `posted_as: "draft"` on the queued record (since the
+customer-facing reply is now in `automation_drafts`, awaiting operator
+approval). Auto-sent tickets with `action_items == []` are NOT queued —
+the digest has nothing to add for them, and the draft itself is the
+operator's surface in Pack'N OS.
 
 **Draft path** (`is_auto_send == false`, or auto-send fell through):
 
@@ -522,6 +712,55 @@ Create `outputs/runs/<ISO timestamp>.md` with:
 - Run summary (count of tickets seen, classified, notes posted, urgent emails sent, normal items queued).
 - Per-ticket: ticket id + link, category + confidence, priority, what was done (note posted / dry-run only), any errors.
 - Any MCP errors encountered.
+
+### 4.5. Pack'N OS run-record finish (NEW — Phase 4)
+
+After the run log is written, persist the tick's outcome to the Pack'N OS
+`automation_runs` table. This row is the source of truth for the OS-side
+status panel + alert detection (CONTEXT D-03, D-13).
+
+Decide `status` based on counters:
+- `success` — at least one ticket processed AND no MCP errors AND no
+  image_errors AND no auto_send_failures.
+- `partial` — at least one ticket processed AND ANY of the above non-fatal
+  errors occurred (some tickets succeeded, some hit issues).
+- `failure` — zero tickets processed AND `mcp_errors > 0` (the run was
+  blocked entirely by MCP / auth / rate-limit issues).
+- (`skipped` is written by Step 0 BEFORE the main loop runs — never reached
+  here, since we only get to Step 4.5 if the routine was enabled.)
+
+Build `error_summary` (free-text, ≤ 8KB; the helper truncates the LAST
+8000 chars on overflow per UI-SPEC discretionary item 9). Include any
+MCP errors, image errors, write_draft failures, urgent-send failures,
+and Sheets sync failures observed during this run. If no errors, pass
+`None`.
+
+```bash
+py -c "
+from packn_os_hubspot_client import client
+client.write_run_record(
+    routine_name='tickets-process',
+    status='<success|partial|failure>',
+    error_summary='<free-text or None>',
+    tickets_processed=<counters.tickets_processed>,
+    drafts_created=<counters.notes_posted + counters.auto_sends>,
+    started_at_iso='<run_started_at_utc ISO-8601>',
+    finished_at_iso='<now ISO-8601>',
+)
+"
+```
+
+`drafts_created` is the sum of `notes_posted + auto_sends` because both
+counters represent draft writes in the Phase 4 model (`auto_sends` is
+the legacy name retained for backward compatibility — every former
+auto-send is now a draft per CONTEXT D-04).
+
+If the `client.write_run_record` shell-out itself fails (e.g., Postgres
+unreachable), log the failure to the run log with a `!! RUN_RECORD_WRITE_
+FAILED` marker and continue to Step 5. The run log on the local
+filesystem is the durable backup; Pack'N OS will surface a "no run
+record in last 60 min" alert via the alert-scan worker if this happens
+repeatedly.
 
 ### 5. Exit
 
