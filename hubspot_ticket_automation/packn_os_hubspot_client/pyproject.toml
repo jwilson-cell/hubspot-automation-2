@@ -1,0 +1,39 @@
+# Pack'N OS HubSpot helper client.
+# Local dev install (from this directory):
+#     py -m pip install -e ".[dev]"
+# Then run tests with:
+#     py -m pytest
+#
+# Per Pack'N OS Phase 4 CONTEXT D-03, this directory is the canonical source
+# of the helper module shared between Pack'N OS and the existing HubSpot
+# ticket-automation. Wave 4 copies this into the existing-automation repo via
+# a one-PR change; Pack'N OS owns the source here.
+
+[project]
+name = "packn-os-hubspot-client"
+version = "0.1.0"
+description = "Pack'N OS shared client for the existing HubSpot ticket-automation (DB I/O + Redis Lua rate-limit token acquire). See Pack'N OS Phase 4 docs."
+requires-python = ">=3.11"
+dependencies = [
+    "psycopg[binary,pool]>=3.2,<4",
+    "redis>=5,<6",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8,<9",
+    "pytest-asyncio>=0.23,<1",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+addopts = "-x -v"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["packn_os_hubspot_client"]
+package-dir = {"packn_os_hubspot_client" = "."}

@@ -2,3 +2,12 @@ google-auth>=2.23
 google-auth-oauthlib>=1.2
 google-api-python-client>=2.100
 PyYAML>=6.0
+
+# Phase 4 — Pack'N OS HubSpot helper module integration.
+# Required by packn_os_hubspot_client/ for the cooperative DB poll
+# (read_routine_enabled, write_run_record, write_draft, rerun queue) AND
+# the cross-process Redis Lua rate-limit token bucket
+# (acquire_hubspot_token before each MCP HubSpot call). See
+# packn_os_hubspot_client/README.md for env vars + GRANT statements.
+psycopg[binary,pool]>=3.2,<4
+redis>=5,<6
