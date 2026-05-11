@@ -24,12 +24,20 @@ Threat-register notes (T-04-* in the plan):
 
 import json
 import logging
+from pathlib import Path
 from typing import Optional
 
 from .db import get_pool
 from .tenant import TENANT_ID
 
 logger = logging.getLogger(__name__)
+
+# Sibling-repo layout: pending_actions.json lives under hubspot_ticket_automation/config/.
+# This constant is relative to the package root (packn_os_hubspot_client/) — one parent up
+# to reach hubspot_ticket_automation/, then config/pending_actions.json.
+# Phase 4.1 D-02 RESEARCH Open Question 5 → option B: action_items continue to flow through
+# this file (no automation_drafts schema migration); the digest skill JOINs by ticket_id.
+PENDING_ACTIONS_PATH = Path(__file__).resolve().parent.parent / "config" / "pending_actions.json"
 
 
 def read_routine_enabled(routine_name: str) -> bool:
