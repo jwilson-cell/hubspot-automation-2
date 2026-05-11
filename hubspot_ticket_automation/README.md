@@ -88,12 +88,14 @@ this at boot time. Default split: AUTOMATION=3, OS=2.
 -- Create role with explicit password (replace placeholder)
 CREATE ROLE packn_os_existing_automation WITH LOGIN PASSWORD 'REPLACE_ME';
 
--- Read-only on routines + rerun requests
-GRANT SELECT ON automation_routines TO packn_os_existing_automation;
+-- Read-only on routines + rerun requests + drafts (write_draft replay path
+-- + Phase 4.1 read_pending_drafts for digest skill)
+GRANT SELECT ON automation_routines       TO packn_os_existing_automation;
 GRANT SELECT ON automation_rerun_requests TO packn_os_existing_automation;
+GRANT SELECT ON automation_drafts         TO packn_os_existing_automation; -- ADDED Phase 4.1 D-04
 
--- Insert on runs + drafts (no UPDATE/DELETE — append-only from this side)
-GRANT INSERT ON automation_runs TO packn_os_existing_automation;
+-- Insert on runs + drafts (append-only from this side; OS owns state transitions)
+GRANT INSERT ON automation_runs   TO packn_os_existing_automation;
 GRANT INSERT ON automation_drafts TO packn_os_existing_automation;
 
 -- Update on rerun_requests, only the processed/processed_at/resulting_draft_id columns
@@ -103,11 +105,23 @@ GRANT UPDATE (processed, processed_at, resulting_draft_id)
 -- Sequence usage for SERIAL/UUID PKs
 GRANT USAGE ON SCHEMA public TO packn_os_existing_automation;
 
--- NO access to: audit_log, tasks, claims, adjustments, or any other Pack'N OS table.
+-- NO access to: audit_log, tasks, claims, adjustments, merchants, or any other
+-- Pack'N OS table. The role is scoped to the 4 automation_* tables only.
 ```
 
 The role has zero access to operator data outside the four
 `automation_*` tables. Verify with `\dp` after running the GRANTs.
+
+### Per-table privilege audit (Phase 4.1 D-04.b)
+
+| Table | Privilege | Rationale |
+|-------|-----------|-----------|
+| automation_routines | SELECT | `read_routine_enabled` — fail-closed pause gate (returns False if row missing → tick exits early without HubSpot calls) |
+| automation_rerun_requests | SELECT, UPDATE (processed, processed_at, resulting_draft_id only) | `read_pending_rerun_requests` (operator-initiated reruns) + `mark_rerun_processed` (sets the 3 marker columns; no other column writable) |
+| automation_runs | INSERT | `write_run_record` — append-only audit of each tick (status, error_summary, tickets_processed, drafts_created) |
+| automation_drafts | INSERT, SELECT | `write_draft` (INSERT) + `write_draft` ON CONFLICT replay-path (SELECT for idempotency lookup) + Phase 4.1 `read_pending_drafts` (SELECT for digest skill, replaces HubSpot draft-engagement scraping per D-02.b) |
+
+The role is scoped strictly to these 4 tables. It has NO access to `audit_log`, `tasks`, `claims`, `adjustments`, `merchants`, or any other Pack'N OS table. Column-level UPDATE on `automation_rerun_requests` prevents privilege creep beyond the 3 marker columns the sibling repo needs to write.
 
 ### Install (one-PR cutover)
 
