@@ -86,9 +86,10 @@ install + env-var + Postgres GRANT setup.
   crm_objects` with a token acquire.
 - Step 2a (Hydrate context) — wraps `mcp__claude_ai_HubSpot__search_crm_
   objects` calls (for emails / contact / company) with a token acquire each.
-- Step 2f (Post the reply) — auto-send branch replaced with
-  `client.write_draft`; draft branch's `mcp__claude_ai_HubSpot__manage_crm_
-  objects` note-create still wrapped in a token acquire.
+- Step 2f (Post the reply) — BOTH the auto-send branch AND the draft branch
+  now invoke `client.write_draft` (Phase 4.1 D-02.a hard-cut). No HubSpot
+  note engagement is created for either path; Pack'N OS is the single
+  operator surface for both.
 - Step 5 (NEW, at end of run) — the run_record finish.
 
 ## Step 0: Pack'N OS routine gate + run-record start (NEW — Phase 4)
@@ -484,28 +485,40 @@ operator's surface in Pack'N OS.
 **Draft path** (`is_auto_send == false`, or auto-send fell through):
 
 - If `dry_run: true` → log what would have been posted to `outputs/runs/<timestamp>.md`.
-- Else → use `mcp__claude_ai_HubSpot__manage_crm_objects` to create a note engagement associated to this ticket. The note body has THREE parts, in order:
-  1. The `[DRAFT — REVIEW BEFORE SENDING]` header line.
-  2. The drafted reply text (verbatim, customer-facing).
-  3. A **PACKN_METADATA_V1** block (see below) so the remote digest can reconstruct classifier output + action items without a local queue file.
-- Do NOT change ticket stage or assignee.
-- Record `posted_as: "draft"` and the `posted_note_id` for step 2h. Increment counter `notes_posted`.
+- Else → use `py -c` to invoke `packn_os_hubspot_client.client.write_draft` with the ticket snapshot. This writes a row to Pack'N OS `automation_drafts` with `state='pending'`; the OS-side approval queue picks it up at `/automation/drafts`. **The draft branch NO LONGER creates a HubSpot draft engagement note.** The Pack'N OS UI is the operator surface (Phase 4 D-04 — ALL customer replies now in automation_drafts; Phase 4.1 D-02 closes the partial cutover).
 
-**PACKN_METADATA_V1 block format** (identical for draft notes AND auto-sent notes — this is the canonical embed):
+  ```bash
+  py -c "
+  import json
+  from packn_os_hubspot_client import client
+  draft_id = client.write_draft(
+      ticket_id='<ticket_id>',
+      routine_name='tickets-process',
+      draft_body='<drafted reply from step 2d, plain text>',
+      model='claude-sonnet-4-5',
+      prompt_version='v3.2.1',
+      hubspot_ticket_snapshot=<the JSON dict from the auto-send branch step 1, dumped via json.dumps()>,
+  )
+  print(draft_id)
+  "
+  ```
+
+- Build the snapshot dict the same way the auto-send branch above does (step 1) — required keys `category` + `captured_at`; recommended `subject`, `body`, `contact`, `custom_properties`. The draft branch uses the same snapshot shape so both branches feed automation_drafts uniformly.
+- Do NOT change ticket stage or assignee. **Do NOT create a HubSpot note engagement for the draft (Phase 4.1 D-02.a hard-cut).**
+- Action items continue to be appended to `config/pending_actions.json` per the existing pipeline (option B per Phase 4.1 D-02 RESEARCH Open Question 5). The digest JOINs by `ticket_id`.
+- Record `posted_as: "draft"` and the returned `draft_id` (NOT a `posted_note_id` — there's no HubSpot engagement anymore) for step 2h. Increment counter `notes_posted`.
+
+**Per Phase 4.1 D-02.b:** the `hubspot-actions-digest` skill now reads pending drafts via `client.read_pending_drafts(...)` directly from `automation_drafts`. The PACKN_METADATA_V1 block is no longer emitted (the digest reads structured columns from the DB instead).
+
+**Exception during write_draft** (e.g., Postgres unreachable, ValueError from missing `category` or `captured_at` in the snapshot) → log the error with full traceback in the run log under this ticket's entry. Do NOT fall back to a HubSpot internal note — the operator surface for this is the run-log + the eventual `automation_runs.error_summary` field. Continue to step 2g.
+
+**Legacy (pre-Phase 4.1) reference — PACKN_METADATA_V1 block format:** retained here for historical context only. Prior to the Phase 4.1 D-02.a hard-cut, the draft branch posted a HubSpot note engagement containing this block alongside the drafted reply body. Pre-Phase-4.1 digest runs scraped this block. Post-Phase-4.1, neither the block nor the engagement is emitted on the draft path; the digest reads from `automation_drafts` directly.
 
 ```
---- PACKN_METADATA_V1 ---
-{"v":1,"category":"<classifier category>","classifier_reason":"<one-sentence classifier.reason>","topic_of_ticket":"<form value or null>","source_type":"FORM|EMAIL|CHAT|...","posted_as":"draft|auto_send","urgent_emailed":false,"action_items":[{"action_type":"...","description":"...","owner_hint":"...","blocking_info_needed":[...],"severity":"urgent|normal","needs_hubspot_reply":true|false}]}
+--- PACKN_METADATA_V1 ---  (LEGACY — no longer emitted)
+{"v":1,"category":"<classifier category>","classifier_reason":"<one-sentence classifier.reason>","topic_of_ticket":"<form value or null>","source_type":"FORM|EMAIL|CHAT|...","posted_as":"draft|auto_send","urgent_emailed":false,"action_items":[...]}
 --- PACKN_METADATA_END ---
 ```
-
-Rules for the block:
-- Emit as a single-line JSON to make regex parsing robust. Escape newlines in strings (`\n`).
-- Include even when `action_items == []` — the digest still needs `category`, `classifier_reason`, etc. to group and render.
-- Reviewer ignores this block in HubSpot UI; the digest parses it.
-- When regenerating a draft (re-processing after new customer note), post a NEW note with a fresh metadata block. Do not edit prior notes.
-
-Handle the "did it succeed" check: if the MCP call returns an error on the draft path, log it in the run log under that ticket's entry and continue. (The digest now reads directly from HubSpot, so a failed note post means that ticket simply won't appear in the next digest — fixable by re-running processing.)
 
 #### 2g. Route action items + queue for digest
 
