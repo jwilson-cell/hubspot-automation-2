@@ -6,6 +6,9 @@ Public functions (called by the existing automation's SKILL.md cron skill):
                      drafts_created, started_at_iso, finished_at_iso) -> None
     write_draft(ticket_id, routine_name, draft_body, model, prompt_version,
                 hubspot_ticket_snapshot) -> str  (draft_id, idempotent on D-05 triple)
+    read_pending_drafts(routine_name, since_hours=48) -> list[dict]
+        (Phase 4.1 D-02.b - digest skill reads pending drafts via this helper
+         instead of scraping HubSpot draft engagement PACKN_METADATA_V1 blocks)
     read_pending_rerun_requests(routine_name) -> list[dict]
     mark_rerun_processed(rerun_request_id, resulting_draft_id) -> None
 
@@ -27,16 +30,19 @@ import logging
 from pathlib import Path
 from typing import Optional
 
+from psycopg.rows import dict_row
+
 from .db import get_pool
 from .tenant import TENANT_ID
 
 logger = logging.getLogger(__name__)
 
-# Sibling-repo layout: pending_actions.json lives under hubspot_ticket_automation/config/.
-# This constant is relative to the package root (packn_os_hubspot_client/) — one parent up
-# to reach hubspot_ticket_automation/, then config/pending_actions.json.
-# Phase 4.1 D-02 RESEARCH Open Question 5 → option B: action_items continue to flow through
-# this file (no automation_drafts schema migration); the digest skill JOINs by ticket_id.
+# Phase 4.1 D-02.a / RESEARCH Open Question 5 (option B) - action_items continue
+# to flow through pending_actions.json in the sibling-repo's config/ dir; the
+# canonical Pack'N OS source has no equivalent file (this constant is exported
+# for symmetry with the sibling-repo mirror but is unused in the Pack'N OS-only
+# code paths). When the helper is mirrored to the sibling repo, this constant
+# resolves to <sibling-repo>/hubspot_ticket_automation/config/pending_actions.json.
 PENDING_ACTIONS_PATH = Path(__file__).resolve().parent.parent / "config" / "pending_actions.json"
 
 
@@ -133,6 +139,57 @@ def write_draft(
             )
             existing = cur.fetchone()
             return str(existing["id"]) if existing else ""
+
+
+def read_pending_drafts(routine_name: str, since_hours: int = 48) -> list[dict]:
+    """Read all pending drafts for this routine in the last N hours.
+
+    Returns each row as a dict with the columns the digest needs to render:
+        id, ticket_id, draft_body, hubspot_ticket_snapshot (parsed JSON), created_at
+
+    Used by the hubspot-actions-digest skill (Phase 4.1 D-02.b) instead of
+    scraping HubSpot draft engagement notes for PACKN_METADATA_V1 blocks.
+
+    Returns [] on exception (fail-closed: missing drafts < silent crash).
+
+    Per Phase 4.1 D-04: requires SELECT on automation_drafts for the
+    packn_os_existing_automation role (granted via Phase 4.1 D-04.c).
+
+    Filters applied:
+        - tenant_id = TENANT_ID (multi-tenant invariant)
+        - routine_name = <param>
+        - state = 'pending' (state machine handles natural dedup; once a draft
+          transitions to approved/sent/rejected/superseded it's no longer surfaced)
+        - deleted_at IS NULL (soft-delete invariant)
+        - created_at > NOW() - INTERVAL since_hours (lookback window)
+
+    Ordering: created_at ASC so the digest renders oldest-first (consistent
+    with the pre-Phase-4.1 HubSpot search ASC ordering).
+    """
+    try:
+        with get_pool().connection() as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(
+                    """
+                    SELECT id, ticket_id, draft_body, hubspot_ticket_snapshot, created_at
+                    FROM automation_drafts
+                    WHERE tenant_id = %s
+                      AND routine_name = %s
+                      AND state = 'pending'
+                      AND deleted_at IS NULL
+                      AND created_at > NOW() - (%s || ' hours')::interval
+                    ORDER BY created_at ASC
+                    """,
+                    (TENANT_ID, routine_name, str(since_hours)),
+                )
+                return cur.fetchall()
+    except Exception as e:
+        logger.warning(
+            "read_pending_drafts failed: %s",
+            e,
+            extra={"routine": routine_name},
+        )
+        return []
 
 
 def write_run_record(

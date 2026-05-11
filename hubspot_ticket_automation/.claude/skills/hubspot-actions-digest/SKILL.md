@@ -1,87 +1,108 @@
 ---
 name: hubspot-actions-digest
-description: Compose and send a reviewer digest email of all HubSpot tickets with drafted (or auto-sent backend-action) replies not yet digested. Reads directly from HubSpot via MCP (no local state file). Sends via Gmail using the local OAuth helper (scripts/send_digest_email.py) so the email lands in reviewer inboxes, not drafts. Designed to run on the server under cron at 8am/12pm/3pm ET M-F, also invokable manually.
+description: Compose and send a reviewer digest email of all HubSpot tickets with drafted (or auto-sent backend-action) replies not yet digested. Reads pending drafts directly from Pack'N OS automation_drafts via packn_os_hubspot_client (Phase 4.1 D-02.b — replaces the prior HubSpot search for PACKN_METADATA_V1 blocks). Sends via Gmail using the local OAuth helper (scripts/send_digest_email.py) so the email lands in reviewer inboxes, not drafts. Designed to run on the server under cron at 8am/12pm/3pm ET M-F, also invokable manually.
 ---
 
-# HubSpot Digest Skill — HubSpot-first (no local state)
+# HubSpot Digest Skill — Pack'N OS-first (post-Phase 4.1 D-02.b)
 
-This skill runs **on the server** under cron (`/packn-digest` at 8am/12pm/3pm ET M-F). It does NOT read `config/pending_actions.json` or any local queue file. The single source of truth for the queue is the set of note engagements on HubSpot tickets posted by the `hubspot-tickets` skill, each carrying a `PACKN_METADATA_V1` block with the category, classifier reason, and action items.
+This skill runs **on the server** under cron (`/packn-digest` at 8am/12pm/3pm ET M-F). It does NOT read `config/pending_actions.json` for the *draft list* (that file is still the canonical source for `action_items` per RESEARCH Open Question 5 option B — see Step 4 below). The single source of truth for the **draft queue** is the `automation_drafts` table in Pack'N OS, read via the `packn_os_hubspot_client.client.read_pending_drafts` helper.
 
 Sends the composed digest via Gmail using `scripts/send_digest_email.py` (local OAuth, same token as auto-send). The From line is `Pack'N Customer Care <customercare@gopackn.com>` via the Gmail "Send mail as" alias — matches the sender identity used for customer auto-sends.
 
-## Required MCP connectors
+## Required connectors
 
-- `mcp__claude_ai_HubSpot__*` (search + manage_crm_objects)
-
-No Gmail MCP dependency — the skill sends through the local Python helper, not through an MCP connector.
+- Postgres access via `packn_os_hubspot_client` (PACKN_OS_DATABASE_URL env var; the `packn_os_existing_automation` role has SELECT on `automation_drafts` per Phase 4.1 D-04.c GRANT)
+- No HubSpot MCP needed for the draft queue read (Phase 4.1 D-02.b — zero HubSpot API calls for the discovery step)
+- No Gmail MCP dependency — the skill sends through the local Python helper, not through an MCP connector
 
 ## Inputs read from the repo
 
 - `config/settings.yaml` — `notify_emails` (list), `hubspot_portal_id`, `hubspot_timezone`.
 - `config/categories.yaml` — `category_owners` (map: category → "luca" | "charlie"), `suppress_reply_reminder_categories` (list).
+- `config/pending_actions.json` — per-ticket action_items (option B per RESEARCH Open Question 5); the digest JOINs by `ticket_id`.
 
 ## Flow
 
-### 1. Fetch candidate notes from HubSpot
+### Step 1: Read pending drafts from Pack'N OS
 
-Call `mcp__claude_ai_HubSpot__search_crm_objects` with:
+Invoke the Python helper to read all pending drafts from `automation_drafts` (Phase 4.1 D-02.b — replaces the prior HubSpot-search-for-`PACKN_METADATA_V1` approach):
 
-- `objectType: notes`
-- Filter: `hs_note_body CONTAINS_TOKEN "PACKN_METADATA_V1"` (only notes posted by our automation carry this token).
-- Filter: `hs_timestamp > now - 48h` (two-day lookback — wider than any single digest gap to catch anything missed. The `[DIGESTED]` marker check below de-dupes.)
-- `properties`: `hs_note_body`, `hs_timestamp`, `hs_createdate`
-- `limit`: 200 (one page; if hit, raise a warning — Pack'N volume shouldn't need pagination for a single digest window)
-- `sorts`: `hs_timestamp` ascending
-
-For each note returned, also fetch its `tickets` association (via `associatedWith` or a follow-up `search_crm_objects` with `hs_engagement_associations.ticket`). Discard any note with zero ticket associations.
-
-### 2. De-dupe against `[DIGESTED]` markers
-
-For each candidate note's associated ticket, look up any sibling notes on that ticket:
-
-- `objectType: notes`
-- `associatedWith: [{objectType: "tickets", operator: "EQUAL", objectIdValues: [<ticket_id>]}]`
-- `properties: hs_note_body, hs_timestamp`
-- `limit: 50`
-
-If ANY sibling note has `hs_note_body` starting with `[DIGESTED at ` AND `hs_timestamp > <candidate_note.hs_timestamp>`, that ticket has already been digested since this candidate was created — SKIP.
-
-Otherwise, keep the ticket as an active queue entry.
-
-### 3. Hydrate ticket + contact for display
-
-For each surviving ticket, fetch:
-
-- Ticket properties: `subject`, `source_type`, `topic_of_ticket`, `order_number`, `tracking_number` (for context).
-- Associated contact (first): `firstname`, `lastname`, `email`.
-- Associated company (first, if any): `name`.
-
-Use a single batched `get_crm_objects` per object type to keep MCP calls low.
-
-### 4. Parse the PACKN_METADATA_V1 block from each note
-
-For each kept note, extract the block between lines:
-
-```
---- PACKN_METADATA_V1 ---
-<single-line JSON>
---- PACKN_METADATA_END ---
+```bash
+py -c "
+import json
+from packn_os_hubspot_client import client
+drafts = client.read_pending_drafts('tickets-process', since_hours=48)
+print(json.dumps([
+    {
+        'draft_id': str(d['id']),
+        'ticket_id': d['ticket_id'],
+        'draft_body': d['draft_body'],
+        'snapshot': d['hubspot_ticket_snapshot'],
+        'created_at': d['created_at'].isoformat() if d.get('created_at') else None,
+    }
+    for d in drafts
+]))
+"
 ```
 
-Parse the JSON. If parsing fails, log a warning and SKIP the ticket (back-compat with any malformed note).
+Each draft includes the ticket snapshot (`hubspot_ticket_snapshot` JSONB column) captured at draft-generation time. The snapshot has `subject`, `body`, `category`, `topic_of_ticket`, `source_type`, `contact`, `custom_properties`, `captured_at` — enough to render the digest without any live HubSpot calls.
 
-Extract the drafted reply body as the text BETWEEN the header line (`[DRAFT — REVIEW BEFORE SENDING]` or `[AUTO-SENT TO CUSTOMER] ...`) and the `PACKN_METADATA_V1` block. Preserve line breaks.
+The helper returns rows ordered by `created_at` ASC (oldest first) so the digest renders consistently. The 48-hour lookback is wider than any single digest gap; state-machine dedup (Step 2 below) handles already-handled drafts naturally.
+
+**Side effect:** ZERO HubSpot API calls for the discovery step (vs. ~1 search call per digest run in the legacy path). Phase 4.1 D-08.b verification target.
+
+### Step 2: (DELETED — natural dedup via state machine)
+
+Drafts in `automation_drafts` flow through state transitions: `pending → approved → sent` OR `pending → rejected` OR `pending → superseded`. Step 1 filters on `state='pending'`, so once an operator approves/rejects/supersedes a draft via Pack'N OS UI, the next digest run won't surface it. No legacy dedup marker notes needed.
+
+(Pre-Phase-4.1 the digest posted legacy dedup marker notes to HubSpot to de-dupe against the scraped PACKN_METADATA_V1 search. Post-Phase-4.1 D-02.b, those markers are no longer posted — the state machine on `automation_drafts.state` is the source of truth.)
+
+### Step 3: Use the snapshot for ticket context
+
+Each draft from Step 1 includes its `snapshot` field. Use directly for digest rendering: `subject`, `body`, `category` (owner routing), `topic_of_ticket`, `contact`, `source_type`, `captured_at`. No live HubSpot SDK call needed.
+
+If a snapshot lacks a non-essential field (e.g., older drafts pre-dating a snapshot-schema bump), substitute a sensible default at render time rather than skipping the ticket — the digest is a reviewer surface, not a downstream consumer.
+
+### Step 4: Read action_items from config/pending_actions.json
+
+Per RESEARCH Open Question 5 option B (no `automation_drafts` schema migration for action_items), action_items continue to flow through the sibling repo's local file:
+
+```bash
+py -c "
+import json
+from pathlib import Path
+actions = json.loads(Path('config/pending_actions.json').read_text() or '[]')
+print(json.dumps(actions))
+"
+```
+
+JOIN by `ticket_id` against the drafts list from Step 1. A draft without matching action_items renders with empty `action_items` (and falls into the `suppress_reply_reminder_categories` branch in Step 6 if its category matches).
+
+NO `PACKN_METADATA_V1` block parsing needed — that block is no longer emitted on the draft path post-Phase-4.1 D-02.a hard-cut.
 
 ### 5. Build the per-ticket record
 
-Assemble one record per ticket with the fields the digest body needs:
+Assemble one record per draft (from Steps 1 + 4) with the fields the digest body needs. The draft's `snapshot` (from `hubspot_ticket_snapshot`) supplies subject/contact/category; the JOINed entry from `pending_actions.json` supplies action_items + urgent_emailed:
 
 ```
 {
-  ticket_id, ticket_subject, ticket_link, contact, company,
-  category, topic_of_ticket, source_type, posted_as,
-  posted_note_id, drafted_reply_body, classifier_reason,
-  urgent_emailed, action_items[], queued_at (note.hs_timestamp)
+  ticket_id:           <draft.ticket_id>,
+  ticket_subject:      <snapshot.subject>,
+  ticket_link:         f"https://app.hubspot.com/contacts/{hubspot_portal_id}/ticket/{ticket_id}",
+  contact:             <snapshot.contact.name + " <" + snapshot.contact.email + ">">,
+  company:             <derive from contact or pending_actions entry if present>,
+  category:            <snapshot.category>,
+  topic_of_ticket:     <snapshot.topic_of_ticket or null>,
+  source_type:         <snapshot.source_type>,
+  posted_as:           "draft"  (post-Phase-4.1 D-02.a, ALL automation_drafts rows are drafts —
+                                 the auto-send branch ALSO writes drafts now; see SKILL.md hubspot-tickets
+                                 Phase 4 cutover narrative for the both-branches-uniform model)
+  draft_id:            <draft.draft_id>,
+  drafted_reply_body:  <draft.draft_body>,
+  classifier_reason:   <look up by ticket_id in pending_actions.json if present; else empty>,
+  urgent_emailed:      <look up in pending_actions.json; default false>,
+  action_items[]:      <list from pending_actions.json filtered by ticket_id; default []>,
+  queued_at:           <draft.created_at>
 }
 ```
 
@@ -154,7 +175,7 @@ Generated {timestamp} by hubspot-actions-digest (remote).
 
 ### 7. Empty-queue handling
 
-If `N == 0`, do NOT create a Gmail draft. Do NOT post any `[DIGESTED]` markers. Emit a one-line log message ("queue empty, no digest sent at {timestamp}") and exit cleanly. Empty-run archives don't need to be written for remote runs — the routine log in Claude Code captures the run.
+If `N == 0`, do NOT create a Gmail draft. (Post-Phase-4.1 D-02.b: there are no legacy dedup markers to omit either — the digest no longer writes to HubSpot at all.) Emit a one-line log message ("queue empty, no digest sent at {timestamp}") and exit cleanly. Empty-run archives don't need to be written for remote runs — the routine log in Claude Code captures the run.
 
 ### 8. Send the digest via Gmail
 
@@ -173,20 +194,17 @@ The helper:
 - On exit 0, prints `{"sent_message_id": "...", "from": "...", "to": [...]}` on stdout. Capture `sent_message_id` for the archive.
 - Exit codes: 2 = bad payload, 3 = Gmail token missing, 4 = Gmail API error.
 
-**If the helper exits non-zero, log the error and EXIT WITHOUT posting `[DIGESTED]` markers.** The next digest run will retry. Do NOT silently lose data by marking tickets digested if the email was never sent.
+**If the helper exits non-zero, log the error and EXIT.** The next digest run will retry. (Post-Phase-4.1 D-02.b: drafts remain in `state='pending'` until the operator actions them via Pack'N OS, so a failed digest send is recovered by simply re-running — no dedup-marker bookkeeping needed.)
 
 Rationale for using a local helper instead of the Gmail MCP: the Gmail MCP connector can only create drafts — it cannot send. On the server we have filesystem access to the OAuth token and can send directly in one step.
 
-### 9. Mark each included ticket as digested
+### Step 9: (DELETED — natural state-machine dedup makes markers unnecessary)
 
-For each ticket in the digest, post a `[DIGESTED at <ISO timestamp>]` note via `mcp__claude_ai_HubSpot__manage_crm_objects`:
+Pre-Phase-4.1 the digest posted legacy dedup marker notes on each included ticket via HubSpot, so the next digest run's PACKN_METADATA_V1 search could de-dupe against them.
 
-- `objectType: notes`
-- `properties.hs_timestamp`: current UTC ISO (ms precision)
-- `properties.hs_note_body`: `[DIGESTED at <ISO timestamp>] Included in digest {hour_window}. Gmail message {sent_message_id}. {N_in_this_digest} tickets total.`
-- `associations`: `[{targetObjectId: <ticket_id>, targetObjectType: "tickets"}]`
+Post-Phase-4.1 D-02.b, the state machine on `automation_drafts.state` handles dedup naturally: once the operator approves/rejects/supersedes the draft via Pack'N OS UI, the next `read_pending_drafts` call won't surface it. No HubSpot writes from the digest path.
 
-Do this AFTER the Gmail draft was successfully created. On individual `[DIGESTED]` post failure: log the error but continue — the worst case is that ticket shows up in the NEXT digest as well, which is a tolerable dupe (better than missing it).
+If an operator wants to "skip" a draft from the digest without actioning it via Pack'N OS, that's currently a no-op — they should mark the draft as `rejected` or `superseded` in Pack'N OS UI (or wait for the 48h lookback window to expire). Defer any "skip-from-digest" UX to a future plan if operators request it.
 
 ### 10. Summary
 
@@ -194,16 +212,15 @@ Return a one-line status:
 
 - `"Sent digest with N tickets across C categories ({L} Luca · {C} Charlie). Gmail message id: {sent_message_id}"`
 - `"Queue empty — no digest sent"` (on empty queue)
-- `"Digest composed ({L} Luca · {C} Charlie) but Gmail send failed: {error}. No tickets marked digested — next run will retry."` (on Gmail error)
+- `"Digest composed ({L} Luca · {C} Charlie) but Gmail send failed: {error}. Drafts remain pending in Pack'N OS — next run will retry."` (on Gmail error)
 
 ## Safety / invariants
 
-- Never change ticket stage, priority, owner, or any property beyond posting the `[DIGESTED]` note.
-- The PACKN_METADATA_V1 block is the reconstitution key. If parsing fails on a note, skip the ticket rather than inventing data.
-- The `[DIGESTED]` marker note is append-only — do not modify existing markers.
-- On any single-ticket error (can't parse metadata, can't fetch contact, can't post marker), log and continue. Never let one bad ticket block the rest of the digest.
+- Never write to HubSpot from this skill (post-Phase-4.1 D-02.b). The digest is a pure-read flow against Pack'N OS `automation_drafts` + local `pending_actions.json`. No ticket stage/priority/owner changes, no engagement notes, no legacy dedup markers.
+- The `automation_drafts.state` column is the dedup source of truth. If `read_pending_drafts` returns drafts that the operator already actioned (race condition between digest send and operator approve), the worst case is a duplicate digest entry — tolerable, and the next digest run won't surface the now-non-`pending` draft.
+- On any single-ticket error (can't parse snapshot, can't find pending_actions.json entry, can't render), log and continue. Never let one bad draft block the rest of the digest.
 - Gmail send happens via the local helper script, not via the Gmail MCP connector. The helper uses the same OAuth token (`config/.secrets/token.json`) that powers customer-facing auto-sends. Digest emails land in reviewer inboxes directly — no manual click-send step.
 
 ## Back-compat with local runs (optional)
 
-If someone runs this skill LOCALLY (not via the scheduled routine), the flow is identical — it still queries HubSpot, not the local queue file. Local `config/pending_actions.json` is no longer read by this skill. (The ticket-processing skill may still write to it for its own debugging/audit, but this skill ignores that file.)
+If someone runs this skill LOCALLY (not via the scheduled routine), the flow is identical — it queries Pack'N OS Postgres via `read_pending_drafts`, not the local queue file's draft list. Local `config/pending_actions.json` IS still read (for action_items per option B), but only as a JOIN target keyed by `ticket_id` from the Pack'N OS draft list. The ticket-processing skill writes to it for action-items routing; this skill reads it but does not write.
