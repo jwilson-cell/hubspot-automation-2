@@ -23,6 +23,19 @@ Sends the composed digest via Gmail using `scripts/send_digest_email.py` (local 
 
 ## Flow
 
+### Step 0: Report current crontab schedule to Pack'N OS
+
+Fire-and-forget — failures do NOT block the digest. Lets the Pack'N OS UI
+display the real droplet cron, not the stale seed value.
+
+The marker `/packn-digest` matches the crontab line that invokes this skill
+(`claude -p /packn-digest …`). If the operator changes the invocation, update
+the marker here.
+
+```bash
+py -c "from packn_os_hubspot_client import client; client.report_routine_schedule('digest', '/packn-digest')"
+```
+
 ### Step 1: Read pending drafts from Pack'N OS
 
 Invoke the Python helper to read all pending drafts from `automation_drafts` (Phase 4.1 D-02.b — replaces the prior HubSpot-search-for-`PACKN_METADATA_V1` approach):

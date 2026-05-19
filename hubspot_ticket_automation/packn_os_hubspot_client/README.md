@@ -48,6 +48,12 @@ GRANT INSERT ON automation_drafts TO packn_os_existing_automation;
 GRANT UPDATE (processed, processed_at, resulting_draft_id)
   ON automation_rerun_requests TO packn_os_existing_automation;
 
+-- 2026-05-19: schedule self-reporting (client.report_routine_schedule).
+-- Helper reads `crontab -l` on the droplet and writes the live schedule
+-- back so the Pack'N OS UI never shows the stale seed value.
+GRANT UPDATE (cron_schedule, last_schedule_report_at)
+  ON automation_routines TO packn_os_existing_automation;
+
 -- Sequence usage for SERIAL/UUID PKs
 GRANT USAGE ON SCHEMA public TO packn_os_existing_automation;
 

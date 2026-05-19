@@ -11,6 +11,11 @@ Public functions (called by the existing automation's SKILL.md cron skill):
          instead of scraping HubSpot draft engagement PACKN_METADATA_V1 blocks)
     read_pending_rerun_requests(routine_name) -> list[dict]
     mark_rerun_processed(rerun_request_id, resulting_draft_id) -> None
+    report_routine_schedule(routine_name, cron_marker) -> Optional[str]
+        (2026-05-19: reports the actual droplet crontab back to Pack'N OS so
+         the UI never drifts from reality. Caller passes a marker substring
+         that uniquely identifies its own crontab line — e.g. the wrapper
+         script path or the slash-command name.)
 
 All functions use `with pool.connection() as conn:` for connection lifecycle
 (Pitfall 4). All INSERTs/SELECTs include tenant_id (TENANT_ID constant -
@@ -27,6 +32,7 @@ Threat-register notes (T-04-* in the plan):
 
 import json
 import logging
+import subprocess
 from pathlib import Path
 from typing import Optional
 
@@ -286,3 +292,110 @@ def mark_rerun_processed(rerun_request_id: str, resulting_draft_id: str) -> None
                 (resulting_draft_id, rerun_request_id),
             )
             conn.commit()
+
+
+def _detect_cron_schedule(marker: str) -> Optional[str]:
+    """Run `crontab -l` and return the first-5-fields schedule of the line
+    containing `marker`.
+
+    Returns None on any failure (crontab missing, marker not found, line too
+    short, subprocess timeout, exception). Callers MUST treat None as
+    "could not determine — skip the report" rather than as an error.
+
+    Handles two cron line shapes:
+        */30 * * * * /opt/.../script.sh    -> "*/30 * * * *"
+        @hourly /opt/.../script.sh         -> "@hourly"
+    """
+    try:
+        result = subprocess.run(
+            ["crontab", "-l"], capture_output=True, text=True, timeout=5
+        )
+        if result.returncode != 0:
+            return None
+        for raw_line in result.stdout.splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if marker not in line:
+                continue
+            if line.startswith("@"):
+                first = line.split(maxsplit=1)
+                return first[0] if first else None
+            parts = line.split(maxsplit=5)
+            if len(parts) >= 5:
+                return " ".join(parts[:5])
+        return None
+    except Exception:
+        return None
+
+
+def report_routine_schedule(
+    routine_name: str, cron_marker: str
+) -> Optional[str]:
+    """Detect the droplet's current crontab schedule for this routine and
+    UPDATE automation_routines so the Pack'N OS UI never shows a stale value.
+
+    The helper:
+      1. Reads `crontab -l` for the current user.
+      2. Finds the line containing `cron_marker` (e.g. 'cron_tickets.sh' for
+         tickets-process or '/packn-digest' for the digest skill).
+      3. Parses the first 5 fields as the cron schedule.
+      4. UPDATEs cron_schedule + last_schedule_report_at = NOW().
+
+    Designed for run-EVERY-tick use (operator confirmed 2026-05-19): the
+    UPDATE is unconditional but cheap (single row, indexed PK), and the
+    function ONLY logs when the schedule CHANGES or detection fails — so the
+    runs log doesn't fill up with "still */30 * * * *" lines.
+
+    Required DB grant on packn_os_existing_automation role:
+        GRANT UPDATE (cron_schedule, last_schedule_report_at)
+          ON public.automation_routines TO packn_os_existing_automation;
+
+    Returns:
+        The reported cron_schedule string on success, or None when detection
+        or the DB write failed. Never raises (fail-quiet by design).
+    """
+    detected = _detect_cron_schedule(cron_marker)
+    if detected is None:
+        logger.warning(
+            "report_routine_schedule: could not detect cron line for marker; skipping",
+            extra={"routine": routine_name, "marker": cron_marker},
+        )
+        return None
+    try:
+        with get_pool().connection() as conn:
+            with conn.cursor() as cur:
+                # 2-step so we can log only on actual schedule changes
+                # (operator wants zero log noise on the happy unchanged path).
+                cur.execute(
+                    "SELECT cron_schedule FROM automation_routines "
+                    "WHERE tenant_id = %s AND name = %s",
+                    (TENANT_ID, routine_name),
+                )
+                row = cur.fetchone()
+                previous = row["cron_schedule"] if row else None
+                cur.execute(
+                    """
+                    UPDATE automation_routines
+                    SET cron_schedule = %s,
+                        last_schedule_report_at = NOW()
+                    WHERE tenant_id = %s AND name = %s
+                    """,
+                    (detected, TENANT_ID, routine_name),
+                )
+                conn.commit()
+                if previous != detected:
+                    logger.info(
+                        "report_routine_schedule: cron changed %r -> %r",
+                        previous,
+                        detected,
+                        extra={"routine": routine_name},
+                    )
+    except Exception as e:
+        logger.warning(
+            "report_routine_schedule: DB write failed: %s",
+            e,
+            extra={"routine": routine_name, "schedule": detected},
+        )
+        return None
+    return detected

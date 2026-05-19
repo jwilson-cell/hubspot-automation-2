@@ -94,6 +94,21 @@ install + env-var + Postgres GRANT setup.
 
 ## Step 0: Pack'N OS routine gate + run-record start (NEW — Phase 4)
 
+### Step 0a: Report current crontab schedule to Pack'N OS
+
+Run BEFORE the gate so Pack'N OS knows the cron fired, even when the routine
+is paused. Fire-and-forget — failures do NOT block the rest of Step 0.
+
+The marker `cron_tickets.sh` is the wrapper script invoked by the droplet
+crontab (`/opt/packn/hubspot_ticket_automation/scripts/cron_tickets.sh`).
+If the operator renames the wrapper, update the marker here too.
+
+```bash
+py -c "from packn_os_hubspot_client import client; client.report_routine_schedule('tickets-process', 'cron_tickets.sh')"
+```
+
+### Step 0b: Routine gate
+
 BEFORE entering the main loop, run this gate. The shell-out exit code
 discriminates:
 
