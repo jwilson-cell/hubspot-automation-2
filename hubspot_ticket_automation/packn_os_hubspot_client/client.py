@@ -16,6 +16,16 @@ Public functions (called by the existing automation's SKILL.md cron skill):
          the UI never drifts from reality. Caller passes a marker substring
          that uniquely identifies its own crontab line — e.g. the wrapper
          script path or the slash-command name.)
+    claim_pending_manual_run() -> Optional[dict]
+        (2026-05-19 Phase 3: atomic SELECT+UPDATE of a single pending
+         automation_run_requests row. Race-safe via FOR UPDATE SKIP LOCKED
+         so the regular 12h cron and the 5-min manual-run poller cannot
+         double-claim. Returns the claimed row dict OR None when nothing
+         pending. Caller is responsible for invoking the routine and
+         calling mark_manual_run_completed.)
+    mark_manual_run_completed(run_request_id, resulting_run_id) -> None
+        (Phase 3: link the claimed manual-run request to the
+         automation_runs row produced by the invocation. Idempotent.)
 
 All functions use `with pool.connection() as conn:` for connection lifecycle
 (Pitfall 4). All INSERTs/SELECTs include tenant_id (TENANT_ID constant -
@@ -399,3 +409,95 @@ def report_routine_schedule(
         )
         return None
     return detected
+
+
+def claim_pending_manual_run() -> Optional[dict]:
+    """Atomically claim the OLDEST pending, non-expired manual-run request.
+
+    Returns the claimed row as a dict (id, routine_name, requested_by,
+    requested_at) on success, or None when nothing is pending.
+
+    Race-safe: uses FOR UPDATE SKIP LOCKED inside a subquery so two
+    concurrent callers (e.g. two overlapping poll-cron invocations, or the
+    poll cron racing with the regular 12h cron) cannot claim the same row.
+    The successful caller's UPDATE marks processed=true + processed_at=NOW;
+    the loser's subquery returns zero rows and the caller receives None.
+
+    Returns [] / None on exception (fail-quiet — a DB outage should not
+    crash the poll wrapper; the next tick retries).
+
+    Required DB grants on packn_os_existing_automation role:
+        GRANT SELECT, UPDATE (processed, processed_at, resulting_run_id)
+          ON public.automation_run_requests TO packn_os_existing_automation;
+    """
+    try:
+        with get_pool().connection() as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(
+                    """
+                    UPDATE automation_run_requests
+                    SET processed = true,
+                        processed_at = NOW()
+                    WHERE id = (
+                        SELECT id FROM automation_run_requests
+                        WHERE tenant_id = %s
+                          AND processed = false
+                          AND expires_at > NOW()
+                        ORDER BY requested_at ASC
+                        FOR UPDATE SKIP LOCKED
+                        LIMIT 1
+                    )
+                    RETURNING id, routine_name, requested_by, requested_at
+                    """,
+                    (TENANT_ID,),
+                )
+                row = cur.fetchone()
+                conn.commit()
+                return row if row else None
+    except Exception as e:
+        logger.warning(
+            "claim_pending_manual_run failed: %s",
+            e,
+        )
+        return None
+
+
+def mark_manual_run_completed(
+    run_request_id: str, resulting_run_id: Optional[str]
+) -> None:
+    """Link the claimed manual-run request to the automation_runs row that
+    came out of the invocation. Called by the poll-cron wrapper AFTER the
+    routine returns.
+
+    `resulting_run_id` may be None when the routine crashed before writing
+    its own automation_runs row — the wrapper still calls this so the audit
+    trail shows the claim was attempted.
+
+    Idempotent: UPDATE-by-id with no precondition; repeated calls are
+    no-ops with respect to processed=true (already set by claim).
+
+    Required DB grant: UPDATE (processed_at, resulting_run_id) on
+    automation_run_requests (covered by the GRANT in claim_pending_manual_run
+    docstring).
+    """
+    try:
+        with get_pool().connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE automation_run_requests
+                    SET resulting_run_id = %s
+                    WHERE id = %s
+                    """,
+                    (resulting_run_id, run_request_id),
+                )
+                conn.commit()
+    except Exception as e:
+        logger.warning(
+            "mark_manual_run_completed failed: %s",
+            e,
+            extra={
+                "run_request_id": run_request_id,
+                "resulting_run_id": resulting_run_id,
+            },
+        )

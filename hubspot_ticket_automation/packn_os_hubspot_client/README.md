@@ -54,6 +54,14 @@ GRANT UPDATE (processed, processed_at, resulting_draft_id)
 GRANT UPDATE (cron_schedule, last_schedule_report_at)
   ON automation_routines TO packn_os_existing_automation;
 
+-- 2026-05-19 Phase 3: manual full-routine run requests. Operators click
+-- "Run now" in Pack'N OS → a row lands in automation_run_requests; the
+-- droplet's poll_manual_runs.sh cron (every 5 min) atomically claims +
+-- invokes Claude. The UPDATE columns are limited to processed-state
+-- bookkeeping; the role cannot create or delete rows in this table.
+GRANT SELECT, UPDATE (processed, processed_at, resulting_run_id)
+  ON automation_run_requests TO packn_os_existing_automation;
+
 -- Sequence usage for SERIAL/UUID PKs
 GRANT USAGE ON SCHEMA public TO packn_os_existing_automation;
 

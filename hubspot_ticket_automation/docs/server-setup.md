@@ -283,6 +283,12 @@ ANTHROPIC_API_KEY=sk-ant-...
 0 12 * * 1-5  cd /opt/packn/hubspot_ticket_automation && claude -p /packn-digest --dangerously-skip-permissions >> outputs/runs/cron-digest.log 2>&1
 0 16 * * 1-5  cd /opt/packn/hubspot_ticket_automation && claude -p /packn-digest --dangerously-skip-permissions >> outputs/runs/cron-digest.log 2>&1
 0 19 * * 1-5  cd /opt/packn/hubspot_ticket_automation && claude -p /packn-digest --dangerously-skip-permissions >> outputs/runs/cron-digest.log 2>&1
+
+# Phase 3 (2026-05-19): manual-run poll. Picks up automation_run_requests
+# rows inserted by the Pack'N OS "Run now" button. Cheap when the queue is
+# empty (one indexed DB query, no Claude invocation). 5-min cadence gives
+# operators a "fire within ~5 min" guarantee on manual runs.
+*/5 * * * *  cd /opt/packn/hubspot_ticket_automation && scripts/poll_manual_runs.sh >> outputs/runs/manual-runs.log 2>&1
 ```
 
 Save with `Ctrl+O`, Enter, `Ctrl+X`. Verify:
