@@ -1,0 +1,7 @@
+# Force LF line endings for files that are executed on Linux (the droplet).
+# Without this, commits made on Windows ship .sh files with CRLF and the
+# kernel can't parse `#!/bin/bash\r` — symptom is "scripts/foo.sh: not
+# found" in cron logs (discovered 2026-05-19 during Phase 3 poll-cron
+# bring-up).
+*.sh text eol=lf
+*.py text eol=lf
