@@ -90,6 +90,31 @@ If the customer's complaint assumes shipment already happened, correct the recor
 
 **If `ssk_state` is entirely absent** (hydration didn't run — e.g., SSK integration disabled or errored), fall back to the hedged language below.
 
+## Related prior tickets (when present)
+
+If `ticket_context.related_tickets` is non-empty, the customer has opened
+other tickets referencing the same `order_number` within the last 30
+days. Treat this as **strong continuity signal** — almost always the
+same conversation that HubSpot failed to thread together.
+
+Rules:
+
+1. **Acknowledge the prior ticket** in the opening sentence. Example:
+   *"Following up on your earlier ticket about order #7679500 — I see
+   you've reached out again about this."*
+2. **Do NOT re-ask for information the customer already provided** on a
+   prior ticket (look at `related_tickets[*].snippet` to see what they
+   said). Re-asking is the #1 complaint surfaced by the two-ticket
+   pattern.
+3. **Reference the prior ticket id** so the reviewer can quickly cross-
+   check: *"(prior ticket #12345)"*. Plain inline reference, no link.
+4. **Flag an `internal_escalation` action item** if the prior ticket is
+   still open (stage 1 or 3) — the reviewer should consolidate before
+   sending.
+5. If the prior ticket is closed (stage 4) AND the customer is asking
+   about the same issue, treat the current ticket as a re-open — your
+   reply should not assume the prior resolution worked.
+
 ## Category-specific hints
 
 - `wismo_tracking` / `shipping_delay`: when `ssk_state` is present, use it as above. When absent, check carrier state in the KB — only recommend waiting if the carrier state genuinely warrants it. If `In Transit` with no scans for 3+ business days, propose filing a lost-package investigation.

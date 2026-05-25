@@ -116,6 +116,23 @@ shipsidekick:
     - "Carrier Issue (Provide Tracking)"
     - "Mispack (Provide Order Number)"
 
+# ---- Cross-ticket lookup (continuation context for the drafter) ----
+# When a ticket has form_fields.order_number set, search HubSpot for other
+# tickets with the same order_number custom property in the lookback window.
+# Matches are folded into ticket_context.related_tickets[] so the drafter can
+# acknowledge continuity instead of re-asking for info the customer already
+# provided on a prior ticket. Only fires when order_number is non-empty —
+# free-text channels (email/WhatsApp) skip this step. See SKILL.md step 2a.4.
+cross_ticket_lookup:
+  by_order_number:
+    enabled: true
+    lookback_days: 30
+    max_results: 3
+    # Include closed tickets too — a resolved prior ticket on the same order
+    # is exactly the continuity signal we want (e.g., customer coming back
+    # about an already-credited reship).
+    include_closed_stages: true
+
 # ---- Auto-send (customer-facing replies for form Mispack/Carrier) ----
 # Used by scripts/send_customer_reply.py. Sends via Gmail API (reusing the
 # existing token at config/.secrets/token.json) then logs the sent email as an

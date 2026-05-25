@@ -290,11 +290,76 @@ Same pattern — pull associated `emails` and sort by date. The `content` proper
     { "from": "customer" | "agent", "email": "...", "date": "...", "body_text": "..." },
     ...
   ],
-  "latest_customer_message": "<the most recent visitor-from message body>"
+  "latest_customer_message": "<the most recent visitor-from message body>",
+  "related_tickets": [
+    {
+      "ticket_id": "...",
+      "ticket_link": "...",
+      "subject": "...",
+      "stage": "1" | "3" | "4",
+      "createdate": "<ISO>",
+      "hs_lastmodifieddate": "<ISO>",
+      "topic_of_ticket": "<form value or null>",
+      "snippet": "<first ~200 chars of latest email body on that ticket, or null>"
+    }
+  ]
 }
 ```
 
 **Flag attachment presence, never hydrate contents.** Detect attachments by checking whether the ticket body / form fields mention uploaded files or by association count — DO NOT fetch `hs_file_upload`, file URLs, or file contents (see the attachment-handling rule at the top). Set `has_attachments: true` in `ticket_context` when detected. The reply drafter must NOT claim to have read the attachment; it should write: *"I see files were attached to this ticket — one of our reviewers will look at them before responding."* or similar. The draft reviewer opens the HubSpot ticket to inspect attachments before sending.
+
+#### 2a.4. Hydrate related tickets (cross-ticket continuation context)
+
+If `settings.cross_ticket_lookup.by_order_number.enabled` is true AND
+`ticket_context.form_fields.order_number` is non-empty AND non-whitespace,
+look up other tickets sharing that order number. This bridges the
+two-ticket pattern documented in CLAUDE.md invariant 11: when a customer
+re-submits the form (or replies to an auto-sent email) about an order
+they've already opened a ticket about, HubSpot creates a new ticket
+unlinked from the original. Folding prior tickets into `ticket_context`
+lets the drafter acknowledge continuity instead of re-asking for info
+already provided.
+
+**Acquire a HubSpot rate-limit token first** (Phase 4 HUB-07):
+
+```bash
+py -m packn_os_hubspot_client.rate_limit
+```
+
+Then call `mcp__claude_ai_HubSpot__search_crm_objects`:
+- objectType: `tickets`
+- filters (all AND'd):
+  - `order_number EQ "<ticket_context.form_fields.order_number>"`
+  - `hs_lastmodifieddate > <now - settings.cross_ticket_lookup.by_order_number.lookback_days>`
+  - `hs_object_id NEQ "<ticket_context.ticket_id>"` (exclude self)
+  - Stage filter: omit entirely if `include_closed_stages: true`; else apply same `active_stages` filter as the main loop.
+- properties to return: `subject`, `hs_pipeline_stage`, `createdate`, `hs_lastmodifieddate`, `topic_of_ticket`
+- limit: `settings.cross_ticket_lookup.by_order_number.max_results`
+- sorted by `hs_lastmodifieddate` DESCENDING (most recent prior first)
+
+For each match, pull the latest email body via one more
+`search_crm_objects` on `emails` (associatedWith the matched ticket,
+limit 1, sort `hs_createdate` DESC, properties `hs_email_text` +
+`hs_email_html`) to populate `snippet` — keep it to ~200 chars, plain
+text (prefer `hs_email_text`; strip HTML tags from `hs_email_html` as
+fallback). Each snippet call also requires a fresh rate-limit token
+acquire. If the snippet call fails or returns empty, set
+`snippet: null` and continue.
+
+Fold results into `ticket_context.related_tickets[]`. If zero matches,
+set `related_tickets: []` (empty list, not null) so the drafter
+prompt's "if non-empty" check works cleanly.
+
+**Log to run log**: include `related_tickets_found: <count>` per ticket
+so we can measure hit rate after a week of runs. If 0 across many
+tickets, the lookup is wasted cost and the `cross_ticket_lookup.
+by_order_number.enabled` knob in `settings.yaml` can be flipped off.
+
+**On any failure** (MCP error, rate-limit timeout, malformed response,
+filter rejected because `order_number` is not a searchable property):
+set `related_tickets: []`, log the error against the ticket, continue.
+Never abort the ticket's processing — this is enrichment, not a hard
+dependency.
 
 #### 2a.5. Hydrate ShipSidekick order state (WISMO / Carrier Issue / Mispack)
 
