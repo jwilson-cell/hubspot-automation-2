@@ -393,6 +393,31 @@ Pass whichever identifiers are present; the helper prefers `order_number` and fa
 
 Note: this step runs BEFORE classification (2b) because the ssk_state can inform classification too — e.g., if SSK says the shipment is `delivered` and the customer is complaining it didn't arrive, that's a strong signal for the `wismo_tracking` / "delivered but not received" branch.
 
+#### 2a.6. Backfill structured identifiers to the HubSpot ticket
+
+**Why this exists:** HubSpot's form-to-ticket-property mapping for `tracking_number` and `order_number` is NOT configured for Pack'N's "New ticket created from form submission" forms. The values arrive embedded in the first email's HTML blockquote and are parsed into `ticket_context.form_fields.*` at runtime (step 2a). Downstream systems — Pack'N OS's `/shipments/[tracking]` detail-view HubSpot Tickets tile, the existing search-by-property paths, and any future filterGroups EQ queries — expect the ticket's native `tracking_number` and `order_number` custom properties to be populated. Surfaced during Phase 11.1 UAT 2026-05-26: TN `1Z02D293YW35246090` was extracted by this skill into `form_fields.tracking_number` but the ticket's HubSpot `tracking_number` property remained NULL, so Pack'N OS couldn't surface the ticket on the detail view.
+
+**Trigger** (each independently):
+- `ticket_context.form_fields.tracking_number` is non-empty AND the ticket's existing `tracking_number` property is null/empty/whitespace
+- `ticket_context.form_fields.order_number` is non-empty AND the ticket's existing `order_number` property is null/empty/whitespace
+
+**Action:** acquire a rate-limit token (same pattern as the rest of 2a), then call `mcp__claude_ai_HubSpot__manage_crm_objects` with:
+
+```
+objectType: "tickets"
+operation: "update"
+objectId: "<ticket_id>"
+properties: { "tracking_number": "<form_fields.tracking_number>" }   # or order_number, or both in one call if both apply
+```
+
+**Idempotency:** the trigger check (only fire when the existing property is null/empty) makes this naturally idempotent — re-runs against the same ticket are no-ops because the property is already set. Do NOT overwrite an existing non-empty value; the operator may have edited it.
+
+**On error:** log the failure against the ticket, continue with classification (2b). This is a best-effort backfill — a write failure here MUST NOT block draft generation. The next ticket the customer touches that re-fires the dedupe path will retry.
+
+**Dry-run:** if `settings.dry_run` is true, log what WOULD be written but do NOT make the HubSpot call. Mirror the existing dry-run posture in 2f.
+
+**No PACKN_METADATA_V1 note needed** — this is a structured-property write, not a customer-visible action, so it does not need to appear in the digest stream.
+
 #### 2b. Classify
 
 Read `prompts/classify.md`. Fill in `{ticket_context}`, `{urgent_signals}`, and `{form_topic_mapping}` from `categories.yaml`.
