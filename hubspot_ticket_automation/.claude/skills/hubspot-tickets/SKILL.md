@@ -718,7 +718,7 @@ Forward only when `action_items` is **non-empty**. Pipe the same `action_items` 
 the helper:
 
 ```bash
-echo '<this ticket's action_items array as compact JSON>' | py -3 scripts/post_action_items.py action-items <ticket_id>
+echo '<this ticket's action_items array as compact JSON>' | py scripts/post_action_items.py action-items <ticket_id>
 ```
 
 - **Dry-run gate (parallel run):** invoke WITHOUT `--send` (the default). The helper LOGS the would-be

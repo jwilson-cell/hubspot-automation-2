@@ -39,11 +39,11 @@ Invariants (sibling CLAUDE.md):
       and is logged to stderr. The cron treats the POST as best-effort at-least-once
       (a later run re-POSTs; the OS dedups by ticket + action_type within the ET day).
 
-CLI (manual testing only):
-    py -3 scripts/post_action_items.py action-items <ticket_id> <items.json>   # dry-run
-    py -3 scripts/post_action_items.py action-items <ticket_id> <items.json> --send
-    py -3 scripts/post_action_items.py ticket-closed <hubspot_ticket_id>          # dry-run
-    py -3 scripts/post_action_items.py ticket-closed <hubspot_ticket_id> --send
+CLI (manual testing only — `py` is the venv python on the droplet; use `py -3` on a Windows laptop):
+    py scripts/post_action_items.py action-items <ticket_id> <items.json>   # dry-run
+    py scripts/post_action_items.py action-items <ticket_id> <items.json> --send
+    py scripts/post_action_items.py ticket-closed <hubspot_ticket_id>          # dry-run
+    py scripts/post_action_items.py ticket-closed <hubspot_ticket_id> --send
 """
 from __future__ import annotations
 
