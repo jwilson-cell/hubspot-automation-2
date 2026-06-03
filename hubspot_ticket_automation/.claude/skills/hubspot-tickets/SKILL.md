@@ -718,22 +718,24 @@ Forward only when `action_items` is **non-empty**. Pipe the same `action_items` 
 the helper:
 
 ```bash
-echo '<this ticket's action_items array as compact JSON>' | py scripts/post_action_items.py action-items <ticket_id>
+echo '<this ticket's action_items array as compact JSON>' | py scripts/post_action_items.py action-items <ticket_id> --send
 ```
 
-- **Dry-run gate (parallel run):** invoke WITHOUT `--send` (the default). The helper LOGS the would-be
-  payload + computed `X-PackN-Signature` and sends nothing. The operator adds `--send` (flips this step
-  live) only AFTER inspecting a dry-run pass AND provisioning `ACTION_INGEST_SECRET` on both sides. This
-  gate is **independent** of the global `settings.yaml dry_run` (which is already `false` for the rest of
-  the skill) — keep this step dry-run even while the rest of the skill runs live.
+- **LIVE — flipped 2026-06-03:** invoke WITH `--send` (as shown above). The helper signs the
+  `action_items` envelope and POSTs it to the OS ingestion route, so action items now materialize as
+  first-class tasks in `/tasks`. Flipped live after `ACTION_INGEST_SECRET` was provisioned on both sides
+  and the HMAC transport was verified end-to-end (signed POST → 200, unsigned → 401). To REVERT to
+  dry-run (log-only, sends nothing), remove the `--send` flag from the command above. This gate is
+  **independent** of the global `settings.yaml dry_run` (which is already `false` for the rest of the skill).
 - **Non-blocking (Sheets-sync contract):** the helper never raises out — it always prints a result dict
   and exits 0/1. A failure (`secret_unprovisioned` → the OS route 503s, `os_ingest_url_unset`, a network
   error, or a 400 zod-reject from an `action_type` outside the OS's closed enum) is logged and MUST NOT
   abort the ticket loop or fail the run.
-- **Inspect the dry-run payloads** during the parallel window: the logged `action_type` values must fall
-  within the OS's closed `action_type` enum (Plan 15.1-04), and the `claim_packet` shape (carrier /
-  tracking / filing_deadline_iso / declared_value / evidence_summary) must look right — this is exactly
-  what the dry-run is for before flipping `--send`.
+- **Monitor the first live windows:** an `action_type` outside the OS's closed enum (Plan 15.1-04)
+  returns a 400 zod-reject (logged, non-blocking — that one item just doesn't land as a task); the
+  `claim_packet` shape (carrier / tracking / filing_deadline_iso / declared_value / evidence_summary)
+  rides along for `file_carrier_claim` items. Watch `/tasks` to confirm items land with correct dedup
+  (same ticket + action_type bumps `times_fired`, never a second row).
 - **Invariants preserved:** this is a POST to Pack'N OS, NOT a HubSpot ticket write (read-only-on-tickets
   intact). Only the `action_items` objects cross the boundary — never attachments or file bytes
   (`extract_actions.md` already enforces text-only `evidence_summary`).
