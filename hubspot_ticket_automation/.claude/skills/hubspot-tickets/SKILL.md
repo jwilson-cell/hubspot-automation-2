@@ -701,6 +701,52 @@ Increment counter `tickets_queued_for_digest` (one per queued ticket, regardless
 
 For auto-send tickets with empty `action_items`: log the auto-send in the run log only and do NOT queue.
 
+#### 2g.5. Mirror action items to Pack'N OS tasks (Phase 15.1 — parallel run, dry-run-gated)
+
+After the digest-queue write above, ALSO forward this ticket's `action_items` to the Pack'N OS
+ingestion route so they materialize as first-class tasks in `/tasks` (bell + 8 AM OS digest). This
+is the Phase 15.1 cutover bridge that replaces the legacy action-item email digest.
+
+This step is **ADDITIVE and runs in PARALLEL** with the existing `pending_actions.json` queue + the
+`hubspot-actions-digest` email (D-07 parallel-run). Do NOT remove or alter the urgent-email or
+queue-for-digest steps above — the OS path proves itself first, then the operator retires the legacy
+digest separately (a later step, not here).
+
+Forward only when `action_items` is **non-empty**. Pipe the same `action_items` array you just queued
+(each object carries `action_type`, `description`, `owner_hint`, `blocking_info_needed`, `severity`,
+`needs_hubspot_reply`, plus the optional `claim_packet` for `file_carrier_claim`) as compact JSON to
+the helper:
+
+```bash
+echo '<this ticket's action_items array as compact JSON>' | py -3 scripts/post_action_items.py action-items <ticket_id>
+```
+
+- **Dry-run gate (parallel run):** invoke WITHOUT `--send` (the default). The helper LOGS the would-be
+  payload + computed `X-PackN-Signature` and sends nothing. The operator adds `--send` (flips this step
+  live) only AFTER inspecting a dry-run pass AND provisioning `ACTION_INGEST_SECRET` on both sides. This
+  gate is **independent** of the global `settings.yaml dry_run` (which is already `false` for the rest of
+  the skill) — keep this step dry-run even while the rest of the skill runs live.
+- **Non-blocking (Sheets-sync contract):** the helper never raises out — it always prints a result dict
+  and exits 0/1. A failure (`secret_unprovisioned` → the OS route 503s, `os_ingest_url_unset`, a network
+  error, or a 400 zod-reject from an `action_type` outside the OS's closed enum) is logged and MUST NOT
+  abort the ticket loop or fail the run.
+- **Inspect the dry-run payloads** during the parallel window: the logged `action_type` values must fall
+  within the OS's closed `action_type` enum (Plan 15.1-04), and the `claim_packet` shape (carrier /
+  tracking / filing_deadline_iso / declared_value / evidence_summary) must look right — this is exactly
+  what the dry-run is for before flipping `--send`.
+- **Invariants preserved:** this is a POST to Pack'N OS, NOT a HubSpot ticket write (read-only-on-tickets
+  intact). Only the `action_items` objects cross the boundary — never attachments or file bytes
+  (`extract_actions.md` already enforces text-only `evidence_summary`).
+- Record the helper's result `mode` (`dry-run` / `sent` / `skipped` / `error`) in the run log under this
+  ticket's entry, beside the existing queue record.
+
+**`ticket_closed` auto-resolve (D-15) — DEFERRED for the parallel run.** The OS route also accepts a
+`ticket_closed` signal that auto-resolves a ticket's open action-item tasks. This skill only processes
+active-stage tickets (stages 1 + 3; stage 4 = Closed is filtered out at fetch in Step 1), so it does not
+currently observe closes. Until a close-detection pass is added (follow-up), operators resolve completed
+action-item tasks directly in `/tasks`. The `post_ticket_closed(...)` helper + CLI already exist and are
+ready to wire when that pass lands.
+
 #### 2h. Emit structured row for Sheets export
 
 If `settings.sheets_export.enabled` is true AND the classifier's category matches a tracked rollup, append one row dict to the appropriate in-memory buffer. Use values from `ticket_context`, `classifier`, and the `posted_note_id` from step 2f (empty string on dry_run). **Do NOT** call any Sheets MCP or script here — buffer only; step 3.5 flushes in a single batch.

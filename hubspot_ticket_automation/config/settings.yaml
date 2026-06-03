@@ -177,3 +177,15 @@ sheets_export:
   pending_sync_file: "config/sheets_pending_sync.json"
   # Runtime state (populated by scripts/sheets_bootstrap.py):
   #   config/sheets_state.json holds spreadsheet_id, spreadsheet_url, tab_ids.
+
+# ---- Pack'N OS action-item ingestion (Phase 15.1 cutover) ----
+# scripts/post_action_items.py POSTs each ticket's extracted action items to the
+# Pack'N OS /api/ingest/action-items route so they surface as first-class tasks in
+# /tasks (bell + 8 AM OS digest) — replacing the legacy action-item email digest.
+# The POST is HMAC-signed with the secret at config/.secrets/action_ingest_secret.txt,
+# which MUST byte-match the Coolify web env var ACTION_INGEST_SECRET (>= 16 chars).
+# SKILL step 2g.5 calls the helper in DRY-RUN during the D-07 parallel run (logs the
+# payload + signature, sends nothing); the operator adds --send only after inspecting
+# a dry-run pass. This is independent of the global dry_run above.
+# os_ingest_url may be a bare origin (the helper appends /api/ingest/action-items).
+os_ingest_url: "https://os.gopackn.com"
