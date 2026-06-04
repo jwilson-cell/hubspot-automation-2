@@ -701,46 +701,35 @@ Increment counter `tickets_queued_for_digest` (one per queued ticket, regardless
 
 For auto-send tickets with empty `action_items`: log the auto-send in the run log only and do NOT queue.
 
-#### 2g.5. Mirror action items to Pack'N OS tasks (Phase 15.1 — parallel run, dry-run-gated)
+#### 2g.5. Action items reach Pack'N OS /tasks via a deterministic post-run step — do NOTHING here
 
-After the digest-queue write above, ALSO forward this ticket's `action_items` to the Pack'N OS
-ingestion route so they materialize as first-class tasks in `/tasks` (bell + 8 AM OS digest). This
-is the Phase 15.1 cutover bridge that replaces the legacy action-item email digest.
+Forwarding `action_items` to the Pack'N OS `/tasks` hub (the Phase 15.1 cutover bridge that
+replaces the legacy action-item email digest) is handled **deterministically by
+`scripts/forward_action_items.py`, which the cron runs AUTOMATICALLY after this skill** (the
+crontab calls `scripts/run_tickets.sh`, which runs `/packn-tickets` then the forwarder). The
+forwarder reads the `config/pending_actions.json` records you wrote in step 2g and POSTs each
+ticket's non-empty `action_items` to the OS ingestion route via `scripts/post_action_items.py`.
 
-This step is **ADDITIVE and runs in PARALLEL** with the existing `pending_actions.json` queue + the
-`hubspot-actions-digest` email (D-07 parallel-run). Do NOT remove or alter the urgent-email or
-queue-for-digest steps above — the OS path proves itself first, then the operator retires the legacy
-digest separately (a later step, not here).
+**You (the agent) do NOTHING in this step.** Specifically:
 
-Forward only when `action_items` is **non-empty**. Pipe the same `action_items` array you just queued
-(each object carries `action_type`, `description`, `owner_hint`, `blocking_info_needed`, `severity`,
-`needs_hubspot_reply`, plus the optional `claim_packet` for `file_carrier_claim`) as compact JSON to
-the helper:
+- Do **NOT** run `post_action_items.py`, `forward_action_items.py`, or any `--send` command here.
+  The deterministic forwarder owns the POST. (Running it here too would be a harmless no-op — the
+  OS dedups — but it is not your job and wastes a turn.)
+- Do **NOT** claim in your run summary that action items were "posted to Pack'N OS /tasks",
+  "sent to /tasks", or "forwarded". You CANNOT know the result — the forwarder runs AFTER you
+  exit. Stating success here is exactly how this cutover silently failed for days (2026-06-04):
+  the agentic run narrated "all action items posted to /tasks" while never POSTing, and 0 tasks
+  landed. The source of truth for what reached /tasks is the forwarder's own
+  `[forward_action_items] ...` line in `cron-tickets.log`, NOT your summary.
 
-```bash
-echo '<this ticket's action_items array as compact JSON>' | py scripts/post_action_items.py action-items <ticket_id> --send
-```
+Your ONLY responsibility for the /tasks bridge is upstream: ensure step 2g's
+`config/pending_actions.json` write is complete and accurate (correct `ticket_id` + the full
+`action_items` array per the record shape above). The deterministic forwarder does the rest.
 
-- **LIVE — flipped 2026-06-03:** invoke WITH `--send` (as shown above). The helper signs the
-  `action_items` envelope and POSTs it to the OS ingestion route, so action items now materialize as
-  first-class tasks in `/tasks`. Flipped live after `ACTION_INGEST_SECRET` was provisioned on both sides
-  and the HMAC transport was verified end-to-end (signed POST → 200, unsigned → 401). To REVERT to
-  dry-run (log-only, sends nothing), remove the `--send` flag from the command above. This gate is
-  **independent** of the global `settings.yaml dry_run` (which is already `false` for the rest of the skill).
-- **Non-blocking (Sheets-sync contract):** the helper never raises out — it always prints a result dict
-  and exits 0/1. A failure (`secret_unprovisioned` → the OS route 503s, `os_ingest_url_unset`, a network
-  error, or a 400 zod-reject from an `action_type` outside the OS's closed enum) is logged and MUST NOT
-  abort the ticket loop or fail the run.
-- **Monitor the first live windows:** an `action_type` outside the OS's closed enum (Plan 15.1-04)
-  returns a 400 zod-reject (logged, non-blocking — that one item just doesn't land as a task); the
-  `claim_packet` shape (carrier / tracking / filing_deadline_iso / declared_value / evidence_summary)
-  rides along for `file_carrier_claim` items. Watch `/tasks` to confirm items land with correct dedup
-  (same ticket + action_type bumps `times_fired`, never a second row).
-- **Invariants preserved:** this is a POST to Pack'N OS, NOT a HubSpot ticket write (read-only-on-tickets
-  intact). Only the `action_items` objects cross the boundary — never attachments or file bytes
-  (`extract_actions.md` already enforces text-only `evidence_summary`).
-- Record the helper's result `mode` (`dry-run` / `sent` / `skipped` / `error`) in the run log under this
-  ticket's entry, beside the existing queue record.
+Why deterministic: a forward step buried mid-loop in an agentic run is unreliable — it was
+skipped silently for the entire parallel-run window. A plain script draining
+`pending_actions.json` after the run guarantees delivery and surfaces real POST errors
+(secret/url/zod/network) in the cron log instead of swallowing them behind a false "posted" claim.
 
 **`ticket_closed` auto-resolve (D-15) — DEFERRED for the parallel run.** The OS route also accepts a
 `ticket_closed` signal that auto-resolves a ticket's open action-item tasks. This skill only processes
