@@ -62,6 +62,17 @@ GRANT UPDATE (cron_schedule, last_schedule_report_at)
 GRANT SELECT, UPDATE (processed, processed_at, resulting_run_id)
   ON automation_run_requests TO packn_os_existing_automation;
 
+-- 2026-06-06: live-role drift reconcile. The live prod role additionally
+-- carries SELECT ON automation_drafts (observed in pg_class privileges);
+-- documenting it here so a role recreation from this list matches the
+-- live state instead of silently dropping a read the automation relies on.
+GRANT SELECT ON automation_drafts TO packn_os_existing_automation;
+
+-- 2026-06-06 Phase 20: complaint mirror (scripts/write_complaints.py live writer
+-- + scripts/backfill_complaints.py one-shot). SELECT+INSERT only — the mirror is
+-- append-only; soft-delete/UPDATE stay OS-side (D-01a least privilege).
+GRANT SELECT, INSERT ON customer_complaints TO packn_os_existing_automation;
+
 -- Sequence usage for SERIAL/UUID PKs
 GRANT USAGE ON SCHEMA public TO packn_os_existing_automation;
 
