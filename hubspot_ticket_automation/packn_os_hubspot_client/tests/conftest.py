@@ -114,4 +114,10 @@ def _cleanup(conn: psycopg.Connection) -> None:
         cur.execute(
             "DELETE FROM automation_routines WHERE name LIKE 'pytest-%'"
         )
+        # Phase 20 (Plan 20-04): complaint-mirror writer/helper tests tag
+        # tickets with the same 'pytest-' prefix (no FK to the automation_*
+        # tables — independent leaf, safe to delete last).
+        cur.execute(
+            "DELETE FROM customer_complaints WHERE hubspot_ticket_id LIKE 'pytest-%'"
+        )
     conn.commit()

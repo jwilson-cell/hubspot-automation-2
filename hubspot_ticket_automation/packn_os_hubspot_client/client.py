@@ -43,6 +43,7 @@ Threat-register notes (T-04-* in the plan):
 import json
 import logging
 import subprocess
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -155,6 +156,131 @@ def write_draft(
             )
             existing = cur.fetchone()
             return str(existing["id"]) if existing else ""
+
+
+# ---------------------------------------------------------------------------
+# Phase 20 (D-01/D-04) — complaint-mirror writer helpers.
+#
+# The deterministic post-run writer (scripts/write_complaints.py) consumes the
+# skill's accumulated outputs/kpi/mispack_log.csv and INSERTs customer_complaints
+# rows through write_complaints() below. ZERO new dependencies, ZERO HubSpot
+# calls — this is a pure DB-side mirror of the mispack CSV.
+# ---------------------------------------------------------------------------
+
+
+def normalize_optional(value: Optional[str]) -> Optional[str]:
+    """'' / whitespace-only / None → None; else the stripped string.
+
+    Empty strings must NEVER reach customer_complaints: they break the
+    `IS NOT NULL` partial-index predicates (the tenant_brand / tenant_tracking
+    indexes) and the NOT-EXISTS complement semantics on the Pack'N OS read side
+    (an '' tracking would never match a shipment yet would not count as "no
+    tracking", silently corrupting the unattributed bucket).
+    """
+    if value is None:
+        return None
+    stripped = value.strip()
+    return stripped or None
+
+
+def parse_complained_at(value: Optional[str]) -> Optional[str]:
+    """Strict dual-format parse → ISO-8601 string with timezone, or None.
+
+    Accepts:
+      - ISO-8601 with a 'Z' suffix or an explicit offset ('Z' is normalized to
+        '+00:00' before datetime.fromisoformat — the live on-disk format is
+        ISO-8601-Z per Plan 20-02 probe-3).
+      - integer epoch: 13 digits → milliseconds, 10 digits → seconds, both
+        interpreted as UTC.
+
+    NEVER defaults — an unparseable/empty/None timestamp returns None and the
+    CALLER skips the row (D-06: complained_at carries "when the customer filed",
+    NOT "when the writer ran"; defaulting to now() would corrupt the rolling-30d
+    and monthly SLA windows on the OS read side).
+    """
+    if value is None:
+        return None
+    raw = value.strip()
+    if not raw:
+        return None
+
+    # Integer epoch branch (all-digits, optional leading sign disallowed —
+    # complaint timestamps are always positive).
+    if raw.isdigit():
+        try:
+            num = int(raw)
+        except ValueError:
+            return None
+        if len(raw) == 13:
+            seconds = num / 1000.0
+        elif len(raw) == 10:
+            seconds = float(num)
+        else:
+            # Ambiguous digit count — refuse rather than guess the unit.
+            return None
+        try:
+            dt = datetime.fromtimestamp(seconds, tz=timezone.utc)
+        except (ValueError, OverflowError, OSError):
+            return None
+        return dt.isoformat()
+
+    # ISO-8601 branch (normalize a trailing 'Z' to '+00:00' for fromisoformat).
+    iso = raw[:-1] + "+00:00" if raw.endswith("Z") else raw
+    try:
+        dt = datetime.fromisoformat(iso)
+    except ValueError:
+        return None
+    return dt.isoformat()
+
+
+def write_complaints(rows: list[dict]) -> dict:
+    """Batch INSERT mispack complaint rows. One connection, one transaction.
+
+    Each row dict:
+        {"hubspot_ticket_id": str, "classification": str,
+         "shipment_tracking_number": str | None, "brand": str | None,
+         "complained_at": str  # ISO-8601, pre-validated by the caller}
+
+    Returns {"inserted": int, "conflict_skipped": int}.
+
+    Idempotency: customer_complaints' unique index is PARTIAL
+    (`customer_complaints_tenant_hubspot_uniq … WHERE deleted_at IS NULL`,
+    migration 0052), so the ON CONFLICT target MUST repeat the WHERE clause or
+    Postgres raises 42P10 (InvalidColumnReference) on EVERY row (memory
+    project_packn_os_partial_index_onconflict_targetwhere — the same trap that
+    killed emit.ts and Phase 18 inflight_orders in prod while passing
+    build/tests). The pytest idempotency test is the regression guard.
+    """
+    inserted = 0
+    conflict_skipped = 0
+    with get_pool().connection() as conn:
+        with conn.cursor() as cur:
+            for row in rows:
+                cur.execute(
+                    """
+                    INSERT INTO customer_complaints
+                      (tenant_id, hubspot_ticket_id, classification,
+                       shipment_tracking_number, brand, complained_at)
+                    VALUES (%s, %s, %s, %s, %s, %s::timestamptz)
+                    ON CONFLICT (tenant_id, hubspot_ticket_id) WHERE deleted_at IS NULL
+                      DO NOTHING
+                    RETURNING id
+                    """,
+                    (
+                        TENANT_ID,
+                        row["hubspot_ticket_id"],
+                        row["classification"],
+                        normalize_optional(row.get("shipment_tracking_number")),
+                        normalize_optional(row.get("brand")),
+                        row["complained_at"],
+                    ),
+                )
+                if cur.fetchone():
+                    inserted += 1
+                else:
+                    conflict_skipped += 1
+        conn.commit()
+    return {"inserted": inserted, "conflict_skipped": conflict_skipped}
 
 
 def read_pending_drafts(routine_name: str, since_hours: int = 48) -> list[dict]:
