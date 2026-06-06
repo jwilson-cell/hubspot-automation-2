@@ -15,6 +15,12 @@
 set -u
 cd "$(dirname "$0")/.."
 
+# Cron daemons do NOT reliably inherit /etc/environment — source it explicitly
+# so PACKN_OS_DATABASE_URL resolves under cron's minimal env (Phase 20: without
+# this, the complaint writer would log-and-exit-0 forever under D-04's
+# never-fail posture — a silent total outage).
+if [ -r /etc/environment ]; then set -a; . /etc/environment; set +a; fi
+
 # 1) Agentic ticket pass: classify / draft / queue each ticket's action_items
 #    to config/pending_actions.json (SKILL step 2g). Permissions are skipped so
 #    the headless run never blocks on a prompt.
@@ -25,3 +31,8 @@ claude -p /packn-tickets --dangerously-skip-permissions
 #    (forward-once seen-set + OS-side dedup) and non-blocking (always exits 0),
 #    so it can never fail the cron. Runs regardless of the agentic pass's exit.
 .venv/bin/python scripts/forward_action_items.py
+
+# 3) Deterministic complaint mirror: re-scan outputs/kpi/mispack_log.csv and
+#    INSERT customer_complaints rows (ON CONFLICT DO NOTHING — Phase 20 D-02/D-04).
+#    Non-blocking (always exits 0) — can never fail the cron.
+.venv/bin/python scripts/write_complaints.py
