@@ -290,6 +290,16 @@ def _read_token() -> str:
     return token
 
 
+# 2026-06-07 (todo backfill-redis-warning-spam) — warn ONCE per process. The
+# KeyError('REDIS_URL') fallback fired on EVERY API call (~70 lines per sweep
+# in interactive shells), burying the real summary lines in the run logs.
+# Warn-once (not self-source /etc/environment): REDIS_URL lives INLINE in the
+# droplet crontab env block by operator decision (2026-05-18), NOT in
+# /etc/environment (verified absent 2026-06-07) — sourcing it would find
+# nothing. The unconditional sleep floor remains the real guard either way.
+_rate_token_warned = False
+
+
 def _rate_gate() -> None:
     """Throttle BEFORE every HubSpot call: attempt the cross-process token, then
     sleep the hard floor unconditionally.
@@ -297,14 +307,21 @@ def _rate_gate() -> None:
     The token DEGRADES TO PASSTHROUGH without REDIS_URL (interactive shells lack
     it — and rate_limit._get_redis() raises KeyError on a missing REDIS_URL),
     so the unconditional 0.34s sleep is the real guard. Any token failure is
-    swallowed; the sleep always runs.
+    swallowed; the sleep always runs. The unavailability warning logs ONCE per
+    process — the condition can't self-heal mid-run, so repeating it is noise.
     """
+    global _rate_token_warned
     try:
         from packn_os_hubspot_client import rate_limit
 
         rate_limit.acquire_hubspot_token()
     except Exception as exc:  # noqa: BLE001 — token is best-effort; sleep is the guard.
-        _log(f"rate-limit token unavailable ({exc!r}); relying on sleep floor")
+        if not _rate_token_warned:
+            _rate_token_warned = True
+            _log(
+                f"rate-limit token unavailable ({exc!r}); relying on sleep floor "
+                "(warning suppressed for the rest of this run)"
+            )
     time.sleep(RATE_FLOOR_S)
 
 
