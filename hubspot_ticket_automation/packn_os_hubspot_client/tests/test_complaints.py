@@ -292,12 +292,14 @@ def test_writer_run_over_fixture_csv(
         "inserted": 2,
         "conflict_skipped": 0,
         "skipped_bad": 2,
+        "bad": 0,
     }
     assert second == {
         "rows": 4,
         "inserted": 0,
         "conflict_skipped": 2,
         "skipped_bad": 2,
+        "bad": 0,
     }
 
     # row 4: empty tracking + company → NULL/NULL
@@ -327,3 +329,67 @@ def test_writer_missing_csv_is_tolerated(
 
     assert result["rows"] == 0
     assert result["inserted"] == 0
+
+
+def test_writer_all_rows_failed_emits_stall_marker(
+    db_conn: psycopg.Connection,
+    cleanup_test_data: None,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture,
+) -> None:
+    """20-REVIEW WR-02: rows > 0 but NOTHING landed (inserted=0 AND
+    conflict_skipped=0) ⇒ the grep-able ERROR COMPLAINT_MIRROR_STALL marker is
+    emitted on stderr so the droplet log scan can alert on a silent mirror
+    stall; the never-fail exit-0 posture is unchanged (run() does not raise).
+    A healthy run must NOT emit the marker."""
+    import csv as _csv
+
+    import write_complaints
+
+    nonce = uuid4().hex[:8]
+
+    # All-bad CSV: both rows have unparseable first_seen_utc → skipped_bad=2,
+    # empty batch, nothing lands.
+    stall_csv = tmp_path / "all_bad.csv"
+    with stall_csv.open("w", newline="", encoding="utf-8") as fh:
+        writer = _csv.DictWriter(fh, fieldnames=["ticket_id", "first_seen_utc"])
+        writer.writeheader()
+        writer.writerow(
+            {"ticket_id": f"pytest-s-{nonce}-1", "first_seen_utc": "garbage"}
+        )
+        writer.writerow(
+            {"ticket_id": f"pytest-s-{nonce}-2", "first_seen_utc": "also-garbage"}
+        )
+
+    close_pool()
+    result = write_complaints.run(stall_csv)
+    close_pool()
+
+    assert result == {
+        "rows": 2,
+        "inserted": 0,
+        "conflict_skipped": 0,
+        "skipped_bad": 2,
+        "bad": 0,
+    }
+    captured = capsys.readouterr()
+    assert "COMPLAINT_MIRROR_STALL" in captured.err
+
+    # Healthy run (1 good row) must NOT emit the marker.
+    ok_csv = tmp_path / "ok.csv"
+    with ok_csv.open("w", newline="", encoding="utf-8") as fh:
+        writer = _csv.DictWriter(fh, fieldnames=["ticket_id", "first_seen_utc"])
+        writer.writeheader()
+        writer.writerow(
+            {
+                "ticket_id": f"pytest-s-{nonce}-ok",
+                "first_seen_utc": "2026-06-01T12:00:00Z",
+            }
+        )
+
+    close_pool()
+    ok_result = write_complaints.run(ok_csv)
+    close_pool()
+
+    assert ok_result["inserted"] == 1
+    assert "COMPLAINT_MIRROR_STALL" not in capsys.readouterr().err

@@ -43,7 +43,13 @@ def _log(msg: str) -> None:
 
 
 def _zero_counts() -> dict:
-    return {"rows": 0, "inserted": 0, "conflict_skipped": 0, "skipped_bad": 0}
+    return {
+        "rows": 0,
+        "inserted": 0,
+        "conflict_skipped": 0,
+        "skipped_bad": 0,
+        "bad": 0,
+    }
 
 
 def _brand_column_present() -> bool:
@@ -65,7 +71,11 @@ def run(csv_path: Path) -> dict:
     """Re-scan the whole mispack CSV and batch-INSERT customer_complaints rows.
 
     Returns {"rows": int, "inserted": int, "conflict_skipped": int,
-             "skipped_bad": int}.
+             "skipped_bad": int, "bad": int}.
+
+    `skipped_bad` counts caller-side skips (empty ticket_id, unparseable
+    complained_at); `bad` counts DB-side per-row rejects isolated by the
+    write_complaints SAVEPOINT (20-REVIEW WR-01).
     """
     csv_path = Path(csv_path)
     if not csv_path.exists():
@@ -130,19 +140,35 @@ def run(csv_path: Path) -> dict:
         result = client.write_complaints(batch)
         inserted = result["inserted"]
         conflict_skipped = result["conflict_skipped"]
+        bad = result.get("bad", 0)
     else:
         inserted = 0
         conflict_skipped = 0
+        bad = 0
 
     summary = {
         "rows": rows,
         "inserted": inserted,
         "conflict_skipped": conflict_skipped,
         "skipped_bad": skipped_bad,
+        "bad": bad,
     }
+    # Stall detection (20-REVIEW WR-02): the never-fail exit-0 posture stands,
+    # so a run where the CSV HAD rows but NOTHING landed (not even a known
+    # duplicate) would otherwise stay green forever while the mirror silently
+    # stops populating. Emit a distinctive grep-able ERROR marker the droplet
+    # log scan can alert on (cross-ref memory
+    # project_packn_os_monitoring_design_gaps — heartbeat-green ≠ data-flowing).
+    if rows > 0 and inserted == 0 and conflict_skipped == 0:
+        _log(
+            f"ERROR COMPLAINT_MIRROR_STALL: all {rows} row(s) failed to land "
+            f"(inserted=0 conflict_skipped=0 skipped_bad={skipped_bad} "
+            f"bad={bad}) — the mirror is not populating; investigate before "
+            f"the next run."
+        )
     _log(
         f"done: inserted={inserted} conflict_skipped={conflict_skipped} "
-        f"skipped_bad={skipped_bad} rows={rows}"
+        f"skipped_bad={skipped_bad} bad={bad} rows={rows}"
     )
     return summary
 
