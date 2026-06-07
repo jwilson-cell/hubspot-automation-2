@@ -418,7 +418,7 @@ def _tracking_for_ticket(
     ticket_id = str(ticket.get("id") or "")
     if not ticket_id:
         return None
-    assoc = _get(f"/crm/v4/objects/tickets/{ticket_id}/associations/emails")
+    assoc = _get(f"/crm/v4/objects/tickets/{ticket_id}/associations/emails", token)
     if not assoc:
         return None
     results = assoc.get("results") or []
@@ -427,7 +427,9 @@ def _tracking_for_ticket(
     first_email_id = str(results[0].get("toObjectId") or results[0].get("id") or "")
     if not first_email_id:
         return None
-    email = _get(f"/crm/v3/objects/emails/{first_email_id}?properties=hs_email_html")
+    email = _get(
+        f"/crm/v3/objects/emails/{first_email_id}?properties=hs_email_html", token
+    )
     if not email:
         return None
     html = (email.get("properties") or {}).get("hs_email_html")
