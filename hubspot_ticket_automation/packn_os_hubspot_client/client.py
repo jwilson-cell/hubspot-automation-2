@@ -47,6 +47,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
+import psycopg
 from psycopg.rows import dict_row
 
 from .db import get_pool
@@ -234,14 +235,25 @@ def parse_complained_at(value: Optional[str]) -> Optional[str]:
 
 
 def write_complaints(rows: list[dict]) -> dict:
-    """Batch INSERT mispack complaint rows. One connection, one transaction.
+    """Batch INSERT mispack complaint rows. One connection; per-row SAVEPOINT.
 
     Each row dict:
         {"hubspot_ticket_id": str, "classification": str,
          "shipment_tracking_number": str | None, "brand": str | None,
          "complained_at": str  # ISO-8601, pre-validated by the caller}
 
-    Returns {"inserted": int, "conflict_skipped": int}.
+    Returns {"inserted": int, "conflict_skipped": int, "bad": int}.
+
+    Row isolation (20-REVIEW WR-01): each INSERT runs inside its own
+    `conn.transaction()` block — a SAVEPOINT under the outer transaction — so a
+    row psycopg rejects for any reason OTHER than the (free, DO NOTHING)
+    duplicate conflict (e.g. an uncastable `::timestamptz` value, a future
+    CHECK-constraint violation, an oversize value) rolls back ONLY itself.
+    Previously one such row aborted the whole transaction and discarded every
+    good row in the batch, defeating the "best-effort + retry next run"
+    contract: the poisoned batch would re-fail identically on every run. Bad
+    rows are counted in `bad` and logged by exception repr ONLY — never row
+    contents (no PII in logs).
 
     Idempotency: customer_complaints' unique index is PARTIAL
     (`customer_complaints_tenant_hubspot_uniq … WHERE deleted_at IS NULL`,
@@ -253,34 +265,43 @@ def write_complaints(rows: list[dict]) -> dict:
     """
     inserted = 0
     conflict_skipped = 0
+    bad = 0
     with get_pool().connection() as conn:
-        with conn.cursor() as cur:
-            for row in rows:
-                cur.execute(
-                    """
-                    INSERT INTO customer_complaints
-                      (tenant_id, hubspot_ticket_id, classification,
-                       shipment_tracking_number, brand, complained_at)
-                    VALUES (%s, %s, %s, %s, %s, %s::timestamptz)
-                    ON CONFLICT (tenant_id, hubspot_ticket_id) WHERE deleted_at IS NULL
-                      DO NOTHING
-                    RETURNING id
-                    """,
-                    (
-                        TENANT_ID,
-                        row["hubspot_ticket_id"],
-                        row["classification"],
-                        normalize_optional(row.get("shipment_tracking_number")),
-                        normalize_optional(row.get("brand")),
-                        row["complained_at"],
-                    ),
-                )
-                if cur.fetchone():
-                    inserted += 1
-                else:
-                    conflict_skipped += 1
-        conn.commit()
-    return {"inserted": inserted, "conflict_skipped": conflict_skipped}
+        with conn.transaction():  # outer transaction — single COMMIT on exit
+            with conn.cursor() as cur:
+                for row in rows:
+                    try:
+                        with conn.transaction():  # SAVEPOINT — isolates this row
+                            cur.execute(
+                                """
+                                INSERT INTO customer_complaints
+                                  (tenant_id, hubspot_ticket_id, classification,
+                                   shipment_tracking_number, brand, complained_at)
+                                VALUES (%s, %s, %s, %s, %s, %s::timestamptz)
+                                ON CONFLICT (tenant_id, hubspot_ticket_id) WHERE deleted_at IS NULL
+                                  DO NOTHING
+                                RETURNING id
+                                """,
+                                (
+                                    TENANT_ID,
+                                    row["hubspot_ticket_id"],
+                                    row["classification"],
+                                    normalize_optional(row.get("shipment_tracking_number")),
+                                    normalize_optional(row.get("brand")),
+                                    row["complained_at"],
+                                ),
+                            )
+                            if cur.fetchone():
+                                inserted += 1
+                            else:
+                                conflict_skipped += 1
+                    except psycopg.Error as exc:
+                        # SAVEPOINT rollback discarded ONLY this row; the rest
+                        # of the batch survives. Exception repr only — no row
+                        # data / PII in the log.
+                        bad += 1
+                        logger.warning("write_complaints: row skipped: %r", exc)
+    return {"inserted": inserted, "conflict_skipped": conflict_skipped, "bad": bad}
 
 
 def read_pending_drafts(routine_name: str, since_hours: int = 48) -> list[dict]:

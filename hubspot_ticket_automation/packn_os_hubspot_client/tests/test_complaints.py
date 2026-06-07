@@ -60,8 +60,8 @@ def test_write_complaints_idempotent_no_42p10(
     second = client.write_complaints(rows)
     close_pool()
 
-    assert first == {"inserted": 2, "conflict_skipped": 0}
-    assert second == {"inserted": 0, "conflict_skipped": 2}
+    assert first == {"inserted": 2, "conflict_skipped": 0, "bad": 0}
+    assert second == {"inserted": 0, "conflict_skipped": 2, "bad": 0}
 
     with db_conn.cursor() as cur:
         cur.execute(
@@ -93,7 +93,7 @@ def test_empty_strings_coerced_to_null(
     result = client.write_complaints(rows)
     close_pool()
 
-    assert result == {"inserted": 1, "conflict_skipped": 0}
+    assert result == {"inserted": 1, "conflict_skipped": 0, "bad": 0}
 
     with db_conn.cursor() as cur:
         cur.execute(
@@ -105,6 +105,59 @@ def test_empty_strings_coerced_to_null(
     assert row is not None
     assert row["shipment_tracking_number"] is None
     assert row["brand"] is None
+
+
+def test_write_complaints_bad_row_does_not_poison_batch(
+    db_conn: psycopg.Connection, cleanup_test_data: None
+) -> None:
+    """20-REVIEW WR-01 regression guard: a mid-batch row psycopg rejects (an
+    uncastable ::timestamptz value) is isolated by the per-row SAVEPOINT — the
+    good rows BEFORE and AFTER it still land, the failure is counted in `bad`,
+    and nothing raises. Pre-fix behavior: the whole batch rolled back and
+    write_complaints raised, losing both good rows on every retry."""
+    nonce = uuid4().hex[:8]
+    rows = [
+        {
+            "hubspot_ticket_id": f"pytest-b-{nonce}-1",
+            "classification": "mispack",
+            "shipment_tracking_number": "1Zpytestb000000001",
+            "brand": "Pytest Brand LLC",
+            "complained_at": "2026-06-01T12:00:00+00:00",
+        },
+        {
+            # complained_at bypasses caller-side parse validation here on
+            # purpose — simulates the error class upstream validation misses.
+            "hubspot_ticket_id": f"pytest-b-{nonce}-bad",
+            "classification": "mispack",
+            "shipment_tracking_number": "1Zpytestb000000002",
+            "brand": "Pytest Brand LLC",
+            "complained_at": "not-a-timestamp",
+        },
+        {
+            "hubspot_ticket_id": f"pytest-b-{nonce}-2",
+            "classification": "mispack",
+            "shipment_tracking_number": "1Zpytestb000000003",
+            "brand": "Pytest Brand LLC",
+            "complained_at": "2026-06-01T13:00:00+00:00",
+        },
+    ]
+
+    close_pool()
+    result = client.write_complaints(rows)
+    close_pool()
+
+    assert result == {"inserted": 2, "conflict_skipped": 0, "bad": 1}
+
+    # Both good rows (one BEFORE, one AFTER the bad row) are durably committed.
+    with db_conn.cursor() as cur:
+        cur.execute(
+            "SELECT count(*)::int AS n FROM customer_complaints "
+            "WHERE hubspot_ticket_id LIKE %s",
+            (f"pytest-b-{nonce}-%",),
+        )
+        row = cur.fetchone()
+    assert row is not None
+    assert row["n"] == 2
 
 
 # ---------------------------------------------------------------------------
