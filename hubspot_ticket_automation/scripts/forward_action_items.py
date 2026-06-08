@@ -15,7 +15,9 @@ to the OS ingestion route via the existing post_action_items helper.
 
 Forward-once semantics: a local seen-state file
 (config/.action_items_forwarded.json, gitignored) records the
-(ticket_id, action_type) pairs already delivered, so:
+(ticket_id, action_type) pairs whose delivery the OS CONFIRMED (response body
+errors == 0 — HTTP 200 alone is NOT trusted; see the false-seen note in the
+loop below), so:
   - an accumulating pending_actions.json is never re-POSTed, and
   - already-delivered items are never re-fired across ET-day boundaries
     (which would otherwise resurrect resolved tasks via the OS fresh-emit path).
@@ -93,7 +95,20 @@ def main() -> int:
             continue
 
         result = poster.post_action_items(ticket_id, fresh, dry_run=False)
-        if result.get("ok"):
+        # HTTP 200 is NOT proof of persistence. The OS route returns 200 with a
+        # per-item {"emitted","errors"} body even when emitTask throws for some
+        # items; trusting the status alone caused the false-seen bug (2026-06-08)
+        # that marked ~104 items delivered while zero task rows were written, then
+        # permanently suppressed them. Confirm the body reports errors == 0 before
+        # marking an item seen; otherwise leave it un-seen so the next run retries
+        # (emitTask is idempotent, so a retry is safe).
+        resp = result.get("response") or {}
+        try:
+            body_errors = int(resp.get("errors", 0) or 0)
+        except (TypeError, ValueError):
+            body_errors = 0
+        confirmed = bool(result.get("ok")) and body_errors == 0
+        if confirmed:
             forwarded += len(fresh)
             for it in fresh:
                 fresh_keys.add(_key(ticket_id, str(it["action_type"])))
@@ -103,11 +118,16 @@ def main() -> int:
                 f"({result.get('mode')} {status})".rstrip()
             )
         else:
-            # Not marked seen → retried on the next run (transient secret/url/net).
+            # Not marked seen → retried next run (transient secret/url/net, an
+            # HTTP-error status, OR a 200-with-errors partial persistence).
             errors += len(fresh)
-            reason = result.get("reason") or result.get("error") or "unknown"
+            reason = (
+                result.get("reason")
+                or result.get("error")
+                or (f"{body_errors} item(s) errored server-side" if body_errors else "unknown")
+            )
             _log(
-                f"ticket {ticket_id}: forward FAILED "
+                f"ticket {ticket_id}: forward NOT confirmed "
                 f"({result.get('mode')}: {reason}) — will retry next run"
             )
 

@@ -18,20 +18,34 @@ Drafted reply (for context, since it often names next steps):
 
 ## Allowed action types
 
-Pick from this set. If none fit cleanly, use `other` and be specific in the description.
+`action_type` **MUST be EXACTLY one of the following literal strings.** Do not invent, pluralize, abbreviate, or rephrase them. A value outside this set is downgraded to `other` on ingestion and loses its routing, so choose the closest match deliberately. If genuinely none fit, use `other` and be specific in the `description`.
 
-- `file_carrier_claim` — file a damage or loss claim with the carrier (needs tracking #, photos, declared value). **Emit with the extended `claim_packet` sub-schema — see §"Extended schema: file_carrier_claim" below.**
-- `warehouse_investigation` — pull camera footage, audit picker, recount cycle (needs wave ID or date range)
-- `create_rma` — issue a return label / RMA
-- `reship_order` — send replacement goods (specify cost owner: 3PL / merchant / carrier)
-- `issue_credit_or_refund` — process credit memo or refund (needs approval)
-- `sync_sku_master` — add/update SKU in WMS, fix integration mapping
-- `escalate_to_ops_manager` — route to operations leadership
-- `escalate_to_account_manager` — route to merchant's AM
-- `update_asn_or_appointment` — fix ASN data or rebook receiving appointment
-- `request_missing_info_from_merchant` — ask merchant for photos, PO#, order #, etc.
-- `billing_specialist_follow_up` — invoice or rate question needing billing's input
-- `other` — describe
+**Fulfilling / changing an order (owner_hint: `warehouse`):**
+- `expedite_fulfillment` — look up a stuck, unallocated, or never-scanned order and push it to dispatch; "did this ship?", rush/priority requests, label-created-but-never-tendered packages.
+- `edit_order` — change an order BEFORE it ships: address correction, item/size swap, quantity change, split / partial shipment, hold or cancel.
+- `create_order` — cut a NEW outbound order in the WMS to send goods: the correct/missing item for a confirmed mispack, a replacement for a lost/damaged shipment, or a net-new order the merchant asks us to place. **Emit this whenever `ticket_context.form_fields.check_box_to_reship_order_immediately == "true"`, OR the merchant clearly wants goods (re)sent and the decision is already made** (see Rule 7).
+- `reship_order` — a reship that still needs review/approval first (cost owner undecided, or blocked pending an investigation result). Use `create_order` instead once it's a go.
+
+**Investigations (owner_hint: `warehouse`):**
+- `warehouse_investigation` — locate a package, audit a picker, recount, or explain an allocation hold (non-mispack).
+- `mispack_investigation` — wrong SKU / wrong size / wrong quantity / missing item: pull the pick + pack-station record to find root cause.
+
+**Carrier / claims:**
+- `carrier_trace` — open a trace, monitor a stuck-in-transit shipment, or assess whether the claim window is still open — BEFORE a claim is filed. (owner_hint: `warehouse`, or `account_manager` for international)
+- `file_carrier_claim` — file a damage or loss claim with the carrier NOW (needs tracking #, photos, declared value). (owner_hint: `carrier`) **Emit with the extended `claim_packet` sub-schema — see §"Extended schema: file_carrier_claim" below.**
+
+**Returns / money / data:**
+- `create_rma` — issue a return label / RMA. (owner_hint: `warehouse`)
+- `issue_credit_or_refund` — process credit memo or refund, or review refund eligibility (needs approval). (owner_hint: `account_manager` or `billing`)
+- `sync_sku_master` — add/update SKU in WMS, fix integration mapping. (owner_hint: `integration`)
+- `update_asn_or_appointment` — fix ASN data or rebook a receiving appointment. (owner_hint: `warehouse`)
+
+**People / billing / catch-all:**
+- `request_missing_info_from_merchant` — ask the merchant for photos, PO#, order #, correct address, etc. (owner_hint: `merchant`)
+- `billing_specialist_follow_up` — invoice or rate question needing billing's input. (owner_hint: `billing`)
+- `escalate_to_ops_manager` — route to operations leadership. (owner_hint: `ops_manager`)
+- `escalate_to_account_manager` — route to the merchant's AM; also use for chargeback-risk / bank-dispute threats (set `severity: "urgent"`). (owner_hint: `account_manager`)
+- `other` — none of the above; describe precisely in `description`.
 
 ## Output
 
@@ -56,9 +70,16 @@ Return ONLY a JSON array (possibly empty). Each element:
 4. **`blocking_info_needed`** should list specific missing inputs (e.g., `["photos of damaged goods", "tracking number"]`), not vague wishes.
 5. **Do not duplicate** the customer-facing reply content. This is for internal routing, not the customer.
 6. **`needs_hubspot_reply`** — set `true` if completing this action requires sending a follow-up message to the customer in the HubSpot ticket thread. Set `false` if it's a backend task whose outcome may or may not produce a future customer-facing reply.
-   - Typically `true`: `request_missing_info_from_merchant`, `issue_credit_or_refund` (customer must be told), `billing_specialist_follow_up` when the answer needs to be conveyed back, `create_rma` (customer needs the label/instructions).
-   - Typically `false`: `file_carrier_claim`, `warehouse_investigation`, `sync_sku_master`, `update_asn_or_appointment`, `escalate_to_ops_manager`, `escalate_to_account_manager` (those are internal routing).
+   - Typically `true`: `request_missing_info_from_merchant`, `edit_order` (confirm the change took), `create_order` / `reship_order` (tell the customer it's on the way), `issue_credit_or_refund` (customer must be told), `billing_specialist_follow_up` when the answer needs to be conveyed back, `create_rma` (customer needs the label/instructions).
+   - Typically `false`: `file_carrier_claim`, `carrier_trace`, `warehouse_investigation`, `mispack_investigation`, `expedite_fulfillment`, `sync_sku_master`, `update_asn_or_appointment`, `escalate_to_ops_manager`, `escalate_to_account_manager` (internal routing).
    - Use judgment — the question is whether the reviewer must compose a customer-facing reply to close the loop on THIS action item.
+
+7. **`create_order` vs `reship_order`.** Both put goods in motion, but they are different operator tasks:
+   - Use **`create_order`** when the decision to (re)ship is already made — the merchant explicitly asks us to send/resend goods, OR `ticket_context.form_fields.check_box_to_reship_order_immediately == "true"`. This is the "cut the order now" task.
+   - Use **`reship_order`** when a reship is the likely resolution but still needs review or is blocked (cost owner undecided, or pending a `mispack_investigation` / `warehouse_investigation` result). This is the "approve the reship" task.
+   - When in doubt and the reship checkbox is set, prefer `create_order`.
+
+8. **Confirmed-vs-suspected mispack.** For a wrong / missing / wrong-size item, ALWAYS emit `mispack_investigation` (pull the pick/pack record). If the merchant has also asked for the correct item to be sent: add `create_order` when the reship checkbox is set or the resend is clearly approved, otherwise `reship_order` with the investigation result listed in `blocking_info_needed`.
 
 ## Extended schema: `file_carrier_claim`
 
