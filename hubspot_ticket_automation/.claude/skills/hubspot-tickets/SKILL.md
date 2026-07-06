@@ -94,6 +94,16 @@ install + env-var + Postgres GRANT setup.
 
 ## Step 0: Pack'N OS routine gate + run-record start (NEW — Phase 4)
 
+> **Pre-gate note (2026-07-06):** cron invocations arrive via
+> `scripts/run_tickets.sh`, which runs `scripts/pregate_tickets.py` FIRST.
+> The pre-gate performs the Step 0a schedule report, the Step 0b routine
+> gate, the rerun-queue check, and the Step 1 HubSpot poll deterministically
+> — and skips launching this skill entirely when there is no work. If you
+> are running, either work likely exists or the pre-gate failed open. Still
+> execute Steps 0–1 exactly as written below (manual `/packn-tickets` runs
+> bypass the pre-gate, and the double-check is cheap); a zero-ticket result
+> here remains a normal clean exit.
+
 ### Step 0a: Report current crontab schedule to Pack'N OS
 
 Run BEFORE the gate so Pack'N OS knows the cron fired, even when the routine
@@ -395,7 +405,7 @@ Note: this step runs BEFORE classification (2b) because the ssk_state can inform
 
 #### 2a.6. Backfill structured identifiers to the HubSpot ticket
 
-**Why this exists:** HubSpot's form-to-ticket-property mapping for `tracking_number` and `order_number` is NOT configured for Pack'N's "New ticket created from form submission" forms. The values arrive embedded in the first email's HTML blockquote and are parsed into `ticket_context.form_fields.*` at runtime (step 2a). Downstream systems — Pack'N OS's `/shipments/[tracking]` detail-view HubSpot Tickets tile, the existing search-by-property paths, and any future filterGroups EQ queries — expect the ticket's native `tracking_number` and `order_number` custom properties to be populated. Surfaced during Phase 11.1 UAT 2026-05-26: TN `1Z02D293YW35246090` was extracted by this skill into `form_fields.tracking_number` but the ticket's HubSpot `tracking_number` property remained NULL, so Pack'N OS couldn't surface the ticket on the detail view.
+**Why this exists:** HubSpot's form-to-ticket-property mapping does NOT populate the native `tracking_number` / `order_number` ticket properties — the values arrive in the first email's HTML blockquote and are parsed into `ticket_context.form_fields.*` (step 2a). Downstream Pack'N OS surfaces (e.g. `/shipments/[tracking]` HubSpot Tickets tile) search by those native properties, so this step backfills them.
 
 **Trigger** (each independently):
 - `ticket_context.form_fields.tracking_number` is non-empty AND the ticket's existing `tracking_number` property is null/empty/whitespace
@@ -617,13 +627,7 @@ operator's surface in Pack'N OS.
 
 **Exception during write_draft** (e.g., Postgres unreachable, ValueError from missing `category` or `captured_at` in the snapshot) → log the error with full traceback in the run log under this ticket's entry. Do NOT fall back to a HubSpot internal note — the operator surface for this is the run-log + the eventual `automation_runs.error_summary` field. Continue to step 2g.
 
-**Legacy (pre-Phase 4.1) reference — PACKN_METADATA_V1 block format:** retained here for historical context only. Prior to the Phase 4.1 D-02.a hard-cut, the draft branch posted a HubSpot note engagement containing this block alongside the drafted reply body. Pre-Phase-4.1 digest runs scraped this block. Post-Phase-4.1, neither the block nor the engagement is emitted on the draft path; the digest reads from `automation_drafts` directly.
-
-```
---- PACKN_METADATA_V1 ---  (LEGACY — no longer emitted)
-{"v":1,"category":"<classifier category>","classifier_reason":"<one-sentence classifier.reason>","topic_of_ticket":"<form value or null>","source_type":"FORM|EMAIL|CHAT|...","posted_as":"draft|auto_send","urgent_emailed":false,"action_items":[...]}
---- PACKN_METADATA_END ---
-```
+**Legacy note:** prior to the Phase 4.1 D-02.a hard-cut, the draft branch posted a HubSpot note engagement containing a `PACKN_METADATA_V1` block that the digest scraped. Neither the block nor the engagement is emitted anymore; the digest reads from `automation_drafts` directly. (Full legacy block format: git history of this file, pre-2026-07-06.)
 
 #### 2g. Route action items + queue for digest
 
