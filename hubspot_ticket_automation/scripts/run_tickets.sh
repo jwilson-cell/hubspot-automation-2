@@ -35,6 +35,13 @@ PREGATE_EXIT=0
 if [ "$PREGATE_EXIT" -eq 10 ] || [ "$PREGATE_EXIT" -eq 11 ]; then
   echo "[run_tickets] pregate exit ${PREGATE_EXIT} — skipping agentic pass this tick"
 else
+  # 0.5) Shadow pipeline (efficiency rework #3): direct-API classify/draft/
+  #      extract over the SAME candidates the agent is about to process.
+  #      Writes comparison artifacts to outputs/shadow/ only — zero side
+  #      effects; gated by settings pipeline.shadow_enabled; always exits 0.
+  #      Runs BEFORE the agent so both see identical state.json.
+  .venv/bin/python scripts/run_pipeline.py
+
   # 1) Agentic ticket pass: classify / draft / queue each ticket's action_items
   #    to config/pending_actions.json (SKILL step 2g). Permissions are skipped so
   #    the headless run never blocks on a prompt. Model is PINNED to the Sonnet

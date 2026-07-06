@@ -11,3 +11,8 @@ PyYAML>=6.0
 # packn_os_hubspot_client/README.md for env vars + GRANT statements.
 psycopg[binary,pool]>=3.2,<4
 redis>=5,<6
+
+# Efficiency rework #3 (2026-07-06) — direct-API ticket pipeline
+# (ticket_pipeline/ package; shadow mode first). Uses the same
+# ANTHROPIC_API_KEY the claude CLI reads from the environment.
+anthropic>=0.40

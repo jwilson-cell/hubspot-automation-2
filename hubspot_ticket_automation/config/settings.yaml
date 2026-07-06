@@ -178,6 +178,16 @@ sheets_export:
   # Runtime state (populated by scripts/sheets_bootstrap.py):
   #   config/sheets_state.json holds spreadsheet_id, spreadsheet_url, tab_ids.
 
+# ---- Direct-API ticket pipeline (efficiency rework #3, 2026-07-06) ----
+# Shadow mode: scripts/run_pipeline.py runs BEFORE the agent on the same
+# candidate set and writes comparison artifacts to outputs/shadow/ — zero
+# side effects (the agent stays the system of record). Flip shadow_enabled
+# off to stop the extra LLM spend; cutover to live mode is a future,
+# separate decision after drafts have been compared for a validation window.
+pipeline:
+  shadow_enabled: true
+  shadow_limit: 25   # max tickets per shadow run (mirrors per_run_cap)
+
 # ---- Pack'N OS action-item ingestion (Phase 15.1 cutover) ----
 # scripts/post_action_items.py POSTs each ticket's extracted action items to the
 # Pack'N OS /api/ingest/action-items route so they surface as first-class tasks in
