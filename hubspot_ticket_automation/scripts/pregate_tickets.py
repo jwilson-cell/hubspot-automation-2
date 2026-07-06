@@ -168,11 +168,22 @@ def unprocessed_candidates(results: list[dict], fingerprints: dict) -> list[str]
     """Filter search hits through the state.json fingerprint dedupe.
 
     Approximation of SKILL.md Step 2a-pre (which compares num_notes): a
-    ticket is NOT new work when its fingerprint recorded an
-    hs_lastmodifieddate >= the ticket's current one — nothing changed since
-    the skill last processed it. Every ambiguous case (no fingerprint,
-    fingerprint without a lastmodified, unparseable timestamps) counts as a
-    candidate: a false positive costs one agent launch whose own dedupe
+    ticket is NOT new work when either
+      (a) its fingerprint recorded an hs_lastmodifieddate >= the ticket's
+          current one — nothing changed since the skill last processed it; or
+      (b) its fingerprint's processed_at >= the ticket's current
+          hs_lastmodifieddate — every HubSpot-side change we know of predates
+          the moment the skill FINISHED that ticket. This closes the
+          echo-launch hole: the skill's own step-2a.6 property backfill bumps
+          hs_lastmodifieddate DURING processing (i.e. before processed_at is
+          stamped), so without (b) every productive tick re-flags its tickets
+          once and wastes one agent launch. A genuinely new customer message
+          arrives AFTER processed_at, bumps lastmodified past it, and still
+          fails open. Relies only on sane NTP clocks (sub-second skew vs the
+          minutes-long gap between backfill and fingerprint write).
+
+    Every ambiguous case (no fingerprint, no comparable timestamps) counts as
+    a candidate: a false positive costs one agent launch whose own dedupe
     skips the ticket; a false negative would silently drop work.
     """
     candidates: list[str] = []
@@ -186,8 +197,13 @@ def unprocessed_candidates(results: list[dict], fingerprints: dict) -> list[str]
             candidates.append(ticket_id)
             continue
         fp_ms = iso_to_ms(fp.get("hs_lastmodifieddate"))
-        if current_ms is None or fp_ms is None or current_ms > fp_ms:
-            candidates.append(ticket_id)
+        processed_ms = iso_to_ms(fp.get("processed_at"))
+        if current_ms is not None and (
+            (fp_ms is not None and current_ms <= fp_ms)
+            or (processed_ms is not None and current_ms <= processed_ms)
+        ):
+            continue
+        candidates.append(ticket_id)
     return candidates
 
 

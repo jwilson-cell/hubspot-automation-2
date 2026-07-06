@@ -129,8 +129,7 @@ def test_newer_lastmod_than_fingerprint_is_a_candidate() -> None:
 def test_ambiguous_fingerprints_fail_open() -> None:
     hits = [_hit("1", "2026-07-01T00:00:00Z"), _hit("2", None), _hit("3", "garbage")]
     fps = {
-        # fingerprint with null lastmod (real shape in live state.json —
-        # run #1 backfill rows) → candidate
+        # fingerprint with null lastmod AND null/absent processed_at → candidate
         "1": {"num_notes": 1, "hs_lastmodifieddate": None},
         # fingerprint present but ticket lastmod missing → candidate
         "2": {"hs_lastmodifieddate": "2026-07-01T00:00:00Z"},
@@ -138,6 +137,32 @@ def test_ambiguous_fingerprints_fail_open() -> None:
         "3": {"hs_lastmodifieddate": "2026-07-01T00:00:00Z"},
     }
     assert pg.unprocessed_candidates(hits, fps) == ["1", "2", "3"]
+
+
+def test_backfill_echo_covered_by_processed_at() -> None:
+    """The echo-launch hole (observed live 2026-07-06): step 2a.6 bumps the
+    ticket's lastmodified DURING processing, so the fingerprint's recorded
+    lastmod is stale — but processed_at (stamped at ticket completion) is
+    later than the bump, and must suppress the candidate."""
+    fps = {
+        "1": {
+            "hs_lastmodifieddate": "2026-07-06T18:00:10Z",  # pre-backfill snapshot
+            "processed_at": "2026-07-06T18:03:00Z",  # ticket finished
+        }
+    }
+    # backfill bumped lastmod to 18:01 — BETWEEN snapshot and completion → skip
+    assert pg.unprocessed_candidates([_hit("1", "2026-07-06T18:01:00Z")], fps) == []
+    # a customer reply at 18:10 lands AFTER processed_at → candidate
+    assert pg.unprocessed_candidates([_hit("1", "2026-07-06T18:10:00Z")], fps) == ["1"]
+
+
+def test_backfilled_fingerprint_with_null_lastmod_uses_processed_at() -> None:
+    """Live state.json has run-#1 backfilled fingerprints with
+    hs_lastmodifieddate: None but a real processed_at — the processed_at
+    branch must still dedupe those when nothing changed since."""
+    fps = {"1": {"hs_lastmodifieddate": None, "processed_at": "2026-07-06T18:03:00Z"}}
+    assert pg.unprocessed_candidates([_hit("1", "2026-07-06T18:01:00Z")], fps) == []
+    assert pg.unprocessed_candidates([_hit("1", "2026-07-06T18:10:00Z")], fps) == ["1"]
 
 
 def test_non_dict_fingerprint_and_missing_id_handled() -> None:
