@@ -27,8 +27,8 @@ Drafted reply (for context, since it often names next steps):
 - `reship_order` — a reship that still needs review/approval first (cost owner undecided, or blocked pending an investigation result). Use `create_order` instead once it's a go.
 
 **Investigations (owner_hint: `warehouse`):**
-- `warehouse_investigation` — locate a package, audit a picker, recount, or explain an allocation hold (non-mispack).
-- `mispack_investigation` — wrong SKU / wrong size / wrong quantity / missing item: pull the pick + pack-station record to find root cause.
+- `warehouse_investigation` — locate a package, audit a picker, recount, or explain an allocation hold (non-mispack). **ONLY when a physical warehouse check is genuinely required** to answer the ticket (someone walking the floor, pulling footage, recounting a bin, finding a package). NEVER emit it as a duplicate carrier of work another extracted action already covers — e.g., an `edit_order` already instructs the warehouse to change the order; adding a `warehouse_investigation` that says "update the order" on top of it is noise (see Rule 9).
+- `mispack_investigation` — **ONLY when the customer reports receiving wrong or missing items in a package that was DELIVERED to them** (wrong SKU / wrong size / wrong quantity / item missing from the box in hand): pull the pick + pack-station record to find root cause. NOT for orders (or portions of orders) that haven't shipped yet — a partially-fulfilled order whose remaining unit is still owed was not mispacked; nothing has been packed wrong. That is `expedite_fulfillment` territory (or no action at all if the reply resolves it).
 
 **Carrier / claims:**
 - `carrier_trace` — open a trace, monitor a stuck-in-transit shipment, or assess whether the claim window is still open — BEFORE a claim is filed. (owner_hint: `warehouse`, or `account_manager` for international)
@@ -79,7 +79,9 @@ Return ONLY a JSON array (possibly empty). Each element:
    - Use **`reship_order`** when a reship is the likely resolution but still needs review or is blocked (cost owner undecided, or pending a `mispack_investigation` / `warehouse_investigation` result). This is the "approve the reship" task.
    - When in doubt and the reship checkbox is set, prefer `create_order`.
 
-8. **Confirmed-vs-suspected mispack.** For a wrong / missing / wrong-size item, ALWAYS emit `mispack_investigation` (pull the pick/pack record). If the merchant has also asked for the correct item to be sent: add `create_order` when the reship checkbox is set or the resend is clearly approved, otherwise `reship_order` with the investigation result listed in `blocking_info_needed`.
+8. **Confirmed-vs-suspected mispack.** For a wrong / missing / wrong-size item **reported in a package the customer has received**, ALWAYS emit `mispack_investigation` (pull the pick/pack record). If the merchant has also asked for the correct item to be sent: add `create_order` when the reship checkbox is set or the resend is clearly approved, otherwise `reship_order` with the investigation result listed in `blocking_info_needed`. This rule does NOT apply to undelivered or partially-fulfilled orders — a remaining unit that hasn't shipped is a fulfillment question, not a mispack.
+
+9. **No duplicate carriers of the same work.** Each real-world task gets exactly ONE action item. Rule 2 (one action per item) means a ticket CAN yield multiple items — but only when they are genuinely different tasks. If an `edit_order` covers updating the order, do NOT also emit a `warehouse_investigation` calling for the order to be updated. If an investigation item would only restate what another emitted action already instructs, omit the investigation. Before emitting any `*_investigation`, check the other items you're emitting for this ticket and ask: does this add work not already covered? If not, drop it.
 
 ## Extended schema: `file_carrier_claim`
 
