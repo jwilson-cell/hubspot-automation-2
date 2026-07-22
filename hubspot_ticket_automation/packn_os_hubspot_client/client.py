@@ -234,13 +234,23 @@ def parse_complained_at(value: Optional[str]) -> Optional[str]:
     return dt.isoformat()
 
 
-def write_complaints(rows: list[dict]) -> dict:
+def write_complaints(rows: list[dict], include_order_number: bool = False) -> dict:
     """Batch INSERT mispack complaint rows. One connection; per-row SAVEPOINT.
 
     Each row dict:
         {"hubspot_ticket_id": str, "classification": str,
          "shipment_tracking_number": str | None, "brand": str | None,
+         "order_number": str | None,  # consumed ONLY when include_order_number
          "complained_at": str  # ISO-8601, pre-validated by the caller}
+
+    include_order_number (2026-07-22, /sla accuracy blind-spot part B): when
+    True the INSERT also carries `order_number` (Pack'N OS migration 0151 —
+    the collision-safe order-attribution tier's join key). The deploy-order-
+    inversion guard lives in the CALLER (scripts/write_complaints.py preflights
+    information_schema, the same pattern as the Phase 20 brand preflight): if
+    the writer goes live BEFORE the OS migration, the flag stays False and rows
+    insert exactly as before; scripts/heal_complaint_order_numbers.py backfills
+    the column afterwards.
 
     Returns {"inserted": int, "conflict_skipped": int, "bad": int}.
 
@@ -266,31 +276,45 @@ def write_complaints(rows: list[dict]) -> dict:
     inserted = 0
     conflict_skipped = 0
     bad = 0
+    # Two static SQL shapes (never string-built from row data). The order_number
+    # variant is only reachable behind the caller's column-presence preflight.
+    if include_order_number:
+        insert_sql = """
+            INSERT INTO customer_complaints
+              (tenant_id, hubspot_ticket_id, classification,
+               shipment_tracking_number, brand, order_number, complained_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s::timestamptz)
+            ON CONFLICT (tenant_id, hubspot_ticket_id) WHERE deleted_at IS NULL
+              DO NOTHING
+            RETURNING id
+            """
+    else:
+        insert_sql = """
+            INSERT INTO customer_complaints
+              (tenant_id, hubspot_ticket_id, classification,
+               shipment_tracking_number, brand, complained_at)
+            VALUES (%s, %s, %s, %s, %s, %s::timestamptz)
+            ON CONFLICT (tenant_id, hubspot_ticket_id) WHERE deleted_at IS NULL
+              DO NOTHING
+            RETURNING id
+            """
     with get_pool().connection() as conn:
         with conn.transaction():  # outer transaction — single COMMIT on exit
             with conn.cursor() as cur:
                 for row in rows:
                     try:
                         with conn.transaction():  # SAVEPOINT — isolates this row
-                            cur.execute(
-                                """
-                                INSERT INTO customer_complaints
-                                  (tenant_id, hubspot_ticket_id, classification,
-                                   shipment_tracking_number, brand, complained_at)
-                                VALUES (%s, %s, %s, %s, %s, %s::timestamptz)
-                                ON CONFLICT (tenant_id, hubspot_ticket_id) WHERE deleted_at IS NULL
-                                  DO NOTHING
-                                RETURNING id
-                                """,
-                                (
-                                    TENANT_ID,
-                                    row["hubspot_ticket_id"],
-                                    row["classification"],
-                                    normalize_optional(row.get("shipment_tracking_number")),
-                                    normalize_optional(row.get("brand")),
-                                    row["complained_at"],
-                                ),
-                            )
+                            params = [
+                                TENANT_ID,
+                                row["hubspot_ticket_id"],
+                                row["classification"],
+                                normalize_optional(row.get("shipment_tracking_number")),
+                                normalize_optional(row.get("brand")),
+                            ]
+                            if include_order_number:
+                                params.append(normalize_optional(row.get("order_number")))
+                            params.append(row["complained_at"])
+                            cur.execute(insert_sql, params)
                             if cur.fetchone():
                                 inserted += 1
                             else:

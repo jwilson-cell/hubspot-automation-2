@@ -52,17 +52,20 @@ def _zero_counts() -> dict:
     }
 
 
-def _brand_column_present() -> bool:
-    """Pre-flight (Pitfall 2 deploy-order-inversion guard): is the `brand`
-    column live on customer_complaints yet? Reading information_schema needs no
-    extra GRANT. If absent, the writer logs an explicit reason and skips the run
-    (it would otherwise INSERT against a column that doesn't exist)."""
+def _column_present(column_name: str) -> bool:
+    """Pre-flight (Pitfall 2 deploy-order-inversion guard): is `column_name`
+    live on customer_complaints yet? Reading information_schema needs no extra
+    GRANT. Used for `brand` (migration 0073 — absent ⇒ skip the whole run) and
+    `order_number` (migration 0151 — absent ⇒ write WITHOUT the column, the
+    heal script backfills later; a missing optional column must never stall
+    the mirror)."""
     with get_pool().connection() as conn:
         with conn.cursor() as cur:
             cur.execute(
                 "SELECT 1 FROM information_schema.columns "
                 "WHERE table_name = 'customer_complaints' "
-                "AND column_name = 'brand'"
+                "AND column_name = %s",
+                (column_name,),
             )
             return cur.fetchone() is not None
 
@@ -83,12 +86,22 @@ def run(csv_path: Path) -> dict:
         return _zero_counts()
 
     # Deploy-order-inversion guard: skip cleanly if the OS migration isn't live.
-    if not _brand_column_present():
+    if not _column_present("brand"):
         _log(
             "brand column missing — OS migration (0073) not deployed yet; "
             "skipping run (will retry next run)."
         )
         return _zero_counts()
+
+    # 2026-07-22 (/sla blind-spot part B): order_number rides along once OS
+    # migration 0151 is live; before that, rows insert WITHOUT it (never a
+    # stall — the heal script backfills the column from this same CSV later).
+    include_order_number = _column_present("order_number")
+    if not include_order_number:
+        _log(
+            "order_number column missing — OS migration (0151) not deployed "
+            "yet; mirroring WITHOUT order_number this run."
+        )
 
     batch: list[dict] = []
     rows = 0
@@ -125,6 +138,13 @@ def run(csv_path: Path) -> dict:
                             "brand": client.normalize_optional(
                                 raw.get("company_name")
                             ),
+                            # 2026-07-22 — the CSV's order_number is the join
+                            # key the Mispack form actually collects; consumed
+                            # by client.write_complaints only when the OS
+                            # column is live (include_order_number).
+                            "order_number": client.normalize_optional(
+                                raw.get("order_number")
+                            ),
                             "complained_at": complained,
                         }
                     )
@@ -137,7 +157,9 @@ def run(csv_path: Path) -> dict:
         _log(f"CSV read error: {exc!r} — partial batch will retry next run.")
 
     if batch:
-        result = client.write_complaints(batch)
+        result = client.write_complaints(
+            batch, include_order_number=include_order_number
+        )
         inserted = result["inserted"]
         conflict_skipped = result["conflict_skipped"]
         bad = result.get("bad", 0)
