@@ -40,7 +40,7 @@ def expected_write_draft_kwargs():
         "routine_name": "tickets-process",
         "draft_body": "<drafted reply text>",
         "model": "claude-sonnet-4-5",
-        "prompt_version": "v3.2.1",
+        "prompt_version": "v3.3.0",
         "hubspot_ticket_snapshot": {
             "subject": "Where is my package?",
             "body": "Hi, my tracking shows no movement for 3 days.",

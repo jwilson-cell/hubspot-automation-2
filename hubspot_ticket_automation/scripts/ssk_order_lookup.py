@@ -6,17 +6,38 @@ Carrier Issue / WISMO / shipping-delay tickets. Output gets injected into
 state (status, est delivery, tracking URL) instead of hedged boilerplate.
 
 Usage:
-    echo '{"order_number": "TEST321"}' | py scripts/ssk_order_lookup.py
+    echo '{"order_number": "TEST321", "merchant": "WKR"}' | py scripts/ssk_order_lookup.py
     echo '{"tracking_number": "1Z02D293YW21069996"}' | py scripts/ssk_order_lookup.py
-    echo '{"order_number": "X", "tracking_number": "Y"}' | py scripts/ssk_order_lookup.py
+    echo '{"order_number": "22288", "merchant": "Bruised", "merchant_hints": ["bruisedbrand.com"]}' | py scripts/ssk_order_lookup.py
 
 Resolution order: order_number first (it's the more reliable anchor), then
 tracking_number as fallback / enrichment.
+
+Merchant scoping (2026-07-22 — cross-merchant order-number collision fix):
+Order numbers COLLIDE across the stores' ShipSidekick orgs (Bruised #22288
+vs WKR #22288 are different orders). SSK API keys are org-scoped, so a
+GET /orders?search= under the right merchant's key CANNOT return another
+store's order. The payload therefore carries the ticket's merchant:
+
+    merchant        — the brand/company name resolved from the ticket
+                      (company_name / form fields / pipeline context).
+                      A STRONG signal: when set, the lookup runs under that
+                      merchant's key or refuses (exit 3). It NEVER falls
+                      back to the default/first key.
+    merchant_hints  — optional list of WEAK signals (e.g. the contact's
+                      email domain). Only used when `merchant` is empty,
+                      and only when a hint matches a configured merchant;
+                      non-matching hints are ignored.
+
+Keys are configured under `shipsidekick.merchants` in settings.yaml. Only
+when NO merchant signal resolves does the helper use the legacy default
+`shipsidekick.token_path` (pre-scoping behavior for unattributable tickets).
 
 Output (stdout JSON):
     {
       "found": true | false,
       "looked_up_by": "order_number" | "tracking_number",
+      "merchant_scope": "<configured merchant name the lookup ran under, or 'default'>",
       "order": {
         "id": "...", "name": "...", "alias": "...",
         "fulfillment_status": "...", "financial_status": "...",
@@ -42,7 +63,9 @@ Output (stdout JSON):
 Exit codes:
     0  success (regardless of whether the order was found — check `found` in JSON)
     2  bad args / bad payload
-    3  token file missing
+    3  token unavailable for the required scope — file missing/empty, OR the
+       ticket's merchant is known but has no configured org-scoped key
+       (the helper REFUSES to query under another merchant's key)
     4  ShipSidekick API error (HTTP non-2xx, non-404 on search)
 """
 from __future__ import annotations
@@ -62,14 +85,66 @@ DEFAULT_TOKEN_PATH = ROOT / "config" / ".secrets" / "shipsidekick_token.txt"
 DEFAULT_BASE_URL = "https://www.shipsidekick.com/api/v1"
 
 
-def _load_config() -> tuple[str, Path]:
-    """Return (base_url, token_path) from settings.yaml with defaults."""
+def _load_config() -> tuple[str, Path, list[dict]]:
+    """Return (base_url, default_token_path, merchants) from settings.yaml."""
     with open(SETTINGS_PATH, "r", encoding="utf-8") as f:
         cfg = yaml.safe_load(f) or {}
     ssk = cfg.get("shipsidekick") or {}
     base = ssk.get("base_url") or DEFAULT_BASE_URL
     token_path = ROOT / (ssk.get("token_path") or "config/.secrets/shipsidekick_token.txt")
-    return base, token_path
+    merchants = ssk.get("merchants") or []
+    return base, token_path, merchants
+
+
+def _match_merchant(needle: str, merchants: list[dict]) -> dict | None:
+    """Case-insensitive match of a merchant signal against configured
+    merchants. A merchant matches when its name or any `match` alias appears
+    in the needle (or equals it) — 'WKR' matches 'WKR', 'wkr.gg', 'WKR LLC'."""
+    n = (needle or "").strip().lower()
+    if not n:
+        return None
+    for m in merchants:
+        candidates = [m.get("name") or ""] + list(m.get("match") or [])
+        for c in candidates:
+            c = c.strip().lower()
+            if c and (c == n or c in n):
+                return m
+    return None
+
+
+def _resolve_token_scope(
+    merchant: str,
+    merchant_hints: list[str],
+    merchants: list[dict],
+    default_token_path: Path,
+) -> tuple[Path, str]:
+    """Pick the org-scoped token for the ticket's merchant.
+
+    - `merchant` set (STRONG signal): must match a configured merchant, else
+      exit 3 — NEVER fall back to the default/first key when the ticket's
+      merchant is known; an org-mismatched key returns another store's order
+      for a colliding order number and that leaks into customer drafts.
+    - `merchant` empty: try hints (weak signals); a hint only counts if it
+      matches a configured merchant, otherwise it's ignored.
+    - Nothing matched: legacy default token (unattributable tickets only).
+    """
+    if merchant.strip():
+        hit = _match_merchant(merchant, merchants)
+        if hit is None:
+            print(
+                f"ticket merchant '{merchant}' has no org-scoped key under "
+                f"shipsidekick.merchants in settings.yaml — refusing to look up "
+                f"under another merchant's key (cross-merchant order-number "
+                f"collision guard). Add the merchant + token_path to settings.yaml.",
+                file=sys.stderr,
+            )
+            sys.exit(3)
+        return ROOT / hit["token_path"], hit.get("name") or merchant
+    for hint in merchant_hints:
+        hit = _match_merchant(hint, merchants)
+        if hit is not None:
+            return ROOT / hit["token_path"], hit.get("name") or hint
+    return default_token_path, "default"
 
 
 def _get(path: str, token: str, base_url: str) -> dict | None:
@@ -187,8 +262,11 @@ def _search_orders(needle: str, token: str, base_url: str) -> dict | None:
     matches against the order name/alias AND (empirically) nested shipment
     tracking codes, so this single call handles both kinds of lookup.
 
-    Preference: exact match on name/alias > exact match on any nested
-    shipment's trackingCode > first result.
+    EXACT matches only: exact name/alias (with/without '#' prefix), else
+    exact trackingCode on a nested shipment. A fuzzy search hit that matches
+    neither is NOT the customer's order — returning it is how wrong-order
+    details leak into drafts. No first-result fallback (2026-07-22, mirrors
+    the Pack'N OS posture for the same defect class).
     """
     qs = urllib.parse.urlencode({"search": needle, "limit": 10, "includeArchived": "false"})
     data = _get(f"/orders?{qs}", token, base_url)
@@ -213,8 +291,8 @@ def _search_orders(needle: str, token: str, base_url: str) -> dict | None:
         for s in (o.get("shipments") or []):
             if (s.get("trackingCode") or "").strip().lower() == n:
                 return o
-    # Priority 3: first result
-    return candidates[0]
+    # No exact match → not found. Never return a fuzzy first result.
+    return None
 
 
 def _get_order(order_id: str, token: str, base_url: str) -> dict | None:
@@ -240,14 +318,25 @@ def main() -> int:
     if not order_number and not tracking_number:
         print("payload must include order_number, tracking_number, or both", file=sys.stderr)
         return 2
+    merchant = (payload.get("merchant") or "").strip()
+    merchant_hints = [
+        str(h).strip() for h in (payload.get("merchant_hints") or []) if str(h).strip()
+    ]
 
-    base_url, token_path = _load_config()
+    base_url, default_token_path, merchants = _load_config()
+    token_path, merchant_scope = _resolve_token_scope(
+        merchant, merchant_hints, merchants, default_token_path
+    )
     if not token_path.exists():
-        print(f"SSK token missing at {token_path} — generate a key in ShipSidekick dashboard", file=sys.stderr)
+        print(
+            f"SSK token missing at {token_path} (scope: {merchant_scope}) — "
+            f"generate an org-scoped key in the ShipSidekick dashboard",
+            file=sys.stderr,
+        )
         return 3
     token = token_path.read_text(encoding="utf-8").strip()
     if not token:
-        print(f"SSK token file at {token_path} is empty", file=sys.stderr)
+        print(f"SSK token file at {token_path} is empty (scope: {merchant_scope})", file=sys.stderr)
         return 3
 
     order = None
@@ -275,6 +364,7 @@ def main() -> int:
         print(json.dumps({
             "found": False,
             "looked_up_by": looked_up_by,
+            "merchant_scope": merchant_scope,
             "not_found_reason": not_found_reason,
         }, indent=2))
         return 0
@@ -290,6 +380,7 @@ def main() -> int:
     result = {
         "found": True,
         "looked_up_by": looked_up_by,
+        "merchant_scope": merchant_scope,
         "order": _normalize_order(order),
         "shipments": shipments,
     }

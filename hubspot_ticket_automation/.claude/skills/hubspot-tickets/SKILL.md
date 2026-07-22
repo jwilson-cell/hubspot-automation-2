@@ -382,20 +382,28 @@ If `settings.shipsidekick.enabled` is true AND the ticket is likely to benefit f
 
 Simplest implementation: trigger whenever the ticket has an `order_number` OR `tracking_number` on a form ticket. The cost is one GET per matching ticket (<200ms typical) and the payoff is a specific, credible reply.
 
+**Resolve the ticket's merchant first (2026-07-22 — cross-merchant order-number collision guard).** Order numbers collide across the stores' ShipSidekick orgs (Bruised #22288 and WKR #22288 are different orders); SSK keys are org-scoped, so the lookup MUST run under the ticket merchant's key. Resolve `merchant` with the same priority rules as the 2h `company_name` field (brand, never gopackn):
+
+1. `ticket_context.company.name` when present AND neither the name nor domain contains `gopackn`.
+2. Else the company/brand field parsed from the form blockquote (`form_fields.company_name` or equivalent).
+3. Else empty string — do NOT guess between brands.
+
+Also pass `merchant_hints`: a list containing the contact's email domain when available (e.g. `["wkr.gg"]`). Hints are weak signals — the helper only uses one if it matches a configured merchant.
+
 **Call**:
 
 ```
-echo '{"order_number": "<form_fields.order_number>", "tracking_number": "<form_fields.tracking_number>"}' | py scripts/ssk_order_lookup.py
+echo '{"order_number": "<form_fields.order_number>", "tracking_number": "<form_fields.tracking_number>", "merchant": "<resolved merchant or empty>", "merchant_hints": ["<contact email domain if any>"]}' | py scripts/ssk_order_lookup.py
 ```
 
-Pass whichever identifiers are present; the helper prefers `order_number` and falls back to `tracking_number`.
+Pass whichever identifiers are present; the helper prefers `order_number` and falls back to `tracking_number`. The helper picks the merchant's org-scoped key from `settings.shipsidekick.merchants`; it NEVER falls back to the default key when the merchant is known (exit 3 instead), and it only returns exact name/alias/tracking matches — a fuzzy search hit from the wrong store can no longer land in a draft.
 
 **On exit code 0**:
 - Parse stdout JSON.
 - If `found: true` → set `ticket_context.ssk_state = <full JSON>`. The drafter will cite it.
 - If `found: false` → set `ticket_context.ssk_state = {"found": false, "not_found_reason": "<reason>"}` so the drafter knows the lookup was attempted and can hedge honestly ("I couldn't locate that order in our WMS — can you double-check the number?") rather than going quiet.
 
-**On exit code 3** (token missing): log a warning in the run log under this ticket, do NOT set `ssk_state`, continue processing (drafter will fall back to the pre-SSK behavior).
+**On exit code 3** (token unavailable for the required scope — file missing/empty, OR the ticket's merchant is known but has no configured org-scoped key): log a warning in the run log under this ticket, do NOT set `ssk_state`, continue processing (drafter will fall back to the pre-SSK hedged behavior). Do NOT retry with the merchant field removed — that would defeat the collision guard and query the wrong store.
 
 **On exit code 4** (SSK API error): log the error in the run log, do NOT set `ssk_state`, continue. Do not abort the run.
 
@@ -553,7 +561,7 @@ Also compose an **auto-send subject** (used in both paths so the queued record h
        routine_name='tickets-process',
        draft_body='<drafted reply from step 2d, plain text>',
        model='claude-sonnet-4-5',
-       prompt_version='v3.2.1',
+       prompt_version='v3.3.0',
        hubspot_ticket_snapshot=<the JSON dict from step 1, dumped via json.dumps()>,
    )
    print(draft_id)
@@ -611,7 +619,7 @@ operator's surface in Pack'N OS.
       routine_name='tickets-process',
       draft_body='<drafted reply from step 2d, plain text>',
       model='claude-sonnet-4-5',
-      prompt_version='v3.2.1',
+      prompt_version='v3.3.0',
       hubspot_ticket_snapshot=<the JSON dict from the auto-send branch step 1, dumped via json.dumps()>,
   )
   print(draft_id)

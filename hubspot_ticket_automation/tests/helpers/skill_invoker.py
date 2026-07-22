@@ -37,7 +37,7 @@ def invoke_draft_branch(ticket_context: dict, draft_body: str) -> str:
         routine_name="tickets-process",
         draft_body=draft_body,
         model="claude-sonnet-4-5",
-        prompt_version="v3.2.1",
+        prompt_version="v3.3.0",
         hubspot_ticket_snapshot=snapshot,
     )
 

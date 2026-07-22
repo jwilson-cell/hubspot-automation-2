@@ -103,6 +103,35 @@ def latest_customer_message(thread: list[dict]) -> str:
     return thread[-1]["body_text"] if thread else ""
 
 
+def resolve_merchant(company: dict, form_fields: dict) -> str:
+    """Resolve the BRAND/merchant the ticket belongs to, mirroring SKILL 2h's
+    company_name rules (brand, never gopackn). Returns "" when unknown —
+    callers must NOT guess between brands. Used to org-scope the SSK lookup
+    (cross-merchant order-number collision guard, 2026-07-22)."""
+    name = ((company or {}).get("name") or "").strip()
+    domain = ((company or {}).get("domain") or "").strip()
+    if name and "gopackn" not in name.lower() and "gopackn" not in domain.lower():
+        return name
+    for key in ("company_name", "company", "brand"):
+        v = ((form_fields or {}).get(key) or "").strip()
+        if v and "gopackn" not in v.lower():
+            return v
+    return ""
+
+
+def merchant_hints(contact: dict) -> list[str]:
+    """Weak merchant signals for the SSK helper: currently the contact's email
+    domain (e.g. va@wkr.gg -> wkr.gg). The helper only uses a hint when it
+    matches a configured merchant; gopackn/CX domains are never hints."""
+    email = ((contact or {}).get("email") or "").strip()
+    if "@" not in email:
+        return []
+    dom = email.rsplit("@", 1)[-1].lower()
+    if not dom or "gopackn" in dom:
+        return []
+    return [dom]
+
+
 _ATTACH_HINT_RE = re.compile(
     r"\battach(?:ed|ment|ments)?\b|\bscreenshot\b|\bphoto(?:s)?\b|\bimage(?:s)? (?:below|attached)\b",
     re.IGNORECASE,
@@ -120,15 +149,27 @@ def detect_attachments(*texts: Optional[str]) -> bool:
 # ===========================================================================
 
 
-def _ssk_lookup(order_number: Optional[str], tracking_number: Optional[str]) -> Optional[dict]:
+def _ssk_lookup(
+    order_number: Optional[str],
+    tracking_number: Optional[str],
+    merchant: str = "",
+    hints: Optional[list[str]] = None,
+) -> Optional[dict]:
     """scripts/ssk_order_lookup.py subprocess — same helper, same contract as
     the agent's step 2a.5. Returns the parsed ssk_state dict, or None when
     the lookup could not run (exit 3/4/2 — the drafter falls back to hedged
-    language, exactly like the agent)."""
+    language, exactly like the agent). Exit 3 includes the merchant-scoping
+    refusal: known merchant with no configured org key never queries under
+    another merchant's key."""
     if not (order_number or tracking_number):
         return None
     payload = json.dumps(
-        {"order_number": order_number or "", "tracking_number": tracking_number or ""}
+        {
+            "order_number": order_number or "",
+            "tracking_number": tracking_number or "",
+            "merchant": merchant or "",
+            "merchant_hints": hints or [],
+        }
     )
     python = str(VENV_PY) if VENV_PY.exists() else sys.executable
     try:
@@ -302,7 +343,10 @@ def hydrate_ticket(ticket: dict, settings: dict, token: str) -> dict:
     if (settings.get("shipsidekick") or {}).get("enabled"):
         try:
             ssk = _ssk_lookup(
-                form_fields.get("order_number"), form_fields.get("tracking_number")
+                form_fields.get("order_number"),
+                form_fields.get("tracking_number"),
+                merchant=resolve_merchant(company, form_fields),
+                hints=merchant_hints(contact),
             )
             if ssk is not None:
                 ctx["ssk_state"] = ssk

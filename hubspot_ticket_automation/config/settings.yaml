@@ -103,7 +103,25 @@ shipsidekick:
   enabled: true
   base_url: "https://www.shipsidekick.com/api/v1"
   # test env: "https://test.shipsidekick.com/api/v1"
+  # DEFAULT token — used ONLY when the ticket's merchant cannot be resolved
+  # at all. When the merchant IS known, the lookup runs under that merchant's
+  # org-scoped key below or refuses (exit 3); it never falls back here.
   token_path: "config/.secrets/shipsidekick_token.txt"
+  # Per-merchant org-scoped API keys (2026-07-22 — cross-merchant order-number
+  # collision fix). Order numbers collide across the stores' SSK orgs (Bruised
+  # #22288 ≠ WKR #22288); SSK keys are org-scoped, so querying under the ticket
+  # merchant's key makes it impossible to pull another store's order.
+  # `match` entries are case-insensitive substrings tested against the ticket's
+  # company name / brand / email domain. Token files live on the droplet under
+  # config/.secrets/ (gitignored) — generate one key per merchant org in the
+  # ShipSidekick dashboard.
+  merchants:
+    - name: "WKR"
+      match: ["wkr", "wkr.gg"]
+      token_path: "config/.secrets/shipsidekick_token_wkr.txt"
+    - name: "Bruised"
+      match: ["bruised"]
+      token_path: "config/.secrets/shipsidekick_token_bruised.txt"
   # Categories that trigger live SSK hydration in step 2a.5 of hubspot-tickets.
   # Extend cautiously — each category adds one SSK GET per ticket.
   hydrate_categories:
