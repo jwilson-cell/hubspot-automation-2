@@ -763,9 +763,9 @@ If `settings.sheets_export.enabled` is true AND the classifier's category matche
   "first_seen_utc":        "<ticket_context.createdate>",
   "customer_name":         "<per shared-field semantics above>",
   "customer_email":        "<ticket_context.contact.email>",
-  "company_name":          "<ticket_context.company.name>",
+  "company_name":          "<see company_name rule below — brand, never gopackn>",
   "order_number":          "<ticket_context.form_fields.order_number>",
-  "tracking_number":       "<ticket_context.form_fields.tracking_number>",
+  "tracking_number":       "<see tracking_number rule below — form field, else SSK shipment>",
   "sku_mentioned":         "<any SKU identified by classifier/drafter; else empty>",
   "issue_description":     "<classifier.reason (one sentence from 2b)>",
   "requested_credit_usd":  "<ticket_context.form_fields.requested_credit_amount>",
@@ -785,9 +785,9 @@ If `settings.sheets_export.enabled` is true AND the classifier's category matche
   "first_seen_utc":        "<ticket_context.createdate>",
   "customer_name":         "<per shared-field semantics above>",
   "customer_email":        "<...>",
-  "company_name":          "<...>",
+  "company_name":          "<see company_name rule below — brand, never gopackn>",
   "order_number":          "<ticket_context.form_fields.order_number>",
-  "tracking_number":       "<ticket_context.form_fields.tracking_number>",
+  "tracking_number":       "<see tracking_number rule below — form field, else SSK shipment>",
   "carrier_inferred":      "<see rule below; empty string when unknown>",
   "carrier_issue":         "<ticket_context.form_fields.carrier_issue>",
   "insurance_on_package":  "<ticket_context.form_fields.insurance_on_package>",
@@ -801,6 +801,22 @@ If `settings.sheets_export.enabled` is true AND the classifier's category matche
 **`carrier_inferred`**: set from `ticket_context.ssk_state.shipments[0].carrier_code` when `ssk_state.found == true` and a shipment is present (high-confidence canonical source). Otherwise emit empty string — `scripts/sheets_sync.py:infer_carrier()` fills it from `tracking_number` regex at write time as fallback.
 
 **`filing_deadline_iso`**: compute as `ship_date + carrier_window_days` when both are known. Ship date comes from `ssk_state.shipments[0].created_at` (date portion). Carrier windows: UPS/FedEx/USPS 60 days, DHL 30 days, Amazon 30, OnTrac 90, LTL 270 days, unknown carrier → 60 (conservative). Emit as ISO date string (`YYYY-MM-DD`). If ship date is not known, emit empty string — the digest will approximate from `first_seen_utc` at render time and flag with a `~` prefix.
+
+**`tracking_number`** (BOTH rollups — 2026-07-22, load-bearing for Pack'N OS /sla accuracy): resolve in priority order —
+
+1. `ticket_context.form_fields.tracking_number` when non-empty.
+2. Else `ticket_context.ssk_state.shipments[0].tracking_code` when `ssk_state.found == true` and a shipment is present (step 2a.5 already hydrated mispack/carrier tickets by order number — this costs nothing extra).
+3. Else empty string. Never invent one.
+
+WHY the SSK fallback is mandatory, not optional polish: the Mispack form asks for an ORDER number, not a tracking number, so the form field is empty on most mispack tickets. Downstream, the Pack'N OS complaint mirror (`write_complaints.py` → `customer_complaints`) attributes a complaint to a shipment — and to its TRUE ship day on the /sla daily accuracy trend — ONLY via this tracking number. Rows mirrored without one degrade to brand-fallback or fall out of the metric entirely. Regression on record: 2026-07-07→07-21, 14 of 15 mispack rows landed with an empty `tracking_number` and /sla charted a flat 100% accuracy while mispacks were arriving daily.
+
+**`company_name`** (BOTH rollups — 2026-07-22): this field is the BRAND the complaint is about (it becomes `customer_complaints.brand` in Pack'N OS and drives per-merchant accuracy attribution). Resolve in priority order —
+
+1. `ticket_context.company.name` when present AND it is not Pack'N itself. SKIP it when the company name or domain contains `gopackn` — CX agents (e.g. marycx@gopackn.com) associate to Pack'N's own CRM company, and `gopackn.com` is never a brand; emitting it poisons brand attribution downstream.
+2. Else the company/brand field parsed from the form blockquote (`form_fields.company_name` or equivalent) when non-empty.
+3. Else infer from unambiguous ticket context (e.g. the customer's email domain clearly belongs to a known brand, like `va@wkr.gg` → WKR); when not certain, emit empty string. Never guess between two brands, never emit a `gopackn` value.
+
+**Pipeline-cutover parity note**: `ticket_pipeline/` (shadow mode) emits no rollup rows today. When cutover adds them, the two resolution rules above MUST be ported into the deterministic composer — they are metric-load-bearing, not drafting sugar.
 
 **Categories outside these rollups** (e.g. returns_rma, billing_invoice, address_recipient) do not emit a row. The KPI row is emitted unconditionally in step 3.5.
 
