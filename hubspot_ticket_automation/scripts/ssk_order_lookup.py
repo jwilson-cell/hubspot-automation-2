@@ -70,6 +70,7 @@ from __future__ import annotations
 import json
 import re
 import sys
+import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -98,9 +99,13 @@ _NORM_RE = re.compile(r"[^a-z0-9]+")
 
 
 def _norm(s: str) -> str:
-    """Lowercase and strip everything non-alphanumeric: 'Bruised Brand LLC'
-    -> 'bruisedbrandllc', 'bruised-brand' -> 'bruisedbrand'."""
-    return _NORM_RE.sub("", (s or "").lower())
+    """Lowercase, fold accents to ASCII, strip everything non-alphanumeric:
+    'Bruised Brand LLC' -> 'bruisedbrandllc', 'bruised-brand' ->
+    'bruisedbrand', 'Erika Peña' -> 'erikapena', 'Törner Labs' ->
+    'tornerlabs'. Without the accent fold, 'ñ'/'ö' would be dropped and
+    the result would never match the ASCII client slug."""
+    folded = unicodedata.normalize("NFKD", s or "").encode("ascii", "ignore").decode("ascii")
+    return _NORM_RE.sub("", folded.lower())
 
 
 def _match_merchant(needle: str, merchants: list[dict]) -> dict | None:

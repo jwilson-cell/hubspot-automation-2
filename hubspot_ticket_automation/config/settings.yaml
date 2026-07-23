@@ -122,13 +122,71 @@ shipsidekick:
   # (exit 3) rather than guess. Token files live under config/.secrets/
   # (gitignored): one file per client, named shipsidekick_token_<slug>.txt,
   # containing ONLY the raw org-scoped API key on a single line.
+  # Roster derived 2026-07-23 from HubSpot: ticket company_name values +
+  # the 2026-01-13 client-import batch of CRM companies. "Vague" alias
+  # covers both "Vague Streetwear" (CRM) and "Vague Studios" (what
+  # customers actually type on tickets).
   merchants:
     - name: "WKR"
       match: ["wkr"]
       token_path: "config/.secrets/shipsidekick_token_wkr.txt"
-    - name: "Bruised"
-      match: ["bruised"]
-      token_path: "config/.secrets/shipsidekick_token_bruised.txt"
+    - name: "Bruised LA"
+      match: ["bruisedla"]
+      token_path: "config/.secrets/shipsidekick_token_bruisedla.txt"
+    - name: "Wear Wojo"
+      match: ["wearwojo"]
+      token_path: "config/.secrets/shipsidekick_token_wearwojo.txt"
+    - name: "Vague Streetwear"
+      match: ["vague"]
+      token_path: "config/.secrets/shipsidekick_token_vaguestreetwear.txt"
+    - name: "OFUURE"
+      match: ["ofuure"]
+      token_path: "config/.secrets/shipsidekick_token_ofuure.txt"
+    - name: "Pendulum"
+      match: ["pendulum"]
+      token_path: "config/.secrets/shipsidekick_token_pendulum.txt"
+    - name: "Wants and Needs"
+      match: ["wantsandneeds"]
+      token_path: "config/.secrets/shipsidekick_token_wantsandneeds.txt"
+    - name: "Erika Pena"
+      match: ["erikapena"]
+      token_path: "config/.secrets/shipsidekick_token_erikapena.txt"
+    - name: "Savoy West"
+      match: ["savoywest"]
+      token_path: "config/.secrets/shipsidekick_token_savoywest.txt"
+    - name: "Prospera"
+      match: ["prospera"]
+      token_path: "config/.secrets/shipsidekick_token_prospera.txt"
+    - name: "Fleurette"
+      match: ["fleurette"]
+      token_path: "config/.secrets/shipsidekick_token_fleurette.txt"
+    - name: "Crowned Saints"
+      match: ["crownedsaints"]
+      token_path: "config/.secrets/shipsidekick_token_crownedsaints.txt"
+    - name: "Life of Errors"
+      match: ["lifeoferrors"]
+      token_path: "config/.secrets/shipsidekick_token_lifeoferrors.txt"
+    - name: "Profit Minded Clothing"
+      match: ["profitminded"]
+      token_path: "config/.secrets/shipsidekick_token_profitmindedclothing.txt"
+    - name: "Trs of God"
+      match: ["trsofgod"]
+      token_path: "config/.secrets/shipsidekick_token_trsofgod.txt"
+    - name: "Shahzad Clothing"
+      match: ["shahzad"]
+      token_path: "config/.secrets/shipsidekick_token_shahzadclothing.txt"
+    - name: "Onyx Apparel"
+      match: ["onyxapparel", "onyx"]
+      token_path: "config/.secrets/shipsidekick_token_onyxapparel.txt"
+    - name: "All In Lid"
+      match: ["allinlid"]
+      token_path: "config/.secrets/shipsidekick_token_allinlid.txt"
+    - name: "Boot Up Customs"
+      match: ["bootupcustoms", "bootup"]
+      token_path: "config/.secrets/shipsidekick_token_bootupcustoms.txt"
+    - name: "Torner Labs"
+      match: ["tornerlabs", "torner"]
+      token_path: "config/.secrets/shipsidekick_token_tornerlabs.txt"
   # Categories that trigger live SSK hydration in step 2a.5 of hubspot-tickets.
   # Extend cautiously — each category adds one SSK GET per ticket.
   hydrate_categories:
