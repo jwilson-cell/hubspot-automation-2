@@ -168,7 +168,18 @@ def _resolve_token_scope(
                 file=sys.stderr,
             )
             sys.exit(3)
-        return ROOT / hit["token_path"], hit.get("name") or merchant
+        token_path = hit.get("token_path")
+        if not token_path:
+            # Misconfigured entry (name/match but no token_path): same
+            # refuse-with-exit-3 contract as an unknown merchant — never a
+            # crash, never a fall-through to the default key.
+            print(
+                f"merchant '{hit.get('name') or merchant}' is configured without a "
+                f"token_path in settings.yaml — refusing (add the org-scoped key).",
+                file=sys.stderr,
+            )
+            sys.exit(3)
+        return ROOT / token_path, hit.get("name") or merchant
     return default_token_path, "default"
 
 
@@ -178,7 +189,10 @@ def _get(path: str, token: str, base_url: str) -> dict | None:
     req.add_header("Authorization", f"Bearer {token}")
     req.add_header("Accept", "application/json")
     try:
-        with urllib.request.urlopen(req) as resp:
+        # timeout matches hubspot_api.py — without it a stalled SSK socket
+        # hangs the whole ticket pass (hydrate.py's subprocess timeout=45
+        # backstops this, but the pipeline should not rely on the caller).
+        with urllib.request.urlopen(req, timeout=30) as resp:
             raw = resp.read().decode("utf-8") or "{}"
             return json.loads(raw)
     except urllib.error.HTTPError as e:

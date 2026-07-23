@@ -351,6 +351,19 @@ def main() -> int:
         )
         return EXIT_RUN_AGENT
 
+    if len(results) >= per_run_cap:
+        # Saturated-page blind spot (2026-07-23 audit): the single page is
+        # full AND every row deduped out. Already-processed tickets whose
+        # hs_lastmodifieddate keeps getting bumped can permanently occupy the
+        # ascending-sorted page, hiding newer unprocessed tickets beyond it —
+        # and since nothing advances last_run_at on a skip, the deadlock is
+        # stable across ticks. Fail open: let the agent run and page deeper.
+        _log(
+            f"page saturated ({len(results)} >= per_run_cap {per_run_cap}) with all "
+            "deduped — failing open to the agent so work beyond the page isn't hidden"
+        )
+        return EXIT_RUN_AGENT
+
     _log(f"no new tickets ({len(results)} matched, all deduped) — skipping agentic run")
     _write_run_record("success", None, started_iso)
     return EXIT_SKIP_NO_WORK

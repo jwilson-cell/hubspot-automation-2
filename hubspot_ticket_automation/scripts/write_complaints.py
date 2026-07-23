@@ -181,7 +181,11 @@ def run(csv_path: Path) -> dict:
     # stops populating. Emit a distinctive grep-able ERROR marker the droplet
     # log scan can alert on (cross-ref memory
     # project_packn_os_monitoring_design_gaps — heartbeat-green ≠ data-flowing).
-    if rows > 0 and inserted == 0 and conflict_skipped == 0:
+    # Only alarm when parseable rows were actually built and none persisted —
+    # a CSV whose rows were ALL caller-side-skipped (empty ticket_id, bad
+    # first_seen_utc) has nothing to land and would page on a non-incident
+    # (2026-07-23 audit).
+    if (rows - skipped_bad) > 0 and inserted == 0 and conflict_skipped == 0:
         _log(
             f"ERROR COMPLAINT_MIRROR_STALL: all {rows} row(s) failed to land "
             f"(inserted=0 conflict_skipped=0 skipped_bad={skipped_bad} "
