@@ -1,0 +1,11 @@
+# Secrets — NEVER commit. Org-scoped ShipSidekick keys, HubSpot private-app
+# token, Gmail OAuth token, action-ingest HMAC secret all live here.
+hubspot_ticket_automation/config/.secrets/
+
+# Python bytecode / test caches
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Virtualenv (droplet uses .venv)
+.venv/
