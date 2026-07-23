@@ -10,6 +10,12 @@ Usage (droplet):
 
 Requires PACKN_OS_DATABASE_URL (source /etc/environment under a bare shell).
 Requests expire after 24h if no tick processes them.
+
+NOTE (2026-07-23): the automation's Postgres role has NO INSERT grant on
+automation_rerun_requests — writing the queue is deliberately Pack'N OS's
+job (D-09), so this CLI fails with InsufficientPrivilege under the cron
+role. Queue reruns via the Pack'N OS UI instead, or have the DB owner run
+`GRANT INSERT ON automation_rerun_requests TO <automation_role>;` first.
 """
 from __future__ import annotations
 
