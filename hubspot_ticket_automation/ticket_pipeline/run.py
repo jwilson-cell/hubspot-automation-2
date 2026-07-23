@@ -47,6 +47,26 @@ def _log(msg: str) -> None:
     print(f"[pipeline.shadow] {msg}", file=sys.stderr)
 
 
+# USD per 1M tokens (input, output) — for the run summary's cost estimate.
+# claude-sonnet-5 is introductory pricing through 2026-08-31 ($3/$15 after).
+_PRICING_USD_PER_MTOK = {
+    "claude-haiku-4-5": (1.00, 5.00),
+    "claude-sonnet-5": (2.00, 10.00),
+    "claude-sonnet-4-5": (3.00, 15.00),
+}
+
+
+def _estimate_cost_usd(usages: list[dict]) -> float:
+    """Best-effort spend estimate from per-call usage records. Unknown
+    models contribute 0 (the token counts still land in the summary)."""
+    total = 0.0
+    for u in usages:
+        rate_in, rate_out = _PRICING_USD_PER_MTOK.get(u.get("model") or "", (0.0, 0.0))
+        total += u.get("input_tokens", 0) * rate_in / 1_000_000
+        total += u.get("output_tokens", 0) * rate_out / 1_000_000
+    return round(total, 6)
+
+
 def _load_yaml(path: Path) -> dict:
     with open(path, encoding="utf-8") as fh:
         return yaml.safe_load(fh) or {}
@@ -180,6 +200,7 @@ def run_shadow(limit: int | None = None, ticket_id: str | None = None) -> int:
                 "actions": len(artifact["action_items"]),
                 "tokens_in": tokens_in,
                 "tokens_out": tokens_out,
+                "cost_usd": _estimate_cost_usd(artifact["usage"]),
                 "elapsed_s": artifact["elapsed_s"],
             }
         )
@@ -197,6 +218,7 @@ def run_shadow(limit: int | None = None, ticket_id: str | None = None) -> int:
             "error": len(summary_rows) - len(ok_rows),
             "tokens_in": sum(r["tokens_in"] for r in ok_rows),
             "tokens_out": sum(r["tokens_out"] for r in ok_rows),
+            "cost_usd": round(sum(r["cost_usd"] for r in ok_rows), 4),
         },
     }
     (out_dir / "_summary.json").write_text(
@@ -204,7 +226,8 @@ def run_shadow(limit: int | None = None, ticket_id: str | None = None) -> int:
     )
     _log(
         f"done: {summary['totals']['ok']} ok / {summary['totals']['error']} error, "
-        f"{summary['totals']['tokens_in']} tokens in / {summary['totals']['tokens_out']} out"
+        f"{summary['totals']['tokens_in']} tokens in / {summary['totals']['tokens_out']} out, "
+        f"~${summary['totals']['cost_usd']}"
     )
     return 0
 
