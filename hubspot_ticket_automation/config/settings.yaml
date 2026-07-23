@@ -154,36 +154,18 @@ shipsidekick:
     - name: "Savoy West"
       match: ["savoywest"]
       token_path: "config/.secrets/shipsidekick_token_savoywest.txt"
-    - name: "Prospera"
-      match: ["prospera"]
-      token_path: "config/.secrets/shipsidekick_token_prospera.txt"
     - name: "Fleurette"
       match: ["fleurette"]
       token_path: "config/.secrets/shipsidekick_token_fleurette.txt"
-    - name: "Crowned Saints"
-      match: ["crownedsaints"]
-      token_path: "config/.secrets/shipsidekick_token_crownedsaints.txt"
     - name: "Life of Errors"
       match: ["lifeoferrors"]
       token_path: "config/.secrets/shipsidekick_token_lifeoferrors.txt"
-    - name: "Profit Minded Clothing"
-      match: ["profitminded"]
-      token_path: "config/.secrets/shipsidekick_token_profitmindedclothing.txt"
-    - name: "Trs of God"
-      match: ["trsofgod"]
-      token_path: "config/.secrets/shipsidekick_token_trsofgod.txt"
     - name: "Shahzad Clothing"
       match: ["shahzad"]
       token_path: "config/.secrets/shipsidekick_token_shahzadclothing.txt"
-    - name: "Onyx Apparel"
-      match: ["onyxapparel", "onyx"]
-      token_path: "config/.secrets/shipsidekick_token_onyxapparel.txt"
     - name: "All In Lid"
       match: ["allinlid"]
       token_path: "config/.secrets/shipsidekick_token_allinlid.txt"
-    - name: "Boot Up Customs"
-      match: ["bootupcustoms", "bootup"]
-      token_path: "config/.secrets/shipsidekick_token_bootupcustoms.txt"
     - name: "Torner Labs"
       match: ["tornerlabs", "torner"]
       token_path: "config/.secrets/shipsidekick_token_tornerlabs.txt"
