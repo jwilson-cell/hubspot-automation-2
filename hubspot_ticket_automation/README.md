@@ -28,13 +28,15 @@ MAILTO=lconner@gopackn.com
 PATH=/usr/local/bin:/opt/packn/hubspot_ticket_automation/.venv/bin:/usr/local/sbin:/usr/sbin:/usr/bin:/bin
 ANTHROPIC_API_KEY=...
 
-# Ticket processing — every 30 minutes
-*/30 * * * *  cd /opt/packn/hubspot_ticket_automation && claude -p /packn-tickets --dangerously-skip-permissions >> outputs/runs/cron-tickets.log 2>&1
+# Ticket processing — every 30 minutes, via the wrapper (pre-gate + shadow
+# pipeline + pinned-model agent + deterministic forwarders)
+*/30 * * * *  cd /opt/packn/hubspot_ticket_automation && bash scripts/run_tickets.sh >> outputs/runs/cron-tickets.log 2>&1
 
 # Digest — 8am / 12pm / 3pm ET weekdays (UTC during EDT: 12:00, 16:00, 19:00)
-0 12 * * 1-5  cd /opt/packn/hubspot_ticket_automation && claude -p /packn-digest --dangerously-skip-permissions >> outputs/runs/cron-digest.log 2>&1
-0 16 * * 1-5  cd /opt/packn/hubspot_ticket_automation && claude -p /packn-digest --dangerously-skip-permissions >> outputs/runs/cron-digest.log 2>&1
-0 19 * * 1-5  cd /opt/packn/hubspot_ticket_automation && claude -p /packn-digest --dangerously-skip-permissions >> outputs/runs/cron-digest.log 2>&1
+# --model pinned so the CLI default can't silently be Opus-tier pricing
+0 12 * * 1-5  cd /opt/packn/hubspot_ticket_automation && claude -p /packn-digest --model claude-sonnet-5 --dangerously-skip-permissions >> outputs/runs/cron-digest.log 2>&1
+0 16 * * 1-5  cd /opt/packn/hubspot_ticket_automation && claude -p /packn-digest --model claude-sonnet-5 --dangerously-skip-permissions >> outputs/runs/cron-digest.log 2>&1
+0 19 * * 1-5  cd /opt/packn/hubspot_ticket_automation && claude -p /packn-digest --model claude-sonnet-5 --dangerously-skip-permissions >> outputs/runs/cron-digest.log 2>&1
 ```
 
 DST: these UTC hours are correct for EDT (UTC−4). When EST resumes on Sunday, Nov 1 2026, shift the digest hours by +1 → `13`, `17`, `20`. The ticket cron stays as-is. A scheduled email reminder is queued for Nov 1 morning.

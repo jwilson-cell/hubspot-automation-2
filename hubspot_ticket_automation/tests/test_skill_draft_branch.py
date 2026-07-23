@@ -39,7 +39,7 @@ def expected_write_draft_kwargs():
         "ticket_id": "TICKET-DRAFT-1",
         "routine_name": "tickets-process",
         "draft_body": "<drafted reply text>",
-        "model": "claude-sonnet-4-5",
+        "model": "claude-sonnet-5",
         "prompt_version": "v3.3.0",
         "hubspot_ticket_snapshot": {
             "subject": "Where is my package?",

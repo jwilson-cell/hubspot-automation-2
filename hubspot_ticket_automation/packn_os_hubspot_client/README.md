@@ -117,7 +117,7 @@ Four insertion points (Wave 4 plan codifies the full diff):
 3. **Replace auto-send with `write_draft` (D-05).**
 
    ```text
-   bash: python3 -c "from packn_os_hubspot_client import client; print(client.write_draft(ticket_id='<id>', routine_name='tickets-process', draft_body='<body>', model='claude-sonnet-4-5', prompt_version='v3.2.1', hubspot_ticket_snapshot=<json>))"
+   bash: python3 -c "from packn_os_hubspot_client import client; print(client.write_draft(ticket_id='<id>', routine_name='tickets-process', draft_body='<body>', model='claude-sonnet-5', prompt_version='v3.3.0', hubspot_ticket_snapshot=<json>))"
    ```
 
 4. **Tick finish — write the run record (D-03).**

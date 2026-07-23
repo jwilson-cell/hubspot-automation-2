@@ -276,13 +276,18 @@ MAILTO=lconner@gopackn.com
 PATH=/usr/local/bin:/opt/packn/hubspot_ticket_automation/.venv/bin:/usr/local/sbin:/usr/sbin:/usr/bin:/bin
 ANTHROPIC_API_KEY=sk-ant-...
 
-# Ticket processing — every 30 minutes
-*/30 * * * *  cd /opt/packn/hubspot_ticket_automation && claude -p /packn-tickets --dangerously-skip-permissions >> outputs/runs/cron-tickets.log 2>&1
+# Ticket processing — every 30 minutes, via the wrapper (pre-gate + shadow
+# pipeline + pinned-model agent + deterministic forwarders). Never call
+# `claude -p /packn-tickets` directly from cron — the wrapper pins the model
+# and guarantees action-item delivery.
+*/30 * * * *  cd /opt/packn/hubspot_ticket_automation && bash scripts/run_tickets.sh >> outputs/runs/cron-tickets.log 2>&1
 
 # Digest — 8am / 12pm / 3pm ET weekdays (UTC during EDT: 12:00, 16:00, 19:00)
-0 12 * * 1-5  cd /opt/packn/hubspot_ticket_automation && claude -p /packn-digest --dangerously-skip-permissions >> outputs/runs/cron-digest.log 2>&1
-0 16 * * 1-5  cd /opt/packn/hubspot_ticket_automation && claude -p /packn-digest --dangerously-skip-permissions >> outputs/runs/cron-digest.log 2>&1
-0 19 * * 1-5  cd /opt/packn/hubspot_ticket_automation && claude -p /packn-digest --dangerously-skip-permissions >> outputs/runs/cron-digest.log 2>&1
+# --model pin added 2026-07-23: an unpinned invocation runs the CLI default,
+# which can silently be Opus-tier pricing.
+0 12 * * 1-5  cd /opt/packn/hubspot_ticket_automation && claude -p /packn-digest --model claude-sonnet-5 --dangerously-skip-permissions >> outputs/runs/cron-digest.log 2>&1
+0 16 * * 1-5  cd /opt/packn/hubspot_ticket_automation && claude -p /packn-digest --model claude-sonnet-5 --dangerously-skip-permissions >> outputs/runs/cron-digest.log 2>&1
+0 19 * * 1-5  cd /opt/packn/hubspot_ticket_automation && claude -p /packn-digest --model claude-sonnet-5 --dangerously-skip-permissions >> outputs/runs/cron-digest.log 2>&1
 
 # Phase 3 (2026-05-19): manual-run poll. Picks up automation_run_requests
 # rows inserted by the Pack'N OS "Run now" button. Cheap when the queue is
@@ -334,8 +339,8 @@ Manual:
 
 ```bash
 cd /opt/packn/hubspot_ticket_automation
-claude -p /packn-tickets --dangerously-skip-permissions 2>&1 | tee /tmp/smoke-tickets.log
-claude -p /packn-digest  --dangerously-skip-permissions 2>&1 | tee /tmp/smoke-digest.log
+bash scripts/run_tickets.sh 2>&1 | tee /tmp/smoke-tickets.log
+claude -p /packn-digest --model claude-sonnet-5 --dangerously-skip-permissions 2>&1 | tee /tmp/smoke-digest.log
 ```
 
 Expected outcomes:

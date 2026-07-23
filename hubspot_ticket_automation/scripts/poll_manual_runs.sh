@@ -62,10 +62,15 @@ echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] manual-run poll: claimed request $REQUEST
 
 case "$ROUTINE" in
     tickets-process)
-        exec claude -p /packn-tickets --model claude-sonnet-4-6 --dangerously-skip-permissions
+        # Pin MUST match scripts/run_tickets.sh — a manual run and a cron run
+        # must draft with the same model (this was sonnet-4-6 vs the cron's
+        # sonnet-4-5 until the 2026-07-23 audit unified everything on sonnet-5).
+        exec claude -p /packn-tickets --model claude-sonnet-5 --dangerously-skip-permissions
         ;;
     digest)
-        exec claude -p /packn-digest --dangerously-skip-permissions
+        # Pinned 2026-07-23 — an unpinned invocation runs the CLI default,
+        # which can silently be Opus-tier pricing.
+        exec claude -p /packn-digest --model claude-sonnet-5 --dangerously-skip-permissions
         ;;
     *)
         echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] manual-run poll: ERROR unknown routine '$ROUTINE' — request $REQUEST_ID was claimed but no dispatch path; row stays processed=true so it won't re-fire" >&2

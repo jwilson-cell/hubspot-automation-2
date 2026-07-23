@@ -44,10 +44,13 @@ else
 
   # 1) Agentic ticket pass: classify / draft / queue each ticket's action_items
   #    to config/pending_actions.json (SKILL step 2g). Permissions are skipped so
-  #    the headless run never blocks on a prompt. Model is PINNED to the Sonnet
-  #    the pipeline was validated on (and which write_draft stamps on drafts) —
-  #    never let the CLI default silently upgrade us to Opus-tier pricing.
-  claude -p /packn-tickets --model claude-sonnet-4-5 --dangerously-skip-permissions
+  #    the headless run never blocks on a prompt. Model is PINNED (and must match
+  #    the write_draft stamp in SKILL.md, the pin in poll_manual_runs.sh, and
+  #    DRAFT_MODEL in ticket_pipeline/llm.py) — never let the CLI default
+  #    silently upgrade us to Opus-tier pricing.
+  #    2026-07-23: claude-sonnet-4-5 -> claude-sonnet-5 (Claude 5 refresh;
+  #    introductory $2/$10 per MTok through 2026-08-31, then $3/$15).
+  claude -p /packn-tickets --model claude-sonnet-5 --dangerously-skip-permissions
 fi
 
 # 2) Deterministic forward: drain the queue the skill just wrote and POST each

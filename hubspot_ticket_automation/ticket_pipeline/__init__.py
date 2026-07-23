@@ -5,7 +5,7 @@ Replaces the agentic `claude -p /packn-tickets` loop with deterministic
 hydration + three plain Anthropic API calls per ticket:
 
     classify  -> claude-haiku-4-5   (prompts/classify.md, form-topic prior)
-    draft     -> claude-sonnet-4-5  (prompts/draft_reply.md + kb/ context)
+    draft     -> claude-sonnet-5    (prompts/draft_reply.md + kb/ context)
     extract   -> claude-haiku-4-5   (prompts/extract_actions.md)
 
 The prompts are the SAME files the agent reads — this package only changes

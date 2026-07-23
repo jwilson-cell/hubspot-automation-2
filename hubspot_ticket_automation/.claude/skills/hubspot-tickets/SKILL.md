@@ -558,7 +558,7 @@ Also compose an **auto-send subject** (used in both paths so the queued record h
        ticket_id='<ticket_id>',
        routine_name='tickets-process',
        draft_body='<drafted reply from step 2d, plain text>',
-       model='claude-sonnet-4-5',
+       model='claude-sonnet-5',
        prompt_version='v3.3.0',
        hubspot_ticket_snapshot=<the JSON dict from step 1, dumped via json.dumps()>,
    )
@@ -616,7 +616,7 @@ operator's surface in Pack'N OS.
       ticket_id='<ticket_id>',
       routine_name='tickets-process',
       draft_body='<drafted reply from step 2d, plain text>',
-      model='claude-sonnet-4-5',
+      model='claude-sonnet-5',
       prompt_version='v3.3.0',
       hubspot_ticket_snapshot=<the JSON dict from the auto-send branch step 1, dumped via json.dumps()>,
   )
