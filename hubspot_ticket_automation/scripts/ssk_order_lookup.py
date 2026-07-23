@@ -8,7 +8,7 @@ state (status, est delivery, tracking URL) instead of hedged boilerplate.
 Usage:
     echo '{"order_number": "TEST321", "merchant": "WKR"}' | py scripts/ssk_order_lookup.py
     echo '{"tracking_number": "1Z02D293YW21069996"}' | py scripts/ssk_order_lookup.py
-    echo '{"order_number": "22288", "merchant": "Bruised", "merchant_hints": ["bruisedbrand.com"]}' | py scripts/ssk_order_lookup.py
+    echo '{"order_number": "22288", "merchant": "Bruised"}' | py scripts/ssk_order_lookup.py
 
 Resolution order: order_number first (it's the more reliable anchor), then
 tracking_number as fallback / enrichment.
@@ -19,15 +19,12 @@ vs WKR #22288 are different orders). SSK API keys are org-scoped, so a
 GET /orders?search= under the right merchant's key CANNOT return another
 store's order. The payload therefore carries the ticket's merchant:
 
-    merchant        — the brand/company name resolved from the ticket
-                      (company_name / form fields / pipeline context).
-                      A STRONG signal: when set, the lookup runs under that
-                      merchant's key or refuses (exit 3). It NEVER falls
-                      back to the default/first key.
-    merchant_hints  — optional list of WEAK signals (e.g. the contact's
-                      email domain). Only used when `merchant` is empty,
-                      and only when a hint matches a configured merchant;
-                      non-matching hints are ignored.
+    merchant — the brand/company name from the ticket's REQUIRED
+               `company_name` property (customers state their brand on
+               every form; falls back to the associated CRM company).
+               When set, the lookup runs under that merchant's key or
+               refuses (exit 3). It NEVER falls back to the default/
+               first key.
 
 Keys are configured under `shipsidekick.merchants` in settings.yaml. Only
 when NO merchant signal resolves does the helper use the legacy default
@@ -114,19 +111,17 @@ def _match_merchant(needle: str, merchants: list[dict]) -> dict | None:
 
 def _resolve_token_scope(
     merchant: str,
-    merchant_hints: list[str],
     merchants: list[dict],
     default_token_path: Path,
 ) -> tuple[Path, str]:
     """Pick the org-scoped token for the ticket's merchant.
 
-    - `merchant` set (STRONG signal): must match a configured merchant, else
-      exit 3 — NEVER fall back to the default/first key when the ticket's
-      merchant is known; an org-mismatched key returns another store's order
-      for a colliding order number and that leaks into customer drafts.
-    - `merchant` empty: try hints (weak signals); a hint only counts if it
-      matches a configured merchant, otherwise it's ignored.
-    - Nothing matched: legacy default token (unattributable tickets only).
+    - `merchant` set: must match a configured merchant, else exit 3 —
+      NEVER fall back to the default/first key when the ticket's merchant
+      is known; an org-mismatched key returns another store's order for a
+      colliding order number and that leaks into customer drafts.
+    - `merchant` empty: legacy default token (unattributable tickets only —
+      company_name is a required form field, so this should be rare).
     """
     if merchant.strip():
         hit = _match_merchant(merchant, merchants)
@@ -140,10 +135,6 @@ def _resolve_token_scope(
             )
             sys.exit(3)
         return ROOT / hit["token_path"], hit.get("name") or merchant
-    for hint in merchant_hints:
-        hit = _match_merchant(hint, merchants)
-        if hit is not None:
-            return ROOT / hit["token_path"], hit.get("name") or hint
     return default_token_path, "default"
 
 
@@ -319,14 +310,9 @@ def main() -> int:
         print("payload must include order_number, tracking_number, or both", file=sys.stderr)
         return 2
     merchant = (payload.get("merchant") or "").strip()
-    merchant_hints = [
-        str(h).strip() for h in (payload.get("merchant_hints") or []) if str(h).strip()
-    ]
 
     base_url, default_token_path, merchants = _load_config()
-    token_path, merchant_scope = _resolve_token_scope(
-        merchant, merchant_hints, merchants, default_token_path
-    )
+    token_path, merchant_scope = _resolve_token_scope(merchant, merchants, default_token_path)
     if not token_path.exists():
         print(
             f"SSK token missing at {token_path} (scope: {merchant_scope}) — "

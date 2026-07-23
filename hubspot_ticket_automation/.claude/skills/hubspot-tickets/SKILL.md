@@ -382,18 +382,16 @@ If `settings.shipsidekick.enabled` is true AND the ticket is likely to benefit f
 
 Simplest implementation: trigger whenever the ticket has an `order_number` OR `tracking_number` on a form ticket. The cost is one GET per matching ticket (<200ms typical) and the payoff is a specific, credible reply.
 
-**Resolve the ticket's merchant first (2026-07-22 — cross-merchant order-number collision guard).** Order numbers collide across the stores' ShipSidekick orgs (Bruised #22288 and WKR #22288 are different orders); SSK keys are org-scoped, so the lookup MUST run under the ticket merchant's key. Resolve `merchant` with the same priority rules as the 2h `company_name` field (brand, never gopackn):
+**Resolve the ticket's merchant first (2026-07-22 — cross-merchant order-number collision guard).** Order numbers collide across the stores' ShipSidekick orgs (Bruised #22288 and WKR #22288 are different orders); SSK keys are org-scoped, so the lookup MUST run under the ticket merchant's key. Resolve `merchant` in this priority order (brand, never gopackn — a value containing `gopackn` is Pack'N itself, skip it):
 
-1. `ticket_context.company.name` when present AND neither the name nor domain contains `gopackn`.
-2. Else the company/brand field parsed from the form blockquote (`form_fields.company_name` or equivalent).
-3. Else empty string — do NOT guess between brands.
-
-Also pass `merchant_hints`: a list containing the contact's email domain when available (e.g. `["wkr.gg"]`). Hints are weak signals — the helper only uses one if it matches a configured merchant.
+1. **The `company_name` ticket property** (`ticket_context.form_fields.company_name`) — this form field is REQUIRED, so the customer states their brand on every submission. This is the authoritative account signal (2026-07-23).
+2. Else `ticket_context.company.name` from the associated CRM company, when neither the name nor domain contains `gopackn`.
+3. Else empty string — do NOT guess between brands, do NOT infer from email domains.
 
 **Call**:
 
 ```
-echo '{"order_number": "<form_fields.order_number>", "tracking_number": "<form_fields.tracking_number>", "merchant": "<resolved merchant or empty>", "merchant_hints": ["<contact email domain if any>"]}' | py scripts/ssk_order_lookup.py
+echo '{"order_number": "<form_fields.order_number>", "tracking_number": "<form_fields.tracking_number>", "merchant": "<resolved merchant or empty>"}' | py scripts/ssk_order_lookup.py
 ```
 
 Pass whichever identifiers are present; the helper prefers `order_number` and falls back to `tracking_number`. The helper picks the merchant's org-scoped key from `settings.shipsidekick.merchants`; it NEVER falls back to the default key when the merchant is known (exit 3 instead), and it only returns exact name/alias/tracking matches — a fuzzy search hit from the wrong store can no longer land in a draft.
@@ -818,11 +816,11 @@ If `settings.sheets_export.enabled` is true AND the classifier's category matche
 
 WHY the SSK fallback is mandatory, not optional polish: the Mispack form asks for an ORDER number, not a tracking number, so the form field is empty on most mispack tickets. Downstream, the Pack'N OS complaint mirror (`write_complaints.py` → `customer_complaints`) attributes a complaint to a shipment — and to its TRUE ship day on the /sla daily accuracy trend — ONLY via this tracking number. Rows mirrored without one degrade to brand-fallback or fall out of the metric entirely. Regression on record: 2026-07-07→07-21, 14 of 15 mispack rows landed with an empty `tracking_number` and /sla charted a flat 100% accuracy while mispacks were arriving daily.
 
-**`company_name`** (BOTH rollups — 2026-07-22): this field is the BRAND the complaint is about (it becomes `customer_complaints.brand` in Pack'N OS and drives per-merchant accuracy attribution). Resolve in priority order —
+**`company_name`** (BOTH rollups — 2026-07-22, updated 2026-07-23): this field is the BRAND the complaint is about (it becomes `customer_complaints.brand` in Pack'N OS and drives per-merchant accuracy attribution). Resolve in priority order —
 
-1. `ticket_context.company.name` when present AND it is not Pack'N itself. SKIP it when the company name or domain contains `gopackn` — CX agents (e.g. marycx@gopackn.com) associate to Pack'N's own CRM company, and `gopackn.com` is never a brand; emitting it poisons brand attribution downstream.
-2. Else the company/brand field parsed from the form blockquote (`form_fields.company_name` or equivalent) when non-empty.
-3. Else infer from unambiguous ticket context (e.g. the customer's email domain clearly belongs to a known brand, like `va@wkr.gg` → WKR); when not certain, emit empty string. Never guess between two brands, never emit a `gopackn` value.
+1. **The `company_name` ticket property** (`ticket_context.form_fields.company_name`) — this form field is REQUIRED, so the customer states their brand on every submission; it is the authoritative account signal. SKIP it only if it contains `gopackn` (never a brand).
+2. Else `ticket_context.company.name` when present AND it is not Pack'N itself. SKIP it when the company name or domain contains `gopackn` — CX agents (e.g. marycx@gopackn.com) associate to Pack'N's own CRM company, and `gopackn.com` is never a brand; emitting it poisons brand attribution downstream.
+3. Else emit empty string. Never guess between two brands, never infer from email domains, never emit a `gopackn` value.
 
 **Pipeline-cutover parity note**: `ticket_pipeline/` (shadow mode) emits no rollup rows today. When cutover adds them, the two resolution rules above MUST be ported into the deterministic composer — they are metric-load-bearing, not drafting sugar.
 

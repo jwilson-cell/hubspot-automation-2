@@ -104,32 +104,23 @@ def latest_customer_message(thread: list[dict]) -> str:
 
 
 def resolve_merchant(company: dict, form_fields: dict) -> str:
-    """Resolve the BRAND/merchant the ticket belongs to, mirroring SKILL 2h's
-    company_name rules (brand, never gopackn). Returns "" when unknown —
-    callers must NOT guess between brands. Used to org-scope the SSK lookup
-    (cross-merchant order-number collision guard, 2026-07-22)."""
-    name = ((company or {}).get("name") or "").strip()
-    domain = ((company or {}).get("domain") or "").strip()
-    if name and "gopackn" not in name.lower() and "gopackn" not in domain.lower():
-        return name
+    """Resolve the BRAND/merchant the ticket belongs to. The REQUIRED
+    `company_name` ticket property (customers state their brand on every
+    form; native properties are merged into form_fields on top of the
+    blockquote parse) is the authoritative signal — 2026-07-23. Falls back
+    to the associated CRM company. Returns "" when unknown — callers must
+    NOT guess between brands. Used to org-scope the SSK lookup
+    (cross-merchant order-number collision guard). gopackn is Pack'N
+    itself, never a brand."""
     for key in ("company_name", "company", "brand"):
         v = ((form_fields or {}).get(key) or "").strip()
         if v and "gopackn" not in v.lower():
             return v
+    name = ((company or {}).get("name") or "").strip()
+    domain = ((company or {}).get("domain") or "").strip()
+    if name and "gopackn" not in name.lower() and "gopackn" not in domain.lower():
+        return name
     return ""
-
-
-def merchant_hints(contact: dict) -> list[str]:
-    """Weak merchant signals for the SSK helper: currently the contact's email
-    domain (e.g. va@wkr.gg -> wkr.gg). The helper only uses a hint when it
-    matches a configured merchant; gopackn/CX domains are never hints."""
-    email = ((contact or {}).get("email") or "").strip()
-    if "@" not in email:
-        return []
-    dom = email.rsplit("@", 1)[-1].lower()
-    if not dom or "gopackn" in dom:
-        return []
-    return [dom]
 
 
 _ATTACH_HINT_RE = re.compile(
@@ -153,7 +144,6 @@ def _ssk_lookup(
     order_number: Optional[str],
     tracking_number: Optional[str],
     merchant: str = "",
-    hints: Optional[list[str]] = None,
 ) -> Optional[dict]:
     """scripts/ssk_order_lookup.py subprocess — same helper, same contract as
     the agent's step 2a.5. Returns the parsed ssk_state dict, or None when
@@ -168,7 +158,6 @@ def _ssk_lookup(
             "order_number": order_number or "",
             "tracking_number": tracking_number or "",
             "merchant": merchant or "",
-            "merchant_hints": hints or [],
         }
     )
     python = str(VENV_PY) if VENV_PY.exists() else sys.executable
@@ -346,7 +335,6 @@ def hydrate_ticket(ticket: dict, settings: dict, token: str) -> dict:
                 form_fields.get("order_number"),
                 form_fields.get("tracking_number"),
                 merchant=resolve_merchant(company, form_fields),
-                hints=merchant_hints(contact),
             )
             if ssk is not None:
                 ctx["ssk_state"] = ssk

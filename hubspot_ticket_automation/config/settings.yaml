@@ -28,6 +28,7 @@ require_last_message_from_visitor: true
 # Reviewers must open the HubSpot ticket directly to view attachments.
 ticket_custom_properties:
   - topic_of_ticket          # form dropdown: classifier prior
+  - company_name             # REQUIRED form field: the merchant/brand — authoritative signal for org-scoped SSK lookup + brand attribution
   - order_number
   - tracking_number
   - inquiry_description      # free-text form field (may be empty)
@@ -112,9 +113,10 @@ shipsidekick:
   # #22288 ≠ WKR #22288); SSK keys are org-scoped, so querying under the ticket
   # merchant's key makes it impossible to pull another store's order.
   # `match` entries are case-insensitive substrings tested against the ticket's
-  # company name / brand / email domain. Token files live on the droplet under
-  # config/.secrets/ (gitignored) — generate one key per merchant org in the
-  # ShipSidekick dashboard.
+  # REQUIRED company_name property (the customer states their brand on every
+  # form — this is the authoritative account signal; email-domain inference was
+  # dropped 2026-07-23). Token files live on the droplet under config/.secrets/
+  # (gitignored) — one org-scoped key per merchant from the SSK dashboard.
   merchants:
     - name: "WKR"
       match: ["wkr", "wkr.gg"]
