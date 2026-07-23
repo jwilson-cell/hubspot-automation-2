@@ -112,14 +112,19 @@ shipsidekick:
   # collision fix). Order numbers collide across the stores' SSK orgs (Bruised
   # #22288 ≠ WKR #22288); SSK keys are org-scoped, so querying under the ticket
   # merchant's key makes it impossible to pull another store's order.
-  # `match` entries are case-insensitive substrings tested against the ticket's
-  # REQUIRED company_name property (the customer states their brand on every
-  # form — this is the authoritative account signal; email-domain inference was
-  # dropped 2026-07-23). Token files live on the droplet under config/.secrets/
-  # (gitignored) — one org-scoped key per merchant from the SSK dashboard.
+  # `match` entries are the client slug MINUS hyphens ("bruised-brand" ->
+  # "bruisedbrand"), tested leniently against the ticket's REQUIRED
+  # company_name property (the customer states their brand on every form —
+  # authoritative account signal; email-domain inference dropped 2026-07-23).
+  # Matching normalizes both sides to alphanumeric-only lowercase and accepts
+  # a substring hit either way, so "Bruised Brand LLC" and partial/typo-lite
+  # variants still resolve; a value matching MORE THAN ONE client refuses
+  # (exit 3) rather than guess. Token files live under config/.secrets/
+  # (gitignored): one file per client, named shipsidekick_token_<slug>.txt,
+  # containing ONLY the raw org-scoped API key on a single line.
   merchants:
     - name: "WKR"
-      match: ["wkr", "wkr.gg"]
+      match: ["wkr"]
       token_path: "config/.secrets/shipsidekick_token_wkr.txt"
     - name: "Bruised"
       match: ["bruised"]

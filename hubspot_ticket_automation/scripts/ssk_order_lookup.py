@@ -68,6 +68,7 @@ Exit codes:
 from __future__ import annotations
 
 import json
+import re
 import sys
 import urllib.error
 import urllib.parse
@@ -93,19 +94,47 @@ def _load_config() -> tuple[str, Path, list[dict]]:
     return base, token_path, merchants
 
 
+_NORM_RE = re.compile(r"[^a-z0-9]+")
+
+
+def _norm(s: str) -> str:
+    """Lowercase and strip everything non-alphanumeric: 'Bruised Brand LLC'
+    -> 'bruisedbrandllc', 'bruised-brand' -> 'bruisedbrand'."""
+    return _NORM_RE.sub("", (s or "").lower())
+
+
 def _match_merchant(needle: str, merchants: list[dict]) -> dict | None:
-    """Case-insensitive match of a merchant signal against configured
-    merchants. A merchant matches when its name or any `match` alias appears
-    in the needle (or equals it) — 'WKR' matches 'WKR', 'wkr.gg', 'WKR LLC'."""
-    n = (needle or "").strip().lower()
-    if not n:
+    """Lenient match of the typed Company Name against configured merchants.
+
+    The Company Name form field is free text — spacing, punctuation, casing,
+    and suffixes vary ('Bruised Brand', 'bruised-brand LLC', 'BruisedBrand').
+    Configured `match` values are the client slug minus hyphens
+    ('bruised-brand' -> 'bruisedbrand'). Both sides are normalized to
+    alphanumeric-only lowercase and a substring hit EITHER way counts, so a
+    partially-typed name still resolves.
+
+    Safety rails: needles shorter than 3 normalized chars never match, and
+    an AMBIGUOUS needle (matches >1 configured merchant) returns None —
+    the caller then refuses (exit 3) rather than guess between brands.
+    """
+    n = _norm(needle)
+    if len(n) < 3:
         return None
+    hits = []
     for m in merchants:
-        candidates = [m.get("name") or ""] + list(m.get("match") or [])
-        for c in candidates:
-            c = c.strip().lower()
-            if c and (c == n or c in n):
-                return m
+        for c in [m.get("name") or ""] + list(m.get("match") or []):
+            c = _norm(c)
+            if c and (c in n or n in c):
+                hits.append(m)
+                break
+    if len(hits) == 1:
+        return hits[0]
+    if len(hits) > 1:
+        print(
+            f"merchant signal {needle!r} ambiguously matches "
+            f"{[h.get('name') for h in hits]} — refusing to guess",
+            file=sys.stderr,
+        )
     return None
 
 
