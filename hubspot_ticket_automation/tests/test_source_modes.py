@@ -1444,3 +1444,389 @@ def test_the_skill_never_works_out_the_mode_another_way() -> None:
     assert "read_ticket_source_mode" not in text
     assert "app_settings" not in text
     assert "ticket_source_mode" not in text
+
+
+# ======================================================================================
+# THE `os`-MODE SKILL AND ITS COMMAND (Phase 93, plan 16)
+#
+# In `os` mode the agent is handed a finished bundle and writes a result file. Its
+# skill is a second prose reader of the one setting: it serves `os` only and its
+# first step is the same code guard, called with `--require os`. The rest of these
+# cases pin the skill's TEXT: what it reads and writes, the key it names a ticket
+# by, the four model-facing sections it shares word for word with the other skill,
+# and what it must not contain (no HubSpot tool, host, token file or read step).
+#
+# The forbidden strings are assembled from halves so this file does not hold them.
+# ======================================================================================
+
+import re  # noqa: E402
+
+from ticket_pipeline import os_pass  # noqa: E402
+
+OS_SKILL_SERVES = ("os",)
+OS_SKILL_PATH = PACKAGE_ROOT / ".claude" / "skills" / "hubspot-tickets-os" / "SKILL.md"
+OS_COMMAND_PATH = PACKAGE_ROOT / ".claude" / "commands" / "packn-tickets-os.md"
+OS_GUARD_COMMAND = "py -m ticket_pipeline.source --require os"
+ATTACHMENT_HEADING = "## CRITICAL: Attachment and image handling"
+SHARED_SECTIONS = (
+    "#### 2b. Classify",
+    "#### 2c. Retrieve KB context",
+    "#### 2d. Draft reply",
+    "#### 2e. Extract action items",
+)
+OS_STEP_ORDER = (
+    "## Source mode (Phase 93) — run this guard FIRST",
+    "## What you do NOT do in this mode",
+    "## The ticket key",
+    "### 1. Read the bundle",
+    "### 2. For each ticket in the bundle",
+    "#### 2b. Classify",
+    "#### 2c. Retrieve KB context",
+    "#### 2d. Draft reply",
+    "#### 2e. Extract action items",
+    "#### 2g. Urgent evaluation + queue for digest",
+    "#### 2h. Emit structured row for Sheets export",
+    "### 3.5. Sync to Google Sheets",
+    "### 4. Write run log",
+    "### 4.5. Write the result file",
+)
+
+
+def _md(path: Path) -> str:
+    return path.read_text(encoding="utf-8").replace("\r\n", "\n")
+
+
+def _os_skill() -> str:
+    return _md(OS_SKILL_PATH)
+
+
+def _os_command() -> str:
+    return _md(OS_COMMAND_PATH)
+
+
+def _section(text: str, heading: str) -> str:
+    """From `heading`'s own line to the next heading of the same or a higher
+    level. An empty string when the heading is not in the text."""
+    lines = text.split("\n")
+    if heading not in lines:
+        return ""
+    start = lines.index(heading)
+    depth = len(heading) - len(heading.lstrip("#"))
+    for end in range(start + 1, len(lines)):
+        marks = re.match(r"^(#{1,6}) ", lines[end])
+        if marks and len(marks.group(1)) <= depth:
+            return "\n".join(lines[start:end])
+    return "\n".join(lines[start:])
+
+
+def _without(text: str, section: str) -> str:
+    return text.replace(section, "") if section else text
+
+
+# --- the guard, for a skill that serves `os`
+
+
+@pytest.mark.parametrize(
+    "env, expected",
+    [
+        pytest.param({"PACKN_SOURCE_MODE": "os", "PACKN_RUN_ID": "r"}, (0, "os"), id="os"),
+        pytest.param(
+            {"PACKN_SOURCE_MODE": "hubspot", "PACKN_RUN_ID": "r"},
+            (3, "SOURCE_MODE_NOT_SERVED hubspot"),
+            id="hubspot",
+        ),
+        pytest.param(
+            {"PACKN_SOURCE_MODE": "shadow", "PACKN_RUN_ID": "r"},
+            (3, "SOURCE_MODE_NOT_SERVED shadow"),
+            id="shadow",
+        ),
+        pytest.param(
+            {"PACKN_SOURCE_MODE": "OS", "PACKN_RUN_ID": "r"}, (4, "SOURCE_MODE_UNKNOWN"), id="unknown"
+        ),
+    ],
+)
+def test_the_os_skills_guard_under_the_wrapper(env, expected) -> None:
+    world = _GuardWorld(read_error=AssertionError("the setting must not be read"))
+    assert world.guard(env, served=OS_SKILL_SERVES) == expected
+    assert world.reads == 0 and world.records == []
+
+
+def test_the_os_skills_guard_on_a_hand_run_reads_the_one_setting() -> None:
+    served = _GuardWorld(True, {"mode": "os"})
+    assert served.guard({}, served=OS_SKILL_SERVES) == (0, "os")
+    assert served.reads == 1 and served.records == []
+
+    # the owner's switch says something else: the skill stops, with its own record
+    elsewhere = _GuardWorld(False)  # an absent row means hubspot
+    assert elsewhere.guard({}, served=OS_SKILL_SERVES) == (3, "SOURCE_MODE_NOT_SERVED hubspot")
+    (record,) = elsewhere.records
+    assert record["status"] == "skipped"
+    assert record["error_summary"] == "skill: source_mode_hubspot_not_served"
+    assert record["source_mode"] == "hubspot"
+
+    unreadable = _GuardWorld(read_error=RuntimeError("database is down"))
+    assert unreadable.guard({}, served=OS_SKILL_SERVES) == (4, "SOURCE_MODE_UNREADABLE")
+    (record,) = unreadable.records
+    assert (record["status"], record["failure_reason_code"]) == ("failure", "source_unreadable")
+
+
+def test_the_os_guard_command_line_serves_os_and_refuses_the_rest(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+) -> None:
+    argv = OS_GUARD_COMMAND.split()[3:]  # what follows `py -m ticket_pipeline.source`
+    assert argv == ["--require", "os"]
+    monkeypatch.setenv("PACKN_RUN_ID", "run-1")
+    monkeypatch.setenv("PACKN_SOURCE_MODE", "os")
+    assert source.main(argv) == 0
+    assert capsys.readouterr().out == "os\n"
+    monkeypatch.setenv("PACKN_SOURCE_MODE", "hubspot")
+    assert source.main(argv) == 3
+    assert capsys.readouterr().out == "SOURCE_MODE_NOT_SERVED hubspot\n"
+
+
+# --- the skill's first step
+
+
+def test_the_os_skill_serves_os_only_and_its_first_step_is_the_guard() -> None:
+    text = _os_skill()
+    block = _section(text, OS_STEP_ORDER[0])
+    assert OS_GUARD_COMMAND + '; echo "guard_exit=$?"' in block
+    assert text.count(OS_GUARD_COMMAND) == 1
+    assert "This skill serves `os` only" in block
+    assert "FIRST" in block
+    # the stop rule: a non-zero exit, or no bundle, and nothing else is done
+    assert "STOP at once" in block
+    assert "do nothing else" in block
+    for token in ("SOURCE_MODE_NOT_SERVED", "SOURCE_MODE_UNKNOWN", "SOURCE_MODE_UNREADABLE"):
+        assert token in block
+    assert "`PACKN_BUNDLE_PATH` is unset or empty" in block
+    # it is the first step: the first `##` section, and the first command in the file
+    second_level = [line for line in text.split("\n") if line.startswith("## ")]
+    assert second_level[:2] == [ATTACHMENT_HEADING, OS_STEP_ORDER[0]]
+    first_command = text.find("```bash")
+    assert first_command != -1
+    assert text[first_command:].startswith("```bash\n" + OS_GUARD_COMMAND)
+    # and it never asks for another mode
+    assert "--require hubspot" not in text and "--require shadow" not in text
+    assert "--require os," not in text
+
+
+def test_the_os_skill_never_works_out_the_mode_another_way() -> None:
+    text = _os_skill()
+    assert text  # the file is there
+    for name in ("read_ticket_source_mode", "app_settings", "ticket_source_mode"):
+        assert name not in text
+    assert "name: hubspot-tickets-os" in text.split("\n")[:4]
+
+
+def test_the_os_command_runs_the_os_skill_guard_first_and_names_the_two_paths() -> None:
+    text = _os_command()
+    assert "`hubspot-tickets-os` skill" in text
+    assert ".claude/skills/hubspot-tickets-os/SKILL.md" in text
+    assert OS_GUARD_COMMAND in text
+    assert text.index(OS_GUARD_COMMAND) < text.index("PACKN_BUNDLE_PATH")
+    assert "PACKN_BUNDLE_PATH" in text and "PACKN_RESULT_PATH" in text
+    assert os_pass.OS_AGENT_SKILL == "/" + OS_COMMAND_PATH.stem
+    assert "packn-tickets-os" == OS_COMMAND_PATH.stem
+
+
+# --- what it reads and what it writes
+
+
+def test_the_os_skills_steps_are_in_order_and_hold_no_step_code_now_owns() -> None:
+    text = _os_skill()
+    lines = text.split("\n")
+    positions = [lines.index(heading) if heading in lines else -1 for heading in OS_STEP_ORDER]
+    assert -1 not in positions, [h for h, p in zip(OS_STEP_ORDER, positions) if p == -1]
+    assert positions == sorted(positions)
+    headings = [line for line in lines if line.startswith("#")]
+    for gone in (
+        "Fetch candidate tickets",
+        "Early-exit dedupe",
+        "Hydrate",
+        "Backfill",
+        "Post the reply",
+        "Persist state",
+        "Discovery step",
+        "Routine gate",
+        "run-record",
+    ):
+        assert not [h for h in headings if gone.lower() in h.lower()], gone
+
+
+def test_the_os_skill_reads_the_bundle_os_pass_writes() -> None:
+    text = _os_skill()
+    step = _section(text, "### 1. Read the bundle")
+    assert os_pass.BUNDLE_PATH_ENV in step
+    for key in ("run_id", "mode", "generated_at", "tickets", *os_pass.ENTRY_KEYS):
+        assert f"`{key}`" in step, key
+    loop = _section(text, "### 2. For each ticket in the bundle")
+    assert "in bundle order" in loop
+    assert "`ticket_context`" in loop
+    assert "`ssk_state`" in loop  # ShipSidekick state, when the bundle carries it
+
+
+def test_the_os_skill_writes_the_result_os_pass_parses() -> None:
+    step = _section(_os_skill(), "### 4.5. Write the result file")
+    for name in ("PACKN_RESULT_PATH", "PACKN_RUN_ID"):
+        assert name in step
+    for key in (
+        "run_id",
+        "status",
+        "tickets_processed",
+        "drafts_created",
+        "error_summary",
+        "tickets",
+        "ref",
+        "outcome",
+        "failure_reason_code",
+        "classification",
+        "draft_body",
+        "action_items",
+    ):
+        assert f"'{key}'" in step, key
+    assert "one entry per bundle ticket" in step
+    assert f"`{os_pass.OUTCOME_COMPLETED}`" in step and f"`{os_pass.OUTCOME_FAILED}`" in step
+    # the failure codes it may write are exactly the runner's closed list
+    for code in os_pass.AGENT_TICKET_CODES:
+        assert f"`{code}`" in step
+    assert os_pass.AGENT_TICKET_CODES == ("agent_ticket_error", "other")
+    assert "any other reason is written as `other`" in step
+    assert "codes, counts and ticket ids only" in step
+
+
+def test_the_os_skill_names_the_ticket_key_in_all_three_places() -> None:
+    text = _os_skill()
+    rule = "the bundle entry's `ref`, copied character for character"
+    key = _section(text, "## The ticket key")
+    assert "For a ticket with no HubSpot id that is the OS ticket id" in key
+    for place in ("the result entry's `ref`", "the digest-queue record's `ticket_id`", "the Sheets row's `ticket_id`"):
+        assert place in key, place
+    assert rule in key
+    assert "the entry's `ticket_context.ticket_link`" in key
+    # and each of the three steps repeats it where the value is written
+    for heading in (
+        "#### 2g. Urgent evaluation + queue for digest",
+        "#### 2h. Emit structured row for Sheets export",
+        "### 4.5. Write the result file",
+    ):
+        assert rule in _section(text, heading), heading
+    queue = _section(text, "#### 2g. Urgent evaluation + queue for digest")
+    assert "the entry's `ticket_context.ticket_link`" in queue
+
+
+def test_the_os_skill_sends_the_urgent_email_only_for_a_ticket_with_a_hubspot_id() -> None:
+    queue = _section(_os_skill(), "#### 2g. Urgent evaluation + queue for digest")
+    assert "ONLY when the entry's `hubspot_ticket_id` is not null" in queue
+    assert "Ticket link: {ticket_link}" in queue
+    assert "config/pending_actions.json" in queue
+
+
+def test_the_os_skill_says_in_plain_words_what_the_agent_does_not_do() -> None:
+    block = _section(_os_skill(), "## What you do NOT do in this mode")
+    for statement in (
+        "No ticket search or lookup",
+        "No draft-row write",
+        "No state-file write",
+        "No run record",
+        "No action-item forwarding",
+        "No number backfill",
+    ):
+        assert statement in block, statement
+    assert "Code does all of these after you exit" in block
+
+
+# --- what it shares with the other skill, word for word
+
+
+@pytest.mark.parametrize("heading", SHARED_SECTIONS)
+def test_a_model_facing_section_is_textually_identical_in_both_skills(heading: str) -> None:
+    ours = _section(_os_skill(), heading)
+    theirs = _section(_md(SKILL_PATH), heading)
+    assert theirs, heading
+    assert ours != "", heading
+    assert ours == theirs
+
+
+def test_the_attachment_rule_is_present_unchanged() -> None:
+    ours = _section(_os_skill(), ATTACHMENT_HEADING)
+    theirs = _section(_md(SKILL_PATH), ATTACHMENT_HEADING)
+    assert theirs
+    assert ours == theirs
+
+
+# --- what it must not contain
+
+
+def _forbidden() -> list[str]:
+    """HubSpot access the `os` skill and command must not name. Lower case; the
+    files are searched lower-cased. Assembled from halves."""
+    return [
+        "mcp__" + "hubspot",
+        "claude_ai_" + "hubspot",
+        "hubapi" + ".com",
+        "app.hub" + "spot.com",
+        "hubspot_" + "token",
+        "config/.sec" + "rets",
+        "crm_" + "objects",
+        "/crm/" + "v",
+        "hubspot-" + "search",
+        "hubspot-" + "create",
+        "hubspot-" + "batch",
+        "hs_" + "pipeline",
+        "send_customer_" + "reply",
+    ]
+
+
+def _helper_calls() -> list[str]:
+    """The database helper's writers: code calls them after the agent exits."""
+    return ["write_" + "run_record", "write_" + "draft", "write_cron_" + "draft", "replace_pending_" + "draft"]
+
+
+@pytest.mark.parametrize("which", ["skill", "command"])
+def test_neither_os_file_names_a_hubspot_tool_host_token_file_or_helper_write(which: str) -> None:
+    text = _os_skill() if which == "skill" else _os_command()
+    assert len(text) > 400  # a real file, not a stub
+    lowered = text.lower()
+    assert [item for item in _forbidden() if item in lowered] == []
+    assert [item for item in _helper_calls() if item in text] == []
+
+
+_FETCHING_VERB = re.compile(
+    r"\b(search(es|ing)?|fetch(es|ing)?|quer(y|ies)|look(s|ing)? up|read(s|ing)?|pull(s|ing)?|"
+    r"hydrat(e|es|ing)|call(s|ing)?)\b",
+    re.IGNORECASE,
+)
+_NEGATION = re.compile(r"\b(no|not|never|nothing|without)\b", re.IGNORECASE)
+
+
+def _hubspot_instructions(text: str) -> list[str]:
+    """The lines that tell the reader to get something from HubSpot: a line that
+    names HubSpot and a fetching verb and is not itself a prohibition. The skill's
+    own name is not a mention of HubSpot."""
+    found = []
+    for line in text.split("\n"):
+        probe = line.replace("hubspot-tickets-os", "").replace("hubspot-tickets", "")
+        if "hubspot" not in probe.lower():
+            continue
+        if _FETCHING_VERB.search(probe) and not _NEGATION.search(probe):
+            found.append(line)
+    return found
+
+
+def test_the_instruction_check_finds_a_planted_instruction_and_passes_a_prohibition() -> None:
+    assert _hubspot_instructions("Search HubSpot for the ticket.") == ["Search HubSpot for the ticket."]
+    assert _hubspot_instructions("Then read the contact from HubSpot.") != []
+    assert _hubspot_instructions("Never search HubSpot.") == []
+    assert _hubspot_instructions("Run the `hubspot-tickets-os` skill and read the bundle.") == []
+    assert _hubspot_instructions("A ticket that has a HubSpot id.") == []
+
+
+@pytest.mark.parametrize("which", ["skill", "command"])
+def test_neither_os_file_instructs_a_hubspot_search_or_read(which: str) -> None:
+    """Outside the unchanged attachment rule (which is made of prohibitions), a line
+    that pairs HubSpot with a fetching verb must be a prohibition itself."""
+    text = _os_skill() if which == "skill" else _os_command()
+    assert len(text) > 400  # a real file, not a stub
+    body = _without(text, _section(text, ATTACHMENT_HEADING))
+    assert _hubspot_instructions(body) == []
