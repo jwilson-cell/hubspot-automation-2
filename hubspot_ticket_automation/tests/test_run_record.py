@@ -1436,6 +1436,16 @@ def test_load_runners_registers_hubspot_and_is_idempotent() -> None:
     assert set(rt.MODE_RUNNERS) == set(rt.RUNNER_SPECS)
 
 
+def test_load_runners_leaves_a_registered_mode_alone(monkeypatch: pytest.MonkeyPatch) -> None:
+    def already_there(ctx, deps):
+        return None
+
+    monkeypatch.setitem(rt.MODE_RUNNERS, "hubspot", already_there)
+    rt.load_runners()
+    rt.load_runners()
+    assert rt.MODE_RUNNERS["hubspot"] is already_there
+
+
 def test_run_and_the_entry_point_see_the_same_registry(
     world: World, monkeypatch: pytest.MonkeyPatch
 ) -> None:

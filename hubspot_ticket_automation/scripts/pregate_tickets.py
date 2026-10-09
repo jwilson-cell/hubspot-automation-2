@@ -50,8 +50,17 @@ HubSpot on any doubt", which is choosing a mode. A mode read that fails, or a
 stored value this code does not know, skips the agent and writes a 'failure'
 record naming the code. `os` mode skips with a 'skipped' record.
 
-EXIT CODES (consumed by scripts/run_tickets.sh)
------------------------------------------------
+ONE DECISION, TWO CALLERS (Phase 93, plan 15)
+---------------------------------------------
+The decision itself is `decide(mode, deps)`: it returns run_agent / no_work /
+paused with a reason and writes nothing. The scheduled tick and Run now reach
+it through scripts/run_tickets.py, the one entry point, which writes the run's
+single record whatever happens next. `main` below is the hand-run shell over
+the same function: it maps the decision to the exit codes this script always
+had and writes its own record on the exits that skip the agent.
+
+EXIT CODES (of a hand-run; the wrapper no longer runs this script)
+------------------------------------------------------------------
 0  = run the agentic pass (work exists, reruns pending, or pre-gate unsure)
 10 = skip — no new work (a status='success' 0-ticket run record was written)
 11 = skip — a gate failed closed: the routine is paused (status='skipped'
@@ -138,9 +147,11 @@ def _load_settings() -> dict:
         return yaml.safe_load(fh) or {}
 
 
-def _load_state() -> dict:
+def _load_state(path: Optional[Path] = None) -> dict:
+    """The state file as a dict; {} when it is missing or not JSON. `path` is
+    the file to read; None means the tracked config/state.json."""
     try:
-        return json.loads(STATE_PATH.read_text(encoding="utf-8") or "{}")
+        return json.loads((path or STATE_PATH).read_text(encoding="utf-8") or "{}")
     except (OSError, json.JSONDecodeError):
         return {}
 
@@ -283,19 +294,132 @@ def hubspot_candidates(
 
 
 DECISION_PAUSED = "paused"
-REASON_PAUSED = "routine_paused"
-REASON_RERUNS = "pending_reruns"
-REASON_SETTINGS_UNREADABLE = "settings_unreadable"
-REASON_NO_ACTIVE_STAGES = "active_stages_empty"
-REASON_TOKEN_MISSING = "token_missing"
+REASON_PAUSED = "routine_paused"  # paused: the routine gate said no (or could not be read)
+REASON_RERUNS = "pending_reruns"  # run_agent: operator reruns are always agent work
+REASON_SETTINGS_UNREADABLE = "settings_unreadable"  # run_agent (fail-open)
+REASON_NO_ACTIVE_STAGES = "active_stages_empty"  # run_agent (fail-open)
+REASON_TOKEN_MISSING = "token_missing"  # run_agent (fail-open)
+
+
+def _decision(decision: str, reason: str, reruns: Optional[list] = None) -> dict:
+    return {**_candidate_decision(decision, reason), "reruns": list(reruns or [])}
+
+
+def _state_for(deps: Any) -> dict:
+    loader = getattr(deps, "load_state", None)
+    if callable(loader):
+        return loader()
+    return _load_state(getattr(deps, "state_path", None))
 
 
 def decide(mode: str, deps: Any) -> dict:
-    """SKELETON (Phase 93, plan 15): the whole pre-gate decision, no record written."""
-    return None  # type: ignore[return-value]
+    """The whole pre-gate decision, in one place. It writes NO run record.
+
+    Returns hubspot_candidates' five keys plus `reruns`:
+
+        {"decision": "run_agent" | "no_work" | "paused",
+         "reason":   see the table,
+         "matched": [...], "candidates": [...], "page_full": bool,
+         "reruns":  the pending rerun rows, when they are why the agent runs}
+
+    In this order, which is the order `main` always had:
+
+        the routine gate says no (or cannot be read)     paused    / routine_paused
+        a rerun request is pending                       run_agent / pending_reruns
+        mode `os` (HubSpot is asked nothing)             no_work   / os_mode
+        settings unreadable, or a cap that is no number  run_agent / settings_unreadable   fail-open
+        active_stages empty                              run_agent / active_stages_empty   fail-open
+        no HubSpot token                                 run_agent / token_missing         fail-open
+        then hubspot_candidates: candidates, page_full and search_failed are
+        run_agent (the last two fail-open); a clean empty poll is no_work / none
+
+    `deps` is anything with these attributes (ticket_pipeline.run_types.Deps is
+    one; `main` below builds another):
+
+        read_routine_enabled(routine) -> bool
+        read_pending_rerun_requests(routine) -> list
+        load_settings() -> dict
+        read_hubspot_token() -> str | None
+        state_path                      the state file to read, or
+        load_state() -> dict            (optional) a loader used instead of the path
+        hubspot_transport               (optional) replaces the HubSpot request function
+
+    The two callers are the orchestrator (scripts/run_tickets.py), which turns the
+    decision into its one run record, and `main`, the hand-run shell. A mode
+    outside the three raises SourceModeError(source_unknown) before anything is
+    asked of anyone.
+    """
+    mode = source.validate_mode(mode)
+
+    # Fail-closed routine gate (False on a database error too, CONTEXT D-01).
+    if not deps.read_routine_enabled(ROUTINE):
+        _log("routine paused (or gate unreachable) — skipping agentic run")
+        return _decision(DECISION_PAUSED, REASON_PAUSED)
+
+    # Operator rerun requests are always agent work (D-09).
+    reruns = list(deps.read_pending_rerun_requests(ROUTINE) or [])
+    if reruns:
+        _log(f"{len(reruns)} pending rerun request(s) — launching agent")
+        return _decision(DECISION_RUN_AGENT, REASON_RERUNS, reruns)
+
+    if mode == source.MODE_OS:
+        # HubSpot is not the source: no settings doubt, no token, no search.
+        return _decision(DECISION_NO_WORK, REASON_OS_MODE)
+
+    try:
+        settings = deps.load_settings()
+        active_stages = [str(s) for s in settings.get("active_stages") or []]
+        int(settings.get("per_run_cap", 25))  # a cap that is not a number is a settings doubt
+    except Exception as e:
+        _log(f"settings unreadable — deferring to agent: {type(e).__name__}")
+        return _decision(DECISION_RUN_AGENT, REASON_SETTINGS_UNREADABLE)
+    if not active_stages:
+        _log("active_stages empty in settings.yaml — deferring to agent")
+        return _decision(DECISION_RUN_AGENT, REASON_NO_ACTIVE_STAGES)
+
+    token = deps.read_hubspot_token()
+    if token is None:
+        _log("hubspot token missing — deferring to agent")
+        return _decision(DECISION_RUN_AGENT, REASON_TOKEN_MISSING)
+
+    state = _state_for(deps)
+
+    # The search-and-dedupe decision lives once, in hubspot_candidates (which
+    # also holds the two fail-open branches of the search itself).
+    transport = getattr(deps, "hubspot_transport", None)
+    if transport is None:
+        outcome = hubspot_candidates(mode, settings, state, token)
+    else:
+        outcome = hubspot_candidates(mode, settings, state, token, transport=transport)
+    return {**outcome, "reruns": []}
+
+
+def _hand_run_deps() -> Any:
+    """decide's collaborators for a hand-run of this script: the real ones, each
+    looked up at the moment it is called."""
+    import types
+
+    from packn_os_hubspot_client import client
+
+    return types.SimpleNamespace(
+        read_routine_enabled=lambda routine: client.read_routine_enabled(routine),
+        read_pending_rerun_requests=lambda routine: client.read_pending_rerun_requests(routine),
+        load_settings=lambda: _load_settings(),
+        load_state=lambda: _load_state(),
+        read_hubspot_token=lambda: hs.read_token(),
+        state_path=STATE_PATH,
+        hubspot_transport=None,
+    )
 
 
 def main() -> int:
+    """A hand-run of the pre-gate: a thin shell over `decide`.
+
+    The scheduled tick and Run now do NOT come through here any more: they go
+    through scripts/run_tickets.py, which calls `decide` itself and writes the
+    run's one record. This shell keeps what a hand-run of the script always did:
+    the same three exit codes, and its own record on the exits that skip the agent.
+    """
     started_iso = datetime.now(timezone.utc).isoformat()
 
     from packn_os_hubspot_client import client
@@ -319,50 +443,20 @@ def main() -> int:
         _write_run_record("skipped", SUMMARY_OS_MODE_NOT_SERVED, started_iso)
         return EXIT_SKIP_PAUSED
 
-    # Step 0b equivalent — fail-closed routine gate (returns False on DB
-    # error too, per CONTEXT D-01). Paused => the agent would exit at its own
-    # gate anyway; skip the launch and write the same 'skipped' record.
-    if not client.read_routine_enabled(ROUTINE):
-        _log("routine paused (or gate unreachable) — skipping agentic run")
+    outcome = decide(mode, _hand_run_deps())
+    if outcome["decision"] == DECISION_PAUSED:
+        # Paused => the agent would exit at its own gate anyway; skip the launch
+        # and write the same 'skipped' record.
         _write_run_record(
             "skipped",
             "pregate: routine paused via Pack'N OS (or gate unreachable — fail-closed)",
             started_iso,
         )
         return EXIT_SKIP_PAUSED
-
-    # Operator rerun requests are always agent work (D-09).
-    reruns = client.read_pending_rerun_requests(ROUTINE)
-    if reruns:
-        _log(f"{len(reruns)} pending rerun request(s) — launching agent")
-        return EXIT_RUN_AGENT
-
-    try:
-        settings = _load_settings()
-        active_stages = [str(s) for s in settings.get("active_stages") or []]
-        int(settings.get("per_run_cap", 25))  # a cap that is not a number is a settings doubt
-        if not active_stages:
-            _log("active_stages empty in settings.yaml — deferring to agent")
-            return EXIT_RUN_AGENT
-    except Exception as e:
-        _log(f"settings unreadable — deferring to agent: {e!r}")
-        return EXIT_RUN_AGENT
-
-    token = hs.read_token()
-    if token is None:
-        _log("hubspot token missing — deferring to agent")
-        return EXIT_RUN_AGENT
-
-    state = _load_state()
-
-    # The search-and-dedupe decision lives once, in hubspot_candidates (which
-    # also holds the two fail-open branches of the search itself).
-    outcome = hubspot_candidates(mode, settings, state, token)
-    if outcome["decision"] == DECISION_RUN_AGENT:
-        return EXIT_RUN_AGENT
-
-    _write_run_record("success", None, started_iso)
-    return EXIT_SKIP_NO_WORK
+    if outcome["decision"] == DECISION_NO_WORK:
+        _write_run_record("success", None, started_iso)
+        return EXIT_SKIP_NO_WORK
+    return EXIT_RUN_AGENT
 
 
 if __name__ == "__main__":
