@@ -23,6 +23,11 @@ returns False) reports its fail-closed value instead; no connection is attempted
 either way.
 
 The fixture reads no environment variable and prints nothing.
+
+This conftest also installs the suite-level network refusal (plan 14): no test
+can open a connection that leaves this machine. Its rule is in
+tests/helpers/network_guard.py. Unlike the database guard it is meant to reach
+every test of a shared session, and the helper suite's conftest installs it too.
 """
 from __future__ import annotations
 
@@ -31,6 +36,8 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator, Optional
 
 import pytest
+
+from tests.helpers import network_guard
 
 NO_DATABASE_MESSAGE = (
     "the pure suite has no database: a test under tests/ asked for the helper's "
@@ -76,6 +83,21 @@ def _hand_back(real: Callable[..., Any], modules: Optional[Iterable[Any]] = None
     """Give the real getter to every module still holding the guard."""
     for module in _holders(_no_database_pool, modules):
         setattr(module, "get_pool", real)
+
+
+@pytest.fixture(autouse=True)
+def _suite_refuses_the_network(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """No test under tests/ can open a connection that leaves this machine.
+
+    Phase 93, plan 14 (task zero). The rule and the four entry points it replaces
+    are in tests/helpers/network_guard.py; the helper suite's conftest installs
+    the same guard. A refusal is an AssertionError naming the host.
+    """
+    network_guard.install(monkeypatch)
+    yield
+    swallowed = network_guard.unanswered_refusals()
+    if swallowed:
+        pytest.fail(swallowed, pytrace=False)
 
 
 @pytest.fixture(autouse=True)

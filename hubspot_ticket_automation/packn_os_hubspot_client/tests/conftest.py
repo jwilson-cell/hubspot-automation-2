@@ -19,6 +19,12 @@ import psycopg
 import pytest
 from psycopg.rows import dict_row
 
+# The suite-level network refusal lives with the pure suite's helpers (standard
+# library only). pytest puts hubspot_ticket_automation/ on sys.path for both test
+# roots, so the import resolves whichever root is run; if it ever does not, the
+# ImportError stops collection, which is louder than running with no guard.
+from tests.helpers import network_guard
+
 # Default points at the dev docker Postgres (port 5433 to match the
 # docker-compose host mapping that avoids the native Windows postgres on
 # 5432). Same posture as tests/setup.ts in the Phase 1 test harness.
@@ -38,6 +44,22 @@ def _set_test_env() -> None:
         os.environ["REDIS_URL"] = DEFAULT_REDIS_URL
     if "HUBSPOT_RATE_LIMIT_AUTOMATION" not in os.environ:
         os.environ["HUBSPOT_RATE_LIMIT_AUTOMATION"] = "3"
+
+
+@pytest.fixture(autouse=True)
+def _suite_refuses_the_network(monkeypatch: pytest.MonkeyPatch) -> Generator[None, None, None]:
+    """No test in the helper suite can open a connection that leaves this machine.
+
+    Phase 93, plan 14 (task zero). The same guard the pure suite installs; the
+    rule is in tests/helpers/network_guard.py. Loopback stays open, which is what
+    the Redis tests use. The database tests do not pass through it: psycopg's
+    binary driver connects inside libpq.
+    """
+    network_guard.install(monkeypatch)
+    yield
+    swallowed = network_guard.unanswered_refusals()
+    if swallowed:
+        pytest.fail(swallowed, pytrace=False)
 
 
 @pytest.fixture
