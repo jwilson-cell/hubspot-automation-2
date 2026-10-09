@@ -104,7 +104,34 @@ def _request(
     return None
 
 
-def search_tickets(body: dict, token: str) -> Optional[dict]:
+# --- Skeleton (Phase 93, plan 13, RED): names and signatures only -------------
+CALL_KINDS: tuple = ()
+
+
+def _default_opener(request, timeout=None):
+    return urllib.request.urlopen(request, timeout=timeout)
+
+
+def record_call(kind):
+    return None
+
+
+def snapshot_calls():
+    return None
+
+
+def reset_calls():
+    return None
+
+
+def update_ticket_properties(ticket_id, properties, token):
+    return None
+
+
+# ------------------------------------------------------------------------------
+
+
+def search_tickets(body: dict, token: str, kind: str = "search", *, transport=None) -> Optional[dict]:
     return _request("POST", "/crm/v3/objects/tickets/search", token, body)
 
 
