@@ -282,6 +282,19 @@ def hubspot_candidates(
     return _candidate_decision(DECISION_NO_WORK, REASON_NONE, matched)
 
 
+DECISION_PAUSED = "paused"
+REASON_PAUSED = "routine_paused"
+REASON_RERUNS = "pending_reruns"
+REASON_SETTINGS_UNREADABLE = "settings_unreadable"
+REASON_NO_ACTIVE_STAGES = "active_stages_empty"
+REASON_TOKEN_MISSING = "token_missing"
+
+
+def decide(mode: str, deps: Any) -> dict:
+    """SKELETON (Phase 93, plan 15): the whole pre-gate decision, no record written."""
+    return None  # type: ignore[return-value]
+
+
 def main() -> int:
     started_iso = datetime.now(timezone.utc).isoformat()
 
