@@ -13,7 +13,8 @@ Env vars expected (defaults below match docker-compose.yml host mapping):
 """
 
 import os
-from typing import Generator
+import urllib.parse
+from typing import Generator, Mapping, Optional
 
 import psycopg
 import pytest
@@ -44,6 +45,62 @@ def _set_test_env() -> None:
         os.environ["REDIS_URL"] = DEFAULT_REDIS_URL
     if "HUBSPOT_RATE_LIMIT_AUTOMATION" not in os.environ:
         os.environ["HUBSPOT_RATE_LIMIT_AUTOMATION"] = "3"
+
+
+# ---------------------------------------------------------------------------
+# Local-dev-database guard (Phase 93, plan 14; runbook tag R-LOCAL-DB-ONLY).
+#
+# `_set_test_env` above sets the database URL only when none is exported, so a
+# shell with another URL exported (a tunnel to prod, say) would have pointed
+# every test in this directory at that database: they insert tickets, drafts
+# and run records. The session fixture below refuses any URL that is not the
+# local dev Postgres and ABORTS the session. Aborting is deliberate: a skip
+# would be a green run that proved nothing, and a per-test error would still
+# let another test's fixture connect.
+#
+# Accepted residual: the rule judges host and port only. An SSH tunnel to
+# another database bound to local port 5433 would pass. That port is the dev
+# Docker Postgres's, so such a tunnel can bind there only while the dev
+# database is stopped; the runbook says never to bind one to 5433.
+# ---------------------------------------------------------------------------
+
+LOCAL_DB_HOSTS = ("localhost", "127.0.0.1")
+LOCAL_DB_PORT = 5433
+DB_GUARD_REFUSAL_TOKEN = "REFUSING_NON_LOCAL_DATABASE"
+DB_GUARD_EXIT_CODE = 97
+DB_URL_ENV = "PACKN_OS_DATABASE_URL"
+
+# libpq reads these from the environment when the URL does not give the same
+# parameter, and either one sends the connection somewhere the URL does not name.
+DB_REDIRECT_ENV = ("PGHOSTADDR", "PGSERVICE")
+
+# A query parameter of the URL that overrides where the connection goes.
+DB_REDIRECT_PARAMS = ("host", "hostaddr", "port", "service")
+
+
+class NonLocalDatabaseError(RuntimeError):
+    """The database URL the suite would use is not the local dev Postgres."""
+
+
+def assert_local_dev_database(url: object, environ: Optional[Mapping[str, str]] = None) -> None:
+    """Raise NonLocalDatabaseError unless `url` is the local dev Postgres.
+
+    RED skeleton: no rule yet.
+    """
+    return None
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _require_local_dev_database(_set_test_env: None) -> None:
+    """Abort the session unless the database URL in use is the local dev one.
+
+    Takes `_set_test_env` so the default is in place first, and is session-scoped
+    and autouse so it runs before any fixture of any test here can connect.
+    """
+    try:
+        assert_local_dev_database(os.environ.get(DB_URL_ENV), os.environ)
+    except NonLocalDatabaseError as refusal:
+        pytest.exit(str(refusal), returncode=DB_GUARD_EXIT_CODE)
 
 
 @pytest.fixture(autouse=True)
