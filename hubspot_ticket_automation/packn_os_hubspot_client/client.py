@@ -7,7 +7,11 @@ Public functions (called by the existing automation's SKILL.md cron skill):
          row `ticket_source_mode`. Raises on a database error — NOT fail-closed
          into a value; ticket_pipeline/source.py owns the decision.)
     write_run_record(routine_name, status, error_summary, tickets_processed,
-                     drafts_created, started_at_iso, finished_at_iso) -> None
+                     drafts_created, started_at_iso, finished_at_iso, *,
+                     run_id=None, source_mode=None, failure_reason_code=None,
+                     hubspot_calls=None) -> None
+        (Phase 93: the four keyword-only values are optional. Without them the
+         statement is the one this function always sent.)
     write_draft(ticket_id, routine_name, draft_body, model, prompt_version,
                 hubspot_ticket_snapshot) -> str  (draft_id, idempotent on D-05 triple)
     replace_pending_draft(*, draft_key, os_ticket_id, routine_name, draft_body,
@@ -752,8 +756,66 @@ def read_pending_drafts(routine_name: str, since_hours: int = 48) -> list[dict]:
         return []
 
 
-# Phase 93 (plan 14) RED skeleton: the cache the column check will use.
+# ---------------------------------------------------------------------------
+# Phase 93 (plan 14) — the run record's four optional values (SPEC R14).
+#
+# `automation_runs` gained `source_mode`, `failure_reason_code` and
+# `hubspot_calls` in OS migration 0181, and the cron sets the row's `id` to its
+# own run id (there is no separate run-id column). The cron's role can INSERT
+# into the table and nothing else, so there is no RETURNING and no read-back.
+#
+# Deploy-order guard (the write_complaints precedent): a cron that reaches a
+# database the OS has not migrated yet must still write its record. Whether the
+# new columns exist is asked once per process through information_schema, which
+# needs no grant of its own, and cached here: None = not asked yet.
+# ---------------------------------------------------------------------------
 _RUN_RECORD_PHASE93_COLUMNS: Optional[bool] = None
+
+_RUN_RECORD_PREFLIGHT_SQL = (
+    "SELECT 1 FROM information_schema.columns "
+    "WHERE table_name = 'automation_runs' "
+    "AND column_name = %s"
+)
+
+_RUN_RECORD_EXTENDED_SQL = """
+    INSERT INTO automation_runs
+      (id, tenant_id, routine_name, status, started_at, finished_at,
+       tickets_processed, drafts_created, error_summary,
+       source_mode, failure_reason_code, hubspot_calls)
+    VALUES (COALESCE(%s::uuid, gen_random_uuid()), %s, %s, %s,
+            %s::timestamptz, %s::timestamptz, %s, %s, %s,
+            %s, %s, %s::jsonb)
+    """
+
+# The old column list plus the id: what an un-migrated database can take.
+_RUN_RECORD_WITH_ID_SQL = """
+    INSERT INTO automation_runs
+      (id, tenant_id, routine_name, status, started_at, finished_at,
+       tickets_processed, drafts_created, error_summary)
+    VALUES (%s::uuid, %s, %s, %s, %s::timestamptz, %s::timestamptz, %s, %s, %s)
+    """
+
+
+def _run_record_columns_present() -> bool:
+    """Does `automation_runs` have the Phase 93 columns? Asked once per process.
+
+    A database error propagates and nothing is cached: the caller's record is
+    then not written, which the caller reports.
+    """
+    global _RUN_RECORD_PHASE93_COLUMNS
+    if _RUN_RECORD_PHASE93_COLUMNS is None:
+        with get_pool().connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(_RUN_RECORD_PREFLIGHT_SQL, ("source_mode",))
+                present = cur.fetchone() is not None
+        _RUN_RECORD_PHASE93_COLUMNS = present
+    return _RUN_RECORD_PHASE93_COLUMNS
+
+
+def _optional_text(name: str, value: object) -> Optional[str]:
+    if value is not None and not isinstance(value, str):
+        raise ValueError(f"{name} must be a string or None")
+    return value
 
 
 def write_run_record(
@@ -777,9 +839,78 @@ def write_run_record(
     per Assumption A5).
 
     Returns None - signature is fire-and-forget; failures raise.
+
+    Phase 93 keyword-only values, all optional:
+        run_id               a uuid string; becomes the row's `id`, so a second
+                             record for the same run is refused by the primary
+                             key (one record per run)
+        source_mode          the mode the run was in (`hubspot`, `shadow`, `os`)
+        failure_reason_code  why a failed run failed, as a code
+        hubspot_calls        {"kinds": {...}, "raw_requests": n}, stored as JSON
+
+    Called with none of the four (the seven positional arguments, as before),
+    the statement and its parameters are the ones this function always sent.
+    With any of them: one INSERT that names the new columns when the database
+    has them, and otherwise the old column list plus the id, without the three
+    values. A value of the wrong kind is a ValueError before any statement.
     """
     if error_summary and len(error_summary) > 8000:
         error_summary = "...[truncated]\n" + error_summary[-8000:]
+    if not (
+        run_id is None
+        and source_mode is None
+        and failure_reason_code is None
+        and hubspot_calls is None
+    ):
+        run_id = _optional_uuid("run_id", run_id)
+        source_mode = _optional_text("source_mode", source_mode)
+        failure_reason_code = _optional_text("failure_reason_code", failure_reason_code)
+        if hubspot_calls is not None and not isinstance(hubspot_calls, dict):
+            raise ValueError("hubspot_calls must be a dict or None")
+        statement: Optional[str] = None
+        parameters: tuple = ()
+        if _run_record_columns_present():
+            statement = _RUN_RECORD_EXTENDED_SQL
+            parameters = (
+                run_id,
+                TENANT_ID,
+                routine_name,
+                status,
+                started_at_iso,
+                finished_at_iso,
+                tickets_processed,
+                drafts_created,
+                error_summary,
+                source_mode,
+                failure_reason_code,
+                json.dumps(hubspot_calls) if hubspot_calls is not None else None,
+            )
+        else:
+            logger.warning(
+                "run_record_columns_absent: the run record is written without "
+                "source_mode, failure_reason_code and hubspot_calls",
+                extra={"routine": routine_name},
+            )
+            if run_id is not None:
+                statement = _RUN_RECORD_WITH_ID_SQL
+                parameters = (
+                    run_id,
+                    TENANT_ID,
+                    routine_name,
+                    status,
+                    started_at_iso,
+                    finished_at_iso,
+                    tickets_processed,
+                    drafts_created,
+                    error_summary,
+                )
+        if statement is not None:
+            with get_pool().connection() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(statement, parameters)
+                    conn.commit()
+            return
+        # No new column and no run id: nothing differs from the old record.
     with get_pool().connection() as conn:
         with conn.cursor() as cur:
             cur.execute(
