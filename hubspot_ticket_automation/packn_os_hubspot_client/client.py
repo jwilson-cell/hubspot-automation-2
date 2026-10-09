@@ -10,6 +10,20 @@ Public functions (called by the existing automation's SKILL.md cron skill):
                      drafts_created, started_at_iso, finished_at_iso) -> None
     write_draft(ticket_id, routine_name, draft_body, model, prompt_version,
                 hubspot_ticket_snapshot) -> str  (draft_id, idempotent on D-05 triple)
+    replace_pending_draft(*, draft_key, os_ticket_id, routine_name, draft_body,
+                          model, base_prompt_version, cycle_key,
+                          hubspot_ticket_snapshot) -> dict
+        (Phase 93: this cycle's draft in, the ticket's other pending drafts
+         superseded, in one transaction under a per-ticket advisory lock.
+         Returns {"draft_id", "created", "superseded"}.)
+    write_cron_draft(ticket_id, routine_name, draft_body, model, prompt_version,
+                     hubspot_ticket_snapshot) -> str
+        (Phase 93: what the cron calls. write_draft when the run context names
+         no cycle for the ticket, replace_pending_draft when it does.)
+    rollback_cycle_entries(run_id, routine_name="tickets-process") -> dict
+        (Phase 93: the run-context entries a HubSpot-mode run needs so that it
+         replaces, instead of adding beside, a draft an os/shadow pass left
+         pending. One SELECT, no write.)
     read_pending_drafts(routine_name, since_hours=48) -> list[dict]
         (Phase 4.1 D-02.b - digest skill reads pending drafts via this helper
          instead of scraping HubSpot draft engagement PACKN_METADATA_V1 blocks)
@@ -46,7 +60,9 @@ Threat-register notes (T-04-* in the plan):
 
 import json
 import logging
+import os
 import subprocess
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -198,18 +214,100 @@ def write_draft(
 # ---------------------------------------------------------------------------
 # Phase 93 (plan 14) — one pending draft per ticket, replaced atomically.
 #
-# RED skeleton: the names and signatures only.
+# SPEC R12: when a ticket is processed again, the earlier pending draft becomes
+# `superseded` and exactly one pending draft exists. The insert of the new row
+# and the supersede of the old ones are ONE transaction under a per-ticket
+# advisory lock, so no committed state has zero or two pending drafts.
+#
+# How a second pass gets a row of its own without changing the unique key
+# (tenant, routine, ticket, prompt version): the processing cycle rides in the
+# prompt version, as `<base>#<cycle key>`. The cycle key is the id of the client
+# signal the pass consumed, `rerun:<request id>` for an operator rerun, and
+# `hubspot:<run id>` for a HubSpot-mode pass that replaces a cycle-keyed draft.
+#
+# The lock key is the string the OS's on-demand draft route hashes
+# (src/app/api/tasks/reply-draft/route.ts), so a cron pass and an operator's
+# on-demand draft for the same ticket wait for each other.
+#
+# write_draft above is untouched: a ticket with no cycle is written exactly as
+# before, statement for statement.
+#
+# Grant: the supersede needs column-level update rights on `state`,
+# `superseded_at`, `superseded_by_draft_id` and `updated_at` of the drafts table
+# (OS migration 0181; listed in this package's README). It assigns those four
+# columns and no other.
 # ---------------------------------------------------------------------------
 
 DRAFT_LOCK_PREFIX = "task_reply_draft"
 ROLLBACK_CYCLE_PREFIX = "hubspot"
 CYCLE_SEPARATOR = "#"
 RUN_CONTEXT_ENV = "PACKN_RUN_CONTEXT"
-DRAFT_LOCK_SQL = ""
+
+DRAFT_LOCK_SQL = "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))"
+
+_REPLACE_INSERT_SQL = """
+    INSERT INTO automation_drafts
+      (id, tenant_id, routine_name, ticket_id, os_ticket_id, draft_body, model,
+       prompt_version, hubspot_ticket_snapshot, state)
+    VALUES (%s::uuid, %s, %s, %s, %s::uuid, %s, %s, %s, %s::jsonb, 'pending')
+    ON CONFLICT (tenant_id, routine_name, ticket_id, prompt_version)
+      DO NOTHING
+    RETURNING id
+    """
+
+# The only statement in this module that changes an existing draft row.
+_SUPERSEDE_SQL = """
+    UPDATE automation_drafts
+       SET state = 'superseded',
+           superseded_at = now(),
+           superseded_by_draft_id = %s::uuid,
+           updated_at = now()
+     WHERE tenant_id = %s
+       AND state = 'pending'
+       AND deleted_at IS NULL
+       AND id <> %s::uuid
+       AND (ticket_id = %s OR os_ticket_id = %s::uuid)
+    """
+
+_EXISTING_CYCLE_SQL = """
+    SELECT id FROM automation_drafts
+    WHERE tenant_id = %s AND routine_name = %s
+      AND ticket_id = %s AND prompt_version = %s
+    """
+
+_ROLLBACK_SELECT_SQL = """
+    SELECT DISTINCT ticket_id, os_ticket_id
+      FROM automation_drafts
+     WHERE tenant_id = %s
+       AND routine_name = %s
+       AND state = 'pending'
+       AND deleted_at IS NULL
+       AND strpos(prompt_version, %s) > 0
+     ORDER BY ticket_id
+    """
 
 
 def draft_lock_key(draft_key: str) -> str:
-    return ""
+    """The text the per-ticket advisory lock hashes: `task_reply_draft:<tenant>:<key>`."""
+    return f"{DRAFT_LOCK_PREFIX}:{TENANT_ID}:{draft_key}"
+
+
+def _required_text(name: str, value: object) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{name} must be a non-empty string")
+    return value
+
+
+def _optional_uuid(name: str, value: object) -> Optional[str]:
+    """None, or the canonical text of a uuid. Anything else is a ValueError."""
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError(f"{name} must be a uuid string or None")
+    try:
+        return str(uuid.UUID(value))
+    except ValueError:
+        raise ValueError(f"{name} must be a uuid string or None") from None
 
 
 def replace_pending_draft(
@@ -223,11 +321,129 @@ def replace_pending_draft(
     cycle_key: str,
     hubspot_ticket_snapshot: dict,
 ) -> dict:
-    return {"draft_id": "", "created": False, "superseded": 0}
+    """Write this cycle's draft and supersede the ticket's other pending drafts.
+
+    Arguments (all keyword-only):
+        draft_key            the text ticket key: the HubSpot id when the ticket
+                             has one, else the OS id as text (the OS's
+                             draftTicketKeyValue rule)
+        os_ticket_id         the OS ticket id (uuid text), written at insert;
+                             None only when it is not known
+        base_prompt_version  the real prompt version, e.g. `v3.3.0`; the row is
+                             written with `<base>#<cycle_key>`
+        cycle_key            what this pass is a response to (see the block
+                             comment above)
+
+    Returns {"draft_id": str, "created": bool, "superseded": int}.
+        created True   a new pending row was inserted; `superseded` other live
+                       pending drafts of the ticket were superseded and point at
+                       it. They are matched by the same text key, or by the same
+                       OS ticket id when one was given, across every routine: an
+                       operator's unsent on-demand draft is replaced too.
+        created False  this cycle already has a row (a replay): its id is
+                       returned and nothing is changed.
+
+    Sent, approved, rejected, superseded and soft-deleted drafts are never
+    touched.
+
+    One pool connection, one transaction, one commit. The first statement takes
+    the ticket's advisory transaction lock, which the commit (or a rollback)
+    releases.
+
+    Raises:
+        ValueError: a snapshot without `category` or `captured_at` (the rule
+            write_draft applies), an empty key, a base version that already
+            carries a cycle, or an OS id that is not a uuid. Nothing is sent to
+            the database in any of these cases.
+    """
+    if not isinstance(hubspot_ticket_snapshot, dict):
+        raise ValueError("hubspot_ticket_snapshot must be a dict")
+    if "category" not in hubspot_ticket_snapshot:
+        raise ValueError(
+            "hubspot_ticket_snapshot must include 'category' key for D-07 similarity scope"
+        )
+    if "captured_at" not in hubspot_ticket_snapshot:
+        raise ValueError(
+            "hubspot_ticket_snapshot must include 'captured_at' ISO timestamp"
+        )
+    draft_key = _required_text("draft_key", draft_key)
+    routine_name = _required_text("routine_name", routine_name)
+    cycle_key = _required_text("cycle_key", cycle_key)
+    base_prompt_version = _required_text("base_prompt_version", base_prompt_version)
+    if CYCLE_SEPARATOR in base_prompt_version:
+        raise ValueError("base_prompt_version already carries a cycle key")
+    os_id = _optional_uuid("os_ticket_id", os_ticket_id)
+
+    new_id = str(uuid.uuid4())
+    prompt_version = f"{base_prompt_version}{CYCLE_SEPARATOR}{cycle_key}"
+
+    with get_pool().connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(DRAFT_LOCK_SQL, (draft_lock_key(draft_key),))
+            cur.execute(
+                _REPLACE_INSERT_SQL,
+                (
+                    new_id,
+                    TENANT_ID,
+                    routine_name,
+                    draft_key,
+                    os_id,
+                    draft_body,
+                    model,
+                    prompt_version,
+                    json.dumps(hubspot_ticket_snapshot),
+                ),
+            )
+            inserted = cur.fetchone()
+            if inserted:
+                cur.execute(
+                    _SUPERSEDE_SQL,
+                    (new_id, TENANT_ID, new_id, draft_key, os_id),
+                )
+                result = {
+                    "draft_id": str(inserted["id"]),
+                    "created": True,
+                    "superseded": cur.rowcount,
+                }
+            else:
+                # A replay: this cycle already has its row. Nothing is superseded.
+                cur.execute(
+                    _EXISTING_CYCLE_SQL,
+                    (TENANT_ID, routine_name, draft_key, prompt_version),
+                )
+                existing = cur.fetchone()
+                if not existing:
+                    raise RuntimeError(
+                        "replace_pending_draft: the insert conflicted but no row has this cycle"
+                    )
+                result = {"draft_id": str(existing["id"]), "created": False, "superseded": 0}
+            conn.commit()
+    return result
 
 
 def load_run_context() -> dict:
-    return {}
+    """The run context the orchestrator wrote, or an empty map.
+
+    The file named by PACKN_RUN_CONTEXT holds one JSON object:
+
+        { "<draft key>": { "os_ticket_id": str | null, "cycle_key": str | null,
+                           "signal_at": str | null, "signal_id": str | null } }
+
+    No variable, a file that cannot be read, text that is not JSON, or JSON that
+    is not an object all give {}. With {} every draft is written the plain way.
+    """
+    path = os.environ.get(RUN_CONTEXT_ENV)
+    if not path:
+        return {}
+    try:
+        loaded = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError) as e:
+        logger.warning("run_context_unusable: %s", type(e).__name__)
+        return {}
+    if not isinstance(loaded, dict):
+        logger.warning("run_context_unusable: not an object")
+        return {}
+    return loaded
 
 
 def write_cron_draft(
@@ -238,11 +454,82 @@ def write_cron_draft(
     prompt_version: str,
     hubspot_ticket_snapshot: dict,
 ) -> str:
-    return ""
+    """What the cron calls to write a draft: write_draft, or the atomic replace.
+
+    Same positional parameters and same return value (the draft id) as
+    write_draft. The run context decides which:
+
+        no entry for this ticket, or an entry with no cycle key
+            -> write_draft(...), unchanged: a plain call with no statement
+               before or after it
+        an entry with a cycle key
+            -> replace_pending_draft under that cycle, with the entry's
+               `os_ticket_id` and `prompt_version` as the base version
+
+    A cycle key that is present but unusable (an OS id that is not a uuid, a
+    blank key) raises ValueError. It is not written the plain way, because a
+    plain row beside a cycle-keyed one is a second pending draft.
+    """
+    entry = load_run_context().get(str(ticket_id))
+    cycle_key = entry.get("cycle_key") if isinstance(entry, dict) else None
+    if not (isinstance(cycle_key, str) and cycle_key):
+        return write_draft(
+            ticket_id, routine_name, draft_body, model, prompt_version, hubspot_ticket_snapshot
+        )
+    result = replace_pending_draft(
+        draft_key=str(ticket_id),
+        os_ticket_id=entry.get("os_ticket_id"),
+        routine_name=routine_name,
+        draft_body=draft_body,
+        model=model,
+        base_prompt_version=prompt_version,
+        cycle_key=cycle_key,
+        hubspot_ticket_snapshot=hubspot_ticket_snapshot,
+    )
+    return result["draft_id"]
 
 
 def rollback_cycle_entries(run_id: str, routine_name: str = "tickets-process") -> dict:
-    return {}
+    """Run-context entries for the tickets a HubSpot-mode run must REPLACE.
+
+    SPEC R12 / R15 (runbook tag R-ROLLBACK-ONE-DRAFT). A draft left pending by an
+    `os` or `shadow` pass has a cycle-suffixed prompt version, so a HubSpot-mode
+    pass that inserted under the bare version would sit beside it. A HubSpot-mode
+    run calls this once and puts the result in its run context; write_cron_draft
+    then replaces, under the cycle key `hubspot:<run_id>`, for exactly these
+    tickets, and writes every other ticket as before.
+
+    One entry per text ticket key that has a live pending draft of `routine_name`
+    whose prompt version carries a cycle:
+
+        { "<draft key>": { "os_ticket_id": <the row's, or None>,
+                           "cycle_key": "hubspot:<run_id>",
+                           "signal_at": None, "signal_id": None } }
+
+    One tenant-qualified SELECT. It writes nothing, and it needs only the read
+    on the drafts table the role already has. A database error propagates: the
+    caller decides what a run does when it cannot know.
+    """
+    run_id = _required_text("run_id", run_id)
+    routine_name = _required_text("routine_name", routine_name)
+    with get_pool().connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(_ROLLBACK_SELECT_SQL, (TENANT_ID, routine_name, CYCLE_SEPARATOR))
+            rows = cur.fetchall()
+    entries: dict = {}
+    for row in rows:
+        key = row["ticket_id"]
+        os_id = str(row["os_ticket_id"]) if row["os_ticket_id"] is not None else None
+        known = entries.get(key)
+        if known is not None and (known["os_ticket_id"] is not None or os_id is None):
+            continue
+        entries[key] = {
+            "os_ticket_id": os_id,
+            "cycle_key": f"{ROLLBACK_CYCLE_PREFIX}:{run_id}",
+            "signal_at": None,
+            "signal_id": None,
+        }
+    return entries
 
 
 # ---------------------------------------------------------------------------

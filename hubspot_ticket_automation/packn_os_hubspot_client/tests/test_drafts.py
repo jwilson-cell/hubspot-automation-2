@@ -918,6 +918,10 @@ def test_two_overlapping_passes_leave_exactly_one_pending_draft(
     drafts_db: psycopg.Connection, seeded_ticket: dict
 ) -> None:
     """SPEC Edge (concurrency) and R15 acceptance, ten times over."""
+    # Build the helper's pool before the threads start. Its lazy init is not
+    # thread-safe (the cron is one thread), and two threads racing to build it
+    # would each make a pool; that is a fact about this test, not the replace.
+    client.get_pool()
     for repetition in range(10):
         barrier = threading.Barrier(2)
         errors: list = []
