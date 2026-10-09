@@ -37,3 +37,47 @@ def category_keys(categories_cfg: dict) -> list[str]:
     if not isinstance(categories_cfg, dict):
         raise TypeError("category_keys needs the loaded categories.yaml mapping")
     return [key for key in categories_cfg if key not in NON_CATEGORY_KEYS]
+
+
+# --- RED skeleton (plan 93-22, task 2): names and signatures, no behaviour yet ---
+
+THREAD_HUBSPOT = ""
+THREAD_OS = ""
+THREAD_OS_FALLBACK = ""
+BODY_TEXT_CAP = 0
+
+
+def build_context(payload, thread, settings, os_origin):
+    return None
+
+
+def fetch_thread(hubspot_ticket_id, settings, token):
+    return None
+
+
+def os_thread(payload):
+    return None
+
+
+def first_email_html(payload, thread=None):
+    return None
+
+
+def thread_source(payload, thread=None):
+    return None
+
+
+def cycle_key(payload, rerun_request_id=None):
+    return None
+
+
+def draft_key(payload):
+    return None
+
+
+def backfill_source(payload, first_email_html):
+    return None
+
+
+def write_bundle(path, run_id, entries, *, mode="os", generated_at=None):
+    return None
