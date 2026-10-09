@@ -112,7 +112,12 @@ def process_ticket(
     }
 
 
-def run_shadow(limit: int | None = None, ticket_id: str | None = None) -> int:
+def run_shadow(
+    limit: int | None = None,
+    ticket_id: str | None = None,
+    mode: str | None = None,  # skeleton (Phase 93, plan 13, RED): not read yet
+    contexts: list | None = None,  # skeleton: not read yet
+) -> int:
     settings = _load_yaml(SETTINGS_PATH)
     pipeline_cfg = settings.get("pipeline") or {}
     if not pipeline_cfg.get("shadow_enabled") and ticket_id is None:

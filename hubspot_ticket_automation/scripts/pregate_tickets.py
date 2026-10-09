@@ -289,6 +289,11 @@ def _write_run_record(status: str, error_summary: Optional[str], started_iso: st
         _log(f"run-record write failed ({status}): {e!r}")
 
 
+def hubspot_candidates(mode, settings, state, token, transport=None):
+    """Skeleton (Phase 93, plan 13, RED): no behaviour yet."""
+    return None
+
+
 def main() -> int:
     started_iso = datetime.now(timezone.utc).isoformat()
 

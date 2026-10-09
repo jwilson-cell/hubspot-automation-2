@@ -90,6 +90,11 @@ def read_routine_enabled(routine_name: str) -> bool:
         return False
 
 
+def read_ticket_source_mode():
+    """Skeleton (Phase 93, plan 13, RED): no behaviour yet."""
+    return None
+
+
 def write_draft(
     ticket_id: str,
     routine_name: str,
