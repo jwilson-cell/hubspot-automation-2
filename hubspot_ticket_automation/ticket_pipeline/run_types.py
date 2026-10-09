@@ -130,3 +130,13 @@ class Deps:
     # environment children start from (None = this process's own, read at launch)
     hubspot_transport: Optional[Callable[..., Any]] = None
     environ: Optional[Mapping[str, str]] = None
+    # `os` mode (Plan 93-16). Each None means "the real one", resolved by the
+    # runner when it needs it, so a `hubspot`-mode run imports none of them.
+    #   os_api                        fetch_unprocessed(limit) and fetch_ticket(ref);
+    #                                 None = packn_os_hubspot_client.tickets_api
+    #   read_os_origin                the OS's scheme and host; None = that module's
+    #   engine_shadow_contexts_step   the engine shadow over ready-built contexts;
+    #                                 None = ticket_pipeline.os_pass's own
+    os_api: Any = None
+    read_os_origin: Optional[Callable[[], str]] = None
+    engine_shadow_contexts_step: Optional[Callable[[list], Any]] = None

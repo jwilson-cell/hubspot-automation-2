@@ -382,8 +382,10 @@ class World:
 
 
 @pytest.fixture
-def world(tmp_path: Path) -> World:
-    return World(tmp_path)
+def world(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> World:
+    w = World(tmp_path)
+    w.monkeypatch = monkeypatch  # for a case that has to narrow the runner registry
+    return w
 
 
 # --- one configuration per outcome; each is used by a named test and by the
@@ -455,6 +457,10 @@ def _rollback_unreadable(w: World) -> None:
 
 
 def _os_mode_without_a_runner(w: World) -> None:
+    # Plan 93-16 registered the `os` runner, so a recognised mode with no runner
+    # no longer exists by itself: this case narrows the registry to `hubspot`.
+    w.monkeypatch.setattr(rt, "MODE_RUNNERS", {})
+    w.monkeypatch.setattr(rt, "RUNNER_SPECS", {"hubspot": rt.RUNNER_SPECS["hubspot"]})
     w.mode_reader = lambda: "os"
 
 
