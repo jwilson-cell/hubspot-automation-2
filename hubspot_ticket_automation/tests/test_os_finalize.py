@@ -991,7 +991,7 @@ def test_a_dry_run_through_the_orchestrator_persists_nothing(world: OsWorld) -> 
     record = world.record
     assert world.drafts == [] and posts(world) == []
     assert (record["status"], record["drafts_created"]) == ("success", 0)
-    assert "dry_run" in record["error_summary"] and "would_draft=3" in record["error_summary"]
+    assert "dry_run" in record["error_summary"] and "would_drafts=3" in record["error_summary"]
 
 
 def test_a_finalizer_that_raises_is_a_code_on_the_one_record_and_never_a_crash(

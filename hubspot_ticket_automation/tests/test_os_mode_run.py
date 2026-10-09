@@ -974,7 +974,14 @@ def test_with_no_injected_api_the_runner_uses_the_real_signed_client(world: OsWo
     opener = _use_the_real_client(world, lambda request: _Answer(_list()), FIXTURE_SECRET + "\n")
     assert world.run() == 0
     assert world.record["status"] == "success" and world.record["tickets_processed"] == 3
-    (request,) = opener.requests
+    request, *writebacks = opener.requests
+    # after the list, the finalizer's three write-backs (plan 17) went through the
+    # same signed client: the OS ticket id in the path, and no query string
+    assert [(sent.get_method(), sent.full_url) for sent in writebacks] == [
+        ("POST", f"{OS_ORIGIN}/api/tickets/{os_id}/classification")
+        for os_id in (T1_OS_ID, T2_OS_ID, T3_OS_ID)
+    ]
+    assert all(sent.get_header(tickets_api.SIGNATURE_HEADER.capitalize()) for sent in writebacks)
     assert request.get_method() == "GET"
     assert request.full_url == f"{OS_ORIGIN}/api/tickets/unprocessed?contract_version=1&limit=25"
     assert request.get_header(tickets_api.SIGNATURE_HEADER.capitalize())
@@ -1524,7 +1531,7 @@ def test_the_count_is_codes_not_the_agents_own(world: OsWorld) -> None:
     world.agent = OsAgent(drop=(T1_HS_ID,), edit=overclaim)
     world.run()
     assert world.record["tickets_processed"] == 2
-    assert world.record["drafts_created"] == 0  # no draft row is written by this plan
+    assert world.record["drafts_created"] == 2  # the rows code wrote, never the agent's figure
     assert world.record["status"] == "partial"
 
 
