@@ -225,6 +225,7 @@ def _related_tickets(
             "limit": int(cfg.get("max_results", 3)),
         },
         token,
+        kind="related_lookup",
     )
     related = []
     for r in (resp or {}).get("results", []):
@@ -262,6 +263,7 @@ def hydrate_ticket(ticket: dict, settings: dict, token: str) -> dict:
     portal_id = int(settings.get("hubspot_portal_id", 0))
     email_limit = int(settings.get("conversation_email_limit", 10))
 
+    hs.record_call("email_thread")
     email_ids = hs.get_associated_ids(ticket_id, "emails", token, limit=email_limit)
     emails = hs.batch_read("emails", email_ids, hs.EMAIL_PROPERTIES, token)
     emails.sort(key=lambda e: (e.get("properties") or {}).get("hs_createdate") or "")
@@ -279,6 +281,7 @@ def hydrate_ticket(ticket: dict, settings: dict, token: str) -> dict:
             form_fields[prop_key] = value
 
     contact = {}
+    hs.record_call("contact_read")
     contact_ids = hs.get_associated_ids(ticket_id, "contacts", token, limit=1)
     if contact_ids:
         rows = hs.batch_read("contacts", contact_ids, hs.CONTACT_PROPERTIES, token)
@@ -290,6 +293,7 @@ def hydrate_ticket(ticket: dict, settings: dict, token: str) -> dict:
         contact["email"] = props["hs_all_associated_contact_emails"].split(";")[0].strip()
 
     company = {}
+    hs.record_call("company_read")
     company_ids = hs.get_associated_ids(ticket_id, "companies", token, limit=1)
     if company_ids:
         rows = hs.batch_read("companies", company_ids, hs.COMPANY_PROPERTIES, token)

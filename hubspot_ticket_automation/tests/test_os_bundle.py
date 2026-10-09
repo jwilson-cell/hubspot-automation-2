@@ -345,13 +345,15 @@ class QueueOpener:
     """Stands in for urlopen under the real request function: `opener(request, timeout=...)`.
 
     Answers from a queue, in order. An item is a JSON-able payload (a 200) or an
-    exception to raise. A request with nothing queued fails the test, so a test
-    states every request it allows.
+    exception to raise. A request with nothing queued raises and is kept in
+    `unexpected`: hydration's own handlers catch Exception, so `_hydrate` asserts
+    the list is empty rather than trusting the raise to fail the test.
     """
 
     def __init__(self, *answers) -> None:
         self._answers = list(answers)
         self.requests: list[urllib.request.Request] = []
+        self.unexpected: list[tuple[str, str]] = []
         self.on_request = None
 
     def __call__(self, request, timeout=None):
@@ -359,6 +361,7 @@ class QueueOpener:
         if self.on_request is not None:
             self.on_request(request)
         if not self._answers:
+            self.unexpected.append((request.get_method(), request.full_url))
             raise AssertionError(
                 f"unexpected HubSpot request: {request.get_method()} {request.full_url}"
             )
@@ -414,6 +417,7 @@ def _hydrate(monkeypatch: pytest.MonkeyPatch, ticket=None, settings=None, answer
             copy.deepcopy(SETTINGS if settings is None else settings),
             TOKEN,
         )
+    assert opener.unexpected == []  # every request this hydration sent was one the test allowed
     return context, opener
 
 
@@ -568,6 +572,7 @@ def test_every_request_of_a_hydration_belongs_to_exactly_one_recorded_kind(
         patch.setattr(time, "time", lambda: FIXED_NOW_S)
         hydrate.hydrate_ticket(copy.deepcopy(HS_TICKET), copy.deepcopy(SETTINGS), TOKEN)
 
+    assert opener.unexpected == []
     assert recorded == ["email_thread", "contact_read", "company_read", "related_lookup"]
     assert None not in owner_of_request  # no request before a kind was recorded
     requests_per_kind = {kind: owner_of_request.count(kind) for kind in recorded}
@@ -589,9 +594,19 @@ def test_a_hydration_with_no_order_number_records_no_related_lookup(
 ) -> None:
     ticket = copy.deepcopy(HS_TICKET)
     del ticket["properties"]["order_number"]
-    answers = [*_thread_answers(), _assoc("701"), _batch(HS_CONTACT), _assoc("801"), _batch(HS_COMPANY)]
+    # Only the follow-up email: the opening email's form block names an order number too.
+    answers = [
+        _assoc("503"),
+        _batch(EMAIL_FOLLOW_UP),
+        _assoc("701"),
+        _batch(HS_CONTACT),
+        _assoc("801"),
+        _batch(HS_COMPANY),
+    ]
 
-    _hydrate(monkeypatch, ticket=ticket, answers=answers)
+    context, _opener = _hydrate(monkeypatch, ticket=ticket, answers=answers)
+
+    assert "order_number" not in context["form_fields"]
 
     assert hubspot_api.snapshot_calls() == _zero(
         email_thread=1, contact_read=1, company_read=1, raw_requests=6
