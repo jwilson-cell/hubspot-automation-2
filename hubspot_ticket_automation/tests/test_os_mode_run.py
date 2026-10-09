@@ -1368,7 +1368,12 @@ def test_the_state_file_does_not_change_which_tickets_are_selected(
     assert refs_with_a_valid_state == [T1_HS_ID, T2_OS_ID, T3_HS_ID]
     assert deleted.refs == refs_with_a_valid_state
     assert garbage.refs == refs_with_a_valid_state
-    assert garbage.state_path.read_text(encoding="utf-8") == "{ this is not json"  # and not rewritten
+    # Nothing was read from the file to select. At the END of the pass code records
+    # the completed HubSpot-linked tickets in it (plan 23), which also replaces a
+    # missing or corrupt file with a valid one.
+    for rewritten in (deleted, garbage):
+        state = json.loads(rewritten.state_path.read_text(encoding="utf-8"))
+        assert set(state["ticket_fingerprints"]) == {T1_HS_ID, T3_HS_ID}
 
 
 def test_an_end_to_end_run_opens_no_real_token_secret_or_state_file(
@@ -1378,8 +1383,11 @@ def test_an_end_to_end_run_opens_no_real_token_secret_or_state_file(
         REAL_TOKEN_PATH.resolve(),
         REAL_SECRET_PATH.resolve(),
         REAL_STATE_PATH.resolve(),
-        world.state_path.resolve(),  # this mode has no use for any state file
     }
+    # The run's own (temp) state file is not opened while the run SELECTS: not
+    # before the agent is launched. The finalizer records the completed tickets
+    # in it afterwards (plan 23).
+    temp_state = world.state_path.resolve()
     attempts: list[str] = []
     real_open, real_read_text, real_read_bytes = builtins.open, Path.read_text, Path.read_bytes
 
@@ -1388,7 +1396,7 @@ def test_an_end_to_end_run_opens_no_real_token_secret_or_state_file(
             resolved = Path(target).resolve()
         except (TypeError, ValueError, OSError):
             return
-        if resolved in forbidden:
+        if resolved in forbidden or (resolved == temp_state and world.launch_attempts == 0):
             attempts.append(resolved.name)
             raise AssertionError("a real file was opened by an os-mode test")
 
@@ -1422,8 +1430,11 @@ def test_an_end_to_end_run_opens_no_real_token_secret_or_state_file(
 
 def test_the_runner_never_names_the_state_file_or_a_hubspot_search() -> None:
     text = Path(os_pass.__file__).read_text(encoding="utf-8")
-    for halves in (("state", ".json"), ("state", "_path"), ("search", "_tickets"), ("hubapi", ".com")):
+    for halves in (("state", ".json"), ("search", "_tickets"), ("hubapi", ".com")):
         assert "".join(halves) not in text
+    # The state file's path is named ONCE: handed, unread, to the one writer at the
+    # end of the finalizer (plan 23; tests/test_rollback_state.py checks the call).
+    assert text.count("state" + "_path") == 1
     tree = ast.parse(text)
     called = set()
     for node in ast.walk(tree):

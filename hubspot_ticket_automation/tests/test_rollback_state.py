@@ -22,12 +22,16 @@ no-database guards (tests/conftest.py).
 """
 from __future__ import annotations
 
+import ast
 import builtins
+import copy
 import inspect
 import json
+import logging
 import os
+from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator
 
 import pytest
 
@@ -40,7 +44,8 @@ from tests.test_os_mode_run import (  # noqa: F401 - fixtures, used by name
     world,
 )
 from tests.helpers import fakes
-from ticket_pipeline import source
+from tests.test_os_finalize import CONFLICT, E, completed, failed, finalize, make_entry, posts, result_of
+from ticket_pipeline import os_pass, source
 
 REAL_STATE_PATH = osm.REAL_STATE_PATH.resolve()
 REAL_CONFIG_DIR = REAL_STATE_PATH.parent
@@ -588,3 +593,372 @@ def test_the_state_helper_keeps_the_module_standard_library_only() -> None:
         if line.startswith(("import ", "from ")) and not line.startswith("from __future__")
     ]
     assert set(top_level) <= {"json", "os", "shutil", "sys", "tempfile", "time", "datetime", "pathlib", "typing"}
+
+
+# ===========================================================================
+# THE `os` FINALISER KEEPS THE STATE CURRENT (task 2)
+#
+# Fixture tickets: 1 and 3 have a HubSpot id, 2 has none. Ticket 3's numbers
+# are only in its form block, so its pass ends with the number backfill, a
+# HubSpot write of the pass itself.
+# ===========================================================================
+
+T1_UPDATED = "2026-10-08T10:00:00.500Z"  # the list fixture's hubspot_updated_at
+T3_UPDATED = "2026-10-09T07:20:30.456Z"
+STORED_LAST_RUN = "2026-09-01T00:00:00Z"
+SEARCH_PATH = "/crm/v3/objects/tickets/search"
+HUBSPOT_SETTINGS = {"active_stages": ["1", "2"], "per_run_cap": 25, "require_last_message_from_visitor": True}
+UNWRITABLE = "rollback_state_unwritable"
+EXC_MARKER = "ZZ-EXC-93-23"
+KEYS = {"num_notes", "processed_at", "hs_lastmodifieddate"}
+
+
+def code_written(processed_at: str, updated: Any) -> dict:
+    return {"num_notes": None, "processed_at": processed_at, "hs_lastmodifieddate": updated}
+
+
+def plus_ms(iso: str, ms: int) -> str:
+    moment = datetime.fromisoformat(iso.replace("Z", "+00:00")) + timedelta(milliseconds=ms)
+    return os_pass._iso_ms(moment)
+
+
+def empty_state(world: OsWorld, last_run_at: str = STORED_LAST_RUN) -> None:
+    """A state file that holds no fingerprint yet."""
+    world.state_path.write_text(
+        json.dumps({"last_run_at": last_run_at, "run_count": 7, "ticket_fingerprints": {}}), encoding="utf-8"
+    )
+
+
+def all_completed(*entries: dict) -> dict:
+    return result_of(*(completed(entry) for entry in entries))
+
+
+def flip_to_hubspot(world: OsWorld, hits: list) -> tuple:
+    """What the HubSpot path selects after the switch: its own loader over the
+    file the finaliser wrote, its own candidate rule, a fake search answering
+    `hits` as (ticket id, hs_lastmodifieddate). -> (decision, the search window's start in ms)"""
+    transport = fakes.FakeHubSpotTransport(
+        {
+            SEARCH_PATH: {
+                "results": [
+                    {"id": ticket_id, "properties": {"hs_lastmodifieddate": modified}}
+                    for ticket_id, modified in hits
+                ]
+            }
+        }
+    )
+    state = osm.pg._load_state(world.state_path)
+    decision = osm.pg.hubspot_candidates("hubspot", HUBSPOT_SETTINGS, state, "test-token", transport=transport)
+    assert transport.calls == [("POST", SEARCH_PATH)]
+    window = transport.bodies[0]["filterGroups"][0]["filters"][0]
+    assert window["propertyName"] == "hs_lastmodifieddate" and window["operator"] == "GT"
+    return decision, window["value"]
+
+
+def test_a_finalised_run_fingerprints_each_completed_hubspot_linked_ticket(world: OsWorld) -> None:
+    entries = [make_entry(0), make_entry(1), make_entry(2)]
+
+    summary = finalize(world, entries, all_completed(*entries))
+
+    assert summary.tickets_processed == 3 and summary.codes == {}
+    state = read(world.state_path)
+    # ticket 1's agent-written fingerprint (a numeric note count) is replaced;
+    # ticket 2 has no HubSpot id, so HubSpot can never select it: nothing is recorded
+    assert state["ticket_fingerprints"] == {
+        osm.T1_HS_ID: code_written(STAMP, T1_UPDATED),
+        osm.T3_HS_ID: code_written(STAMP, T3_UPDATED),
+    }
+    assert osm.T2_OS_ID not in json.dumps(state)
+    assert state["last_run_at"] == T3_UPDATED  # the latest among the completed, later than the stored one
+
+
+def test_processed_at_is_read_once_after_the_last_step_of_the_last_ticket(world: OsWorld) -> None:
+    ticking = world._now
+
+    def clock() -> Any:
+        world.timeline.append(("clock",))
+        return ticking()
+
+    world._now = clock  # type: ignore[method-assign]
+    entries = [make_entry(0), make_entry(2)]
+    finalize(world, entries, all_completed(*entries))
+
+    assert world.timeline.count(("clock",)) == 1 and world.timeline[-1] == ("clock",)
+    assert ("backfill", osm.T3_HS_ID) in world.timeline  # the pass's own HubSpot write came first
+    assert read(world.state_path)["ticket_fingerprints"][osm.T3_HS_ID]["processed_at"] == STAMP
+
+
+def test_a_failed_ticket_gets_no_fingerprint_and_stays_inside_the_search_window(world: OsWorld) -> None:
+    empty_state(world)
+    entries = [make_entry(0), make_entry(2)]
+
+    finalize(world, entries, result_of(failed(entries[0]), completed(entries[1])))
+
+    state = read(world.state_path)
+    assert state["ticket_fingerprints"] == {osm.T3_HS_ID: code_written(STAMP, T3_UPDATED)}
+    # ticket 3 was modified later than the failed ticket 1: moving the window's start
+    # to it would hide ticket 1 from the HubSpot search for good. It does not move.
+    assert state["last_run_at"] == STORED_LAST_RUN
+    decision, window_start = flip_to_hubspot(world, [(osm.T1_HS_ID, T1_UPDATED), (osm.T3_HS_ID, T3_UPDATED)])
+    assert window_start < source.iso_to_ms(T1_UPDATED)
+    assert decision["candidates"] == [osm.T1_HS_ID]
+
+
+def test_last_run_at_stops_short_of_a_linked_ticket_the_run_did_not_complete(world: OsWorld) -> None:
+    empty_state(world)
+    entries = [make_entry(0), make_entry(2)]
+
+    finalize(world, entries, result_of(completed(entries[0]), failed(entries[1])))
+
+    # ticket 1 (older) completed, ticket 3 (newer) failed: the start may move to
+    # ticket 1's time, which is still before ticket 3's
+    state = read(world.state_path)
+    assert state["last_run_at"] == T1_UPDATED
+    assert set(state["ticket_fingerprints"]) == {osm.T1_HS_ID}
+    decision, window_start = flip_to_hubspot(world, [(osm.T3_HS_ID, T3_UPDATED)])
+    assert window_start < source.iso_to_ms(T3_UPDATED) and decision["candidates"] == [osm.T3_HS_ID]
+
+
+def test_last_run_at_does_not_move_back_or_without_a_readable_time(world: OsWorld) -> None:
+    empty_state(world, last_run_at="2026-10-09T09:00:00Z")  # later than both tickets' times
+    entries = [make_entry(0), make_entry(2)]
+    finalize(world, entries, all_completed(*entries))
+    assert read(world.state_path)["last_run_at"] == "2026-10-09T09:00:00Z"
+
+
+def test_an_uncompleted_linked_ticket_with_no_known_time_holds_last_run_at(world: OsWorld) -> None:
+    empty_state(world)
+    unknown = make_entry(2, payload_edit=lambda payload: payload.update(hubspot_updated_at=None))
+    entries = [make_entry(0), unknown]
+
+    finalize(world, entries, result_of(completed(entries[0]), failed(unknown)))
+
+    state = read(world.state_path)
+    assert set(state["ticket_fingerprints"]) == {osm.T1_HS_ID}
+    assert state["last_run_at"] == STORED_LAST_RUN
+
+
+def test_a_ticket_no_bundle_entry_could_be_built_for_holds_last_run_at(world: OsWorld) -> None:
+    empty_state(world)
+    entry = make_entry(0)
+
+    finalize(world, [entry], all_completed(entry), unbundled=[{"os_ticket_id": osm.T3_OS_ID, "signal": None}])
+
+    state = read(world.state_path)
+    assert set(state["ticket_fingerprints"]) == {osm.T1_HS_ID}
+    assert state["last_run_at"] == STORED_LAST_RUN  # nothing is known of that ticket's HubSpot time
+
+
+def test_a_ticket_whose_write_back_answered_409_is_fingerprinted(world: OsWorld) -> None:
+    empty_state(world)
+    entry = make_entry(0)
+    world.os_api.script = [CONFLICT]  # an earlier pass already holds this signal
+
+    summary = finalize(world, [entry], all_completed(entry))
+
+    assert summary.tickets[0]["writeback"] == os_pass.WB_PROCESSED
+    assert read(world.state_path)["ticket_fingerprints"] == {osm.T1_HS_ID: code_written(STAMP, T1_UPDATED)}
+
+
+def test_a_drafted_ticket_the_os_did_not_record_gets_no_fingerprint(world: OsWorld) -> None:
+    empty_state(world)
+    before = world.state_path.read_bytes()
+    entry = make_entry(0)
+    world.os_api.script = [E("list_timeout"), E("list_timeout")]  # the write-back and its one retry
+
+    summary = finalize(world, [entry], all_completed(entry))
+
+    assert summary.tickets[0]["drafted"] is True and summary.tickets[0]["writeback"] == os_pass.WB_UNRECORDED
+    assert world.state_path.read_bytes() == before  # no ticket ended processed: the file is not touched
+
+
+def test_an_os_only_ticket_and_a_run_with_no_result_leave_the_file_untouched(world: OsWorld) -> None:
+    before = world.state_path.read_bytes()
+    os_only = make_entry(1)
+    assert os_only["hubspot_ticket_id"] is None
+
+    finalize(world, [os_only], all_completed(os_only))
+    finalize(world, [make_entry(0)], None)  # the agent left no result at all
+
+    assert world.state_path.read_bytes() == before
+    assert names(world.state_path.parent).count("state.json") == 1
+
+
+def test_a_dry_run_leaves_the_state_file_untouched(world: OsWorld) -> None:
+    before = world.state_path.read_bytes()
+    world.settings["dry_run"] = True
+    entries = [make_entry(0), make_entry(2)]
+
+    summary = finalize(world, entries, all_completed(*entries))
+
+    assert summary.dry_run is True and summary.tickets_processed == 2
+    assert world.state_path.read_bytes() == before
+
+
+def test_a_state_write_that_fails_is_a_code_and_changes_nothing_else(
+    make_world: Callable[..., OsWorld],
+) -> None:
+    # One world at a time: a world's fakes are module-level patches, so the
+    # second world is built only after the first has run.
+    working = make_world("working")
+    assert working.run() == 0
+
+    broken = make_world("broken")
+    broken.state_path = broken.base / "no-such-directory" / "state.json"  # the temp file cannot be made
+    assert broken.run() == 0
+
+    same = ("status", "tickets_processed", "drafts_created", "failure_reason_code", "hubspot_calls")
+    assert {k: broken.record.get(k) for k in same} == {k: working.record.get(k) for k in same}
+    assert working.record["status"] == "success" and working.record["tickets_processed"] == 3
+    assert working.record["drafts_created"] == 3
+    assert working.record["error_summary"] is None
+    assert broken.record["error_summary"] == f"{UNWRITABLE}=1"
+    # every ticket was still finalised: the same drafts, write-backs and HubSpot write
+    assert [d["draft_key"] for d in broken.drafts] == [d["draft_key"] for d in working.drafts]
+    assert len(broken.drafts) == 3 and len(posts(broken)) == len(posts(working)) == 3
+    assert broken.hubspot.patches == working.hubspot.patches and len(broken.hubspot.patches) == 1
+    assert not broken.state_path.parent.exists()
+    assert set(read(working.state_path)["ticket_fingerprints"]) == {osm.T1_HS_ID, osm.T3_HS_ID}
+
+
+def test_a_failed_state_write_logs_a_class_name_and_never_the_message(
+    world: OsWorld, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, capfd: pytest.CaptureFixture
+) -> None:
+    caplog.set_level(logging.DEBUG)
+    before = world.state_path.read_bytes()
+
+    def refuse(_path: Any, _state: dict) -> None:
+        raise OSError(f"cannot replace {EXC_MARKER}")
+
+    monkeypatch.setattr(source, "_replace_state", refuse)
+    entries = [make_entry(0), make_entry(1), make_entry(2)]
+    summary = finalize(world, entries, all_completed(*entries))
+
+    assert summary.codes == {UNWRITABLE: 1}
+    assert summary.tickets_processed == 3 and summary.partial is False
+    assert [ticket["writeback"] for ticket in summary.tickets] == [os_pass.WB_PROCESSED] * 3
+    assert world.state_path.read_bytes() == before
+    fakes.assert_marker_absent(EXC_MARKER, caplog, capfd)
+
+
+def test_after_three_os_runs_a_flip_to_hubspot_selects_none_of_the_completed_tickets(world: OsWorld) -> None:
+    """SPEC R15's acceptance. Three `os`-mode runs through the orchestrator,
+    each completing a different fixture ticket, over one temp state file. Then
+    the HubSpot path's own candidate rule over that file."""
+    listing = osm._list()
+    for index in (0, 1, 2):
+        world.os_api.unprocessed = {**listing, "tickets": [copy.deepcopy(listing["tickets"][index])]}
+        assert world.run() == 0
+    assert [(r["status"], r["tickets_processed"]) for r in world.client.records] == [("success", 1)] * 3
+    assert [draft["draft_key"] for draft in world.drafts] == [osm.T1_HS_ID, osm.T2_OS_ID, osm.T3_HS_ID]
+    assert world.hubspot.patches and world.hubspot.patches[0][0] == osm.T3_HS_ID  # run 3 wrote to HubSpot
+
+    state = osm.pg._load_state(world.state_path)
+    written = state["ticket_fingerprints"]
+    assert set(written) == {osm.T1_HS_ID, osm.T3_HS_ID}
+    # a fingerprint written by code never carries a note count: every one the three runs wrote
+    assert all(set(fp) == KEYS and fp["num_notes"] is None for fp in written.values())
+    assert [fp["hs_lastmodifieddate"] for fp in written.values()] == [T1_UPDATED, T3_UPDATED]
+    done_1, done_3 = (written[key]["processed_at"] for key in (osm.T1_HS_ID, osm.T3_HS_ID))
+    assert source.iso_to_ms(done_1) < source.iso_to_ms(done_3)  # each run's own finishing instant
+    assert state["last_run_at"] == T3_UPDATED
+
+    # 1. HubSpot reports every completed ticket, unchanged since the mirror saw it: none is a candidate
+    decision, window_start = flip_to_hubspot(world, [(osm.T1_HS_ID, T1_UPDATED), (osm.T3_HS_ID, T3_UPDATED)])
+    assert decision["candidates"] == [] and decision["decision"] == "no_work"
+    assert [hit["deduped"] for hit in decision["matched"]] == [True, True]
+    assert window_start == source.iso_to_ms(T3_UPDATED)
+
+    # 2. modified up to the very instant each pass finished (ticket 3's own
+    #    backfill write is such a change): still none
+    decision, _ = flip_to_hubspot(world, [(osm.T1_HS_ID, done_1), (osm.T3_HS_ID, done_3)])
+    assert decision["candidates"] == [] and decision["decision"] == "no_work"
+
+    # 3. ticket 1 got a new message after its pass finished: it IS a candidate, ticket 3 is not
+    new_message = plus_ms(done_1, 1)
+    decision, window_start = flip_to_hubspot(world, [(osm.T1_HS_ID, new_message), (osm.T3_HS_ID, done_3)])
+    assert decision["candidates"] == [osm.T1_HS_ID] and decision["decision"] == "run_agent"
+    assert window_start < source.iso_to_ms(new_message)  # and the search would return it
+
+    # the three runs and the flip never opened the tracked state file
+    assert _REAL_FILE_LEDGER == []
+    assert world.state_path.resolve() != REAL_STATE_PATH
+
+
+def test_a_ticket_the_os_holds_no_hubspot_time_for_is_judged_by_processed_at_both_ways(world: OsWorld) -> None:
+    empty_state(world)
+    entry = make_entry(0, payload_edit=lambda payload: payload.update(hubspot_updated_at=None))
+
+    finalize(world, [entry], all_completed(entry))
+
+    state = read(world.state_path)
+    assert state["ticket_fingerprints"] == {osm.T1_HS_ID: code_written(STAMP, None)}
+    assert state["last_run_at"] == STORED_LAST_RUN  # no readable time to move it to
+    not_again, _ = flip_to_hubspot(world, [(osm.T1_HS_ID, STAMP)])
+    assert not_again["candidates"] == []  # completed in `os` mode: not processed again
+    picked_up, _ = flip_to_hubspot(world, [(osm.T1_HS_ID, plus_ms(STAMP, 1))])
+    assert picked_up["candidates"] == [osm.T1_HS_ID]  # a change after the pass: picked up
+
+
+def test_the_stated_limit_a_hubspot_change_made_while_the_pass_ran_is_not_a_candidate(world: OsWorld) -> None:
+    """The limit of `processed_at`, pinned so it is not mistaken for more.
+
+    The pass's own number backfill changes the ticket in HubSpot before the
+    pass finishes, so "finished" is the earliest instant that covers the
+    pass's own echo. HubSpot keeps ONE modified time per ticket: a client
+    message that reached HubSpot after the mirror's copy and before the pass
+    finished looks exactly like that echo and is deduped with it. This is rule
+    (b) of the candidate rule, as the HubSpot path has always applied it to its
+    own passes. In `os` mode the OS's marker still holds that message as
+    unprocessed, so it is lost only if the switch back happens before the next
+    `os` run."""
+    empty_state(world)
+    entry = make_entry(2)
+    finalize(world, [entry], all_completed(entry))
+    assert world.hubspot.patches  # the echo exists
+
+    during_the_pass = plus_ms(STAMP, -4000)
+    assert source.iso_to_ms(T3_UPDATED) < source.iso_to_ms(during_the_pass) < source.iso_to_ms(STAMP)
+    decision, _ = flip_to_hubspot(world, [(osm.T3_HS_ID, during_the_pass)])
+    assert decision["candidates"] == []
+
+
+def test_a_fingerprint_lost_to_an_overlap_costs_one_candidate_after_the_flip(world: OsWorld) -> None:
+    """The bound of STATE-FILE-RACE, at the candidate rule: the ticket whose
+    fingerprint an overlapping run dropped is selected once more after a switch
+    back (its draft then goes through the replace of the rollback path, so no
+    second pending draft). The other run's ticket is not selected."""
+    empty_state(world)
+    path = world.state_path
+    read_by_a, read_by_b = source._read_state(path), source._read_state(path)
+    source._replace_state(
+        path, source._merge_state(read_by_a, {osm.T1_HS_ID: source.fingerprint_entry(STAMP, T1_UPDATED)})
+    )
+    source._replace_state(
+        path, source._merge_state(read_by_b, {osm.T3_HS_ID: source.fingerprint_entry(STAMP, T3_UPDATED)})
+    )
+
+    decision, _ = flip_to_hubspot(world, [(osm.T1_HS_ID, T1_UPDATED), (osm.T3_HS_ID, T3_UPDATED)])
+    assert decision["candidates"] == [osm.T1_HS_ID]
+
+
+def test_the_finaliser_hands_the_state_path_to_the_one_writer_and_never_reads_it() -> None:
+    text = Path(os_pass.__file__).read_text(encoding="utf-8")
+    tree = ast.parse(text)
+    writer_calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and (node.func.attr if isinstance(node.func, ast.Attribute) else getattr(node.func, "id", ""))
+        == "merge_fingerprints"
+    ]
+    assert len(writer_calls) == 1  # one call per run
+    path_uses = [node for node in ast.walk(tree) if isinstance(node, ast.Attribute) and node.attr == "state_path"]
+    assert len(path_uses) == 1 and writer_calls[0].args[0] is path_uses[0]
+    called = {
+        node.func.attr if isinstance(node.func, ast.Attribute) else getattr(node.func, "id", "")
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+    }
+    assert not called & {"_read_state", "_load_state", "_merge_state", "_replace_state", "unprocessed_candidates"}
+    assert "state" + ".json" not in text
