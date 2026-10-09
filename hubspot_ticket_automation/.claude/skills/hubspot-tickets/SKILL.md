@@ -34,6 +34,41 @@ Before doing anything, verify:
    - `urgent_signals` (list of strings/regex) — keywords/phrases that force priority=urgent.
 3. Read `config/state.json` to get `last_run_at`. If empty, use the timestamp from 24h ago.
 
+## Source mode (Phase 93) — run this guard FIRST
+
+Pack'N OS has one owner-controlled switch for where the automation gets its
+tickets: `hubspot`, `shadow` or `os`. **This skill serves `hubspot` and `shadow`.**
+It does not serve `os` — in that mode tickets come from Pack'N OS and this skill
+must not run at all.
+
+Your FIRST step — before the discovery step, before Step 0, before any HubSpot
+call of any kind — is to run this guard from the project root:
+
+```bash
+py -m ticket_pipeline.source --require hubspot,shadow; echo "guard_exit=$?"
+```
+
+- **`guard_exit=0`** → the command printed the mode (`hubspot` or `shadow`).
+  Continue with this skill.
+- **Any other exit** → **STOP at once.** Report the token the command printed
+  (`SOURCE_MODE_NOT_SERVED <mode>`, `SOURCE_MODE_UNKNOWN` or
+  `SOURCE_MODE_UNREADABLE`) in one line and do nothing else: no HubSpot search,
+  no ticket fetch, no draft, no state write, no run log, no run record. The
+  guard has already written the run's record when one was needed.
+
+The guard takes the mode from `PACKN_SOURCE_MODE` when the wrapper started this
+run, and otherwise reads the Pack'N OS setting itself, so a hand-run obeys the
+same switch as a scheduled one. Never work the mode out any other way, and
+never assume `hubspot` when the guard does not answer.
+
+**Under the wrapper.** When the environment variable `PACKN_RUN_ID` is set
+(check with `echo "${PACKN_RUN_ID:-}"`), this run was started by
+`scripts/run_tickets.py`. The wrapper has already reported the schedule and
+passed the routine gate, and it writes this run's one `automation_runs` record
+itself, from the result file you write in Step 4.5. Under the wrapper this
+overrides every other instruction in this file about a run record: skip Steps
+0a and 0b, and never call `client.write_run_record`.
+
 ## Discovery step (first run only)
 
 If `pipeline_id` or `active_stages` are empty in `settings.yaml`:
@@ -94,27 +129,35 @@ install + env-var + Postgres GRANT setup.
 
 ## Step 0: Pack'N OS routine gate + run-record start (NEW — Phase 4)
 
-> **Pre-gate note (2026-07-06):** cron invocations arrive via
-> `scripts/run_tickets.sh`, which runs `scripts/pregate_tickets.py` FIRST.
-> The pre-gate performs the Step 0a schedule report, the Step 0b routine
-> gate, the rerun-queue check, and the Step 1 HubSpot poll deterministically
-> — and skips launching this skill entirely when there is no work. If you
-> are running, either work likely exists or the pre-gate failed open. Still
-> execute Steps 0–1 exactly as written below (manual `/packn-tickets` runs
-> bypass the pre-gate, and the double-check is cheap); a zero-ticket result
-> here remains a normal clean exit.
+> **Wrapper note (Phase 93):** scheduled runs AND Run now arrive via
+> `scripts/run_tickets.sh`, which runs `scripts/run_tickets.py` FIRST. That
+> wrapper performs the Step 0a schedule report, the Step 0b routine gate, the
+> rerun-queue check, and the Step 1 HubSpot poll deterministically — and does
+> not launch this skill at all when there is no work. If you are running,
+> either work likely exists or the pre-gate decision failed open.
+>
+> - **`PACKN_RUN_ID` is set (you are under the wrapper):**
+>   SKIP Steps 0a and 0b — both are already done — and
+>   do NOT write a `skipped` run record.
+>   Go straight to the rerun-queue poll below, then to Step 1.
+> - **`PACKN_RUN_ID` is not set (a hand-run of `/packn-tickets`):** execute
+>   Steps 0a and 0b exactly as written below.
+>
+> In both cases still run the rerun-queue poll and Step 1 exactly as written
+> (the double-check is cheap); a zero-ticket result here remains a normal
+> clean exit.
 
 ### Step 0a: Report current crontab schedule to Pack'N OS
 
 Run BEFORE the gate so Pack'N OS knows the cron fired, even when the routine
 is paused. Fire-and-forget — failures do NOT block the rest of Step 0.
 
-The marker `cron_tickets.sh` is the wrapper script invoked by the droplet
-crontab (`/opt/packn/hubspot_ticket_automation/scripts/cron_tickets.sh`).
-If the operator renames the wrapper, update the marker here too.
+The marker `run_tickets.sh` is the wrapper script invoked by the droplet
+crontab (`/opt/packn/hubspot_ticket_automation/scripts/run_tickets.sh`).
+The wrapper's filename must not change; if it ever does, update the marker here too.
 
 ```bash
-py -c "from packn_os_hubspot_client import client; client.report_routine_schedule('tickets-process', 'cron_tickets.sh')"
+py -c "from packn_os_hubspot_client import client; client.report_routine_schedule('tickets-process', 'run_tickets.sh')"
 ```
 
 ### Step 0b: Routine gate
@@ -161,7 +204,7 @@ print(json.dumps([{'id': str(r['id']), 'ticket_id': r['ticket_id']} for r in row
 For each row in the JSON output:
 1. Hydrate ticket context for `ticket_id` (steps 2a + 2a.5 below).
 2. Run classify + draft + extract_actions (steps 2b–2e).
-3. Call `client.write_draft(...)` with the draft (Step 2f auto-send branch
+3. Call `client.write_cron_draft(...)` with the draft (Step 2f auto-send branch
    below — same path).
 4. Mark the rerun processed:
    ```bash
@@ -544,17 +587,21 @@ Also compose an **auto-send subject** (used in both paths so the queued record h
 
    *(no token required for Postgres writes; skip the rate_limit shellout)*
 
-3. Call `client.write_draft` to INSERT a `pending` row into
+3. Call `client.write_cron_draft` to INSERT a `pending` row into
    `automation_drafts`. Idempotency triple is `(tenant_id, routine_name,
    ticket_id, prompt_version)` — replays return the existing draft_id, so
    it's safe to re-run the cron over a ticket that's already been drafted
-   in a prior tick.
+   in a prior tick. `write_cron_draft` takes the same arguments as
+   `write_draft`: when the wrapper's run context names a cycle for this
+   ticket (an operator rerun, or a `shadow`-mode pass) it atomically
+   replaces the earlier pending draft with this one, and with no cycle key
+   it behaves exactly as before.
 
    ```bash
    py -c "
    import json
    from packn_os_hubspot_client import client
-   draft_id = client.write_draft(
+   draft_id = client.write_cron_draft(
        ticket_id='<ticket_id>',
        routine_name='tickets-process',
        draft_body='<drafted reply from step 2d, plain text>',
@@ -606,13 +653,13 @@ operator's surface in Pack'N OS.
 **Draft path** (`is_auto_send == false`, or auto-send fell through):
 
 - If `dry_run: true` → log what would have been posted to `outputs/runs/<timestamp>.md`.
-- Else → use `py -c` to invoke `packn_os_hubspot_client.client.write_draft` with the ticket snapshot. This writes a row to Pack'N OS `automation_drafts` with `state='pending'`; the OS-side approval queue picks it up at `/automation/drafts`. **The draft branch NO LONGER creates a HubSpot draft engagement note.** The Pack'N OS UI is the operator surface (Phase 4 D-04 — ALL customer replies now in automation_drafts; Phase 4.1 D-02 closes the partial cutover).
+- Else → use `py -c` to invoke `packn_os_hubspot_client.client.write_cron_draft` with the ticket snapshot (the same call, for the same reason, as the auto-send branch's step 3). This writes a row to Pack'N OS `automation_drafts` with `state='pending'`; the OS-side approval queue picks it up at `/automation/drafts`. **The draft branch NO LONGER creates a HubSpot draft engagement note.** The Pack'N OS UI is the operator surface (Phase 4 D-04 — ALL customer replies now in automation_drafts; Phase 4.1 D-02 closes the partial cutover).
 
   ```bash
   py -c "
   import json
   from packn_os_hubspot_client import client
-  draft_id = client.write_draft(
+  draft_id = client.write_cron_draft(
       ticket_id='<ticket_id>',
       routine_name='tickets-process',
       draft_body='<drafted reply from step 2d, plain text>',
@@ -896,9 +943,19 @@ Create `outputs/runs/<ISO timestamp>.md` with:
 
 ### 4.5. Pack'N OS run-record finish (NEW — Phase 4)
 
-After the run log is written, persist the tick's outcome to the Pack'N OS
-`automation_runs` table. This row is the source of truth for the OS-side
-status panel + alert detection (CONTEXT D-03, D-13).
+After the run log is written, hand the tick's outcome over so that it reaches
+the Pack'N OS `automation_runs` table. That row is the source of truth for the
+OS-side status panel + alert detection (CONTEXT D-03, D-13). WHO writes the row
+depends on how this run was started — check `echo "${PACKN_RESULT_PATH:-}"`:
+
+- **`PACKN_RESULT_PATH` is set (you are under the wrapper)** → write the
+  **result file** described below and do NOT call `client.write_run_record`.
+  The wrapper turns the file into the run's one record. A second record
+  written by you would be a duplicate.
+- **`PACKN_RESULT_PATH` is not set (a hand-run)** → write the run record
+  yourself with `client.write_run_record`, as described further below.
+
+The `status` rule and the counters are the same in both cases.
 
 Decide `status` based on counters:
 - `success` — at least one ticket processed AND no MCP errors AND no
@@ -915,6 +972,61 @@ Build `error_summary` (free-text, ≤ 8KB; the helper truncates the LAST
 MCP errors, image errors, write_draft failures, urgent-send failures,
 and Sheets sync failures observed during this run. If no errors, pass
 `None`.
+
+**Under the wrapper (`PACKN_RESULT_PATH` set): write the result file.** One
+JSON object, written once, at the path the variable names. Same `status`,
+same counters as above (a run that processed zero tickets and hit no error is
+`success` with zeros). In this file `error_summary` holds codes, counts and
+ticket ids only — never a message body, a subject line, a draft or a
+customer's words; `None` when there were no errors. `tickets` has one entry
+per ticket processed this run (reruns included): its `ref` (the HubSpot ticket
+id), its `outcome` (`completed`, or `failed` with a short lower-case
+`failure_reason_code` such as `write_draft_failed`, `image_processing_error`
+or `mcp_error`), its `classification` from step 2b, the `draft_id` that step
+2f returned (omit it when no draft was written), and its `action_items` from
+step 2e. Do not put the draft's text in this file.
+
+```bash
+py -c "
+import json, os
+result = {
+    'run_id': os.environ['PACKN_RUN_ID'],
+    'status': '<success|partial|failure>',
+    'tickets_processed': <counters.tickets_processed>,
+    'drafts_created': <counters.notes_posted + counters.auto_sends>,
+    'error_summary': <None, or 'codes, counts and ticket ids only'>,
+    'tickets': [
+        {
+            'ref': '<ticket_id>',
+            'outcome': '<completed|failed>',
+            'failure_reason_code': '<only when failed>',
+            'classification': {
+                'category': '<classifier.category>',
+                'form_topic': <ticket_context.topic_of_ticket or None>,
+                'priority': '<classifier.priority>',
+                'confidence': <classifier.confidence>,
+                'reason': '<classifier.reason>',
+            },
+            'draft_id': '<draft_id from step 2f>',
+            'action_items': <the action_items list from step 2e>,
+        },
+        # ... one entry per processed ticket
+    ],
+}
+path = os.environ['PACKN_RESULT_PATH']
+os.makedirs(os.path.dirname(path), exist_ok=True)
+with open(path + '.tmp', 'w', encoding='utf-8') as fh:
+    json.dump(result, fh, ensure_ascii=False)
+os.replace(path + '.tmp', path)
+"
+```
+
+If writing the result file fails, log the failure to the run log with a
+`!! RESULT_FILE_WRITE_FAILED` marker and continue to Step 5; the wrapper
+records the run as a failure (`agent_exited_abnormally`). Do NOT fall back to
+`client.write_run_record`.
+
+**Hand-run (`PACKN_RESULT_PATH` not set): write the run record yourself.**
 
 ```bash
 py -c "

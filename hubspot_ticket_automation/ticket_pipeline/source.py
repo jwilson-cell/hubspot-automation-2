@@ -38,8 +38,16 @@ pre-gate (`scripts/pregate_tickets.py`, which re-exports them) and the
 engine-shadow pipeline (`ticket_pipeline/run.py`) import them, so the two can
 never see different queues.
 
+THE SKILL'S GUARD
+-----------------
+The agent skill is the third reader of the setting. Its first step is
+`python -m ticket_pipeline.source --require <modes>` (`skill_guard`): exit 0
+and the mode when the skill serves it, exit 3 when it does not, exit 4 when the
+mode is unknown or unreadable. The skill stops on anything but 0.
+
 This module imports the standard library only. The database client is imported
-inside `resolve_mode`, so the pure functions stay usable without a driver.
+inside `resolve_mode` and inside the guard's record write, so the pure
+functions stay usable without a driver.
 """
 from __future__ import annotations
 
@@ -173,18 +181,64 @@ def current_mode(
 
 
 # ===========================================================================
-# THE SKILL'S GUARD (Phase 93, plan 15) — SKELETON: names only, no behaviour
+# THE SKILL'S GUARD (Phase 93, plan 15)
+#
+# The agent skill is the third reader of the one setting, and it is prose: it
+# cannot branch in code. So its FIRST step is this guard, run as a command:
+#
+#     python -m ticket_pipeline.source --require hubspot,shadow
+#
+# The skill goes on only when the command exits 0. That holds for a run started
+# by the wrapper AND for one started around it — a hand-run of the slash
+# command, or a stale scheduler line that launches the skill directly: such a
+# run can no longer search HubSpot while the owner's switch says Pack'N OS.
 # ===========================================================================
 
-GUARD_EXIT_SERVED = 0
-GUARD_EXIT_USAGE = 2
-GUARD_EXIT_NOT_SERVED = 3
-GUARD_EXIT_NOT_ESTABLISHED = 4
-TOKEN_NOT_SERVED = "SOURCE_MODE_NOT_SERVED"
+GUARD_EXIT_SERVED = 0  # the mode is one the skill serves; stdout is the mode
+GUARD_EXIT_USAGE = 2  # the command line was wrong; nothing was read or written
+GUARD_EXIT_NOT_SERVED = 3  # a recognised mode the skill does not serve
+GUARD_EXIT_NOT_ESTABLISHED = 4  # the mode is unknown, or could not be read
+
+TOKEN_NOT_SERVED = "SOURCE_MODE_NOT_SERVED"  # printed as "SOURCE_MODE_NOT_SERVED <mode>"
 TOKEN_UNKNOWN = "SOURCE_MODE_UNKNOWN"
 TOKEN_UNREADABLE = "SOURCE_MODE_UNREADABLE"
+
+# Set by scripts/run_tickets.py for every child of a run it started.
 RUN_ID_ENV = "PACKN_RUN_ID"
 GUARD_ROUTINE = "tickets-process"
+
+
+def _guard_record(
+    write_record: Optional[Callable[..., Any]],
+    status: str,
+    summary: str,
+    source_mode: Optional[str],
+    failure_reason_code: Optional[str],
+) -> None:
+    """Write the one record of a run the guard stopped outside the wrapper. A
+    failure of the write is one code line on stderr; the stop holds either way."""
+    failure: Optional[str] = None
+    try:
+        if write_record is None:
+            from packn_os_hubspot_client import client  # lazy: needs the database driver
+
+            write_record = client.write_run_record
+        moment = datetime.now(timezone.utc).isoformat()
+        write_record(
+            GUARD_ROUTINE,
+            status,
+            summary,
+            0,
+            0,
+            moment,
+            moment,
+            source_mode=source_mode,
+            failure_reason_code=failure_reason_code,
+        )
+    except Exception as e:  # noqa: BLE001 — the record is best effort, the stop is not
+        failure = type(e).__name__
+    if failure is not None:
+        _log(f"guard_record_unwritable:{failure}")
 
 
 def skill_guard(
@@ -192,12 +246,80 @@ def skill_guard(
     env: Optional[Mapping[str, str]] = None,
     reader: Optional[Callable[[], Any]] = None,
     write_record: Optional[Callable[..., Any]] = None,
-) -> tuple[Any, Any]:
-    return None, None
+) -> tuple[int, str]:
+    """May a skill that serves the modes in `served` run now? -> (exit code, token)
+
+        (0, "<mode>")                       the mode is in `served`: go on
+        (3, "SOURCE_MODE_NOT_SERVED <mode>")  another recognised mode: stop
+        (4, "SOURCE_MODE_UNKNOWN")          a value this code does not know: stop
+        (4, "SOURCE_MODE_UNREADABLE")       the setting could not be read: stop
+
+    The mode comes from PACKN_SOURCE_MODE in `env` when it is set (the wrapper
+    read the setting once; a run finishes in the mode it started in), and
+    otherwise from `resolve_mode(reader)` — the ONE reader of the setting.
+    There is no default for an error.
+
+    WHO WRITES THE RECORD OF A STOPPED RUN
+    Under the wrapper (PACKN_RUN_ID set in `env`) the guard writes nothing: the
+    wrapper's one record covers the run. Outside it, a stop is written here, so
+    a stopped hand-run is visible on the Pack'N OS card instead of silent:
+
+        not served          `skipped`, summary `skill: source_mode_<mode>_not_served`,
+                            source_mode = the mode
+        unknown/unreadable  `failure`, summary `skill: <code>`, reason code
+                            source_unknown / source_unreadable, no source mode
+
+    `write_record` is called like client.write_run_record (seven positional
+    values, then source_mode= and failure_reason_code=); the default is that
+    function, imported lazily. If the write fails, one code line goes to stderr
+    and the answer is unchanged.
+
+    `served` holding a name outside the three modes is a ValueError.
+    """
+    wanted = tuple(served)
+    for name in wanted:
+        if name not in MODES:
+            raise ValueError(f"not a source mode: {name!r}")
+    environ = os.environ if env is None else env
+    wrapped = bool(environ.get(RUN_ID_ENV))
+
+    code: Optional[str] = None
+    mode: Optional[str] = None
+    try:
+        mode = current_mode(reader, environ)
+    except SourceModeError as e:
+        code = e.code
+    if code is not None:
+        if not wrapped:
+            _guard_record(write_record, "failure", f"skill: {code}", None, code)
+        return GUARD_EXIT_NOT_ESTABLISHED, TOKEN_UNKNOWN if code == SOURCE_UNKNOWN else TOKEN_UNREADABLE
+    if mode in wanted:
+        return GUARD_EXIT_SERVED, mode
+    if not wrapped:
+        _guard_record(write_record, "skipped", f"skill: source_mode_{mode}_not_served", mode, None)
+    return GUARD_EXIT_NOT_SERVED, f"{TOKEN_NOT_SERVED} {mode}"
 
 
 def main(argv: Optional[list] = None) -> int:
-    return None  # type: ignore[return-value]
+    """`python -m ticket_pipeline.source --require <mode>[,<mode>...]`
+
+    Prints the guard's token on stdout and returns its exit code. Anything else
+    on the command line — no list, an empty list, a name that is not one of the
+    three modes, an extra argument — is a usage error: exit 2, and nothing is
+    read or written.
+    """
+    args = list(sys.argv[1:] if argv is None else argv)
+    names = args[1].split(",") if len(args) == 2 and args[0] == "--require" else []
+    if not names or any(name not in MODES for name in names):
+        print(
+            "usage: python -m ticket_pipeline.source --require <mode>[,<mode>...]   "
+            f"(modes: {', '.join(MODES)})",
+            file=sys.stderr,
+        )
+        return GUARD_EXIT_USAGE
+    code, token = skill_guard(tuple(names))
+    print(token)
+    return code
 
 
 # ===========================================================================
@@ -331,3 +453,7 @@ def unprocessed_candidates(results: list[dict], fingerprints: dict) -> list[str]
             continue
         candidates.append(ticket_id)
     return candidates
+
+
+if __name__ == "__main__":
+    sys.exit(main())

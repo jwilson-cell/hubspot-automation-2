@@ -3,8 +3,15 @@
 #
 # Operator clicks "Run now" in Pack'N OS → an automation_run_requests row
 # lands in Postgres. This script runs on a tight cron (~every 5 min),
-# atomically claims the oldest pending row, and invokes the matching
-# Claude routine.
+# atomically claims the oldest pending row, and starts the matching routine.
+#
+# Phase 93 (2026-10): a `tickets-process` request no longer launches the agent
+# from here. It goes through the same door as a scheduled tick —
+# scripts/run_tickets.sh → scripts/run_tickets.py — so a pressed Run now reads
+# the ticket source mode, fails closed on a setting it cannot read, forwards
+# action items afterwards, and writes its own run record whatever happens to
+# the agent. (Before, Run now bypassed all of that.) The `digest` routine is
+# still launched directly.
 #
 # Designed to be cheap when there's no work: the claim helper exits ~50ms
 # when the queue is empty (one indexed query, no Claude invocation), so
@@ -22,10 +29,14 @@
 # wrapper, the regular 12h cron, and any overlapping 5-min poll cannot
 # double-claim the same row.
 #
-# Linking the resulting automation_runs row back to the request via
-# resulting_run_id is a v2 enhancement (would require GRANT SELECT on
-# automation_runs which the role doesn't have today). For now, operators
-# correlate by timestamp in the routine detail page's "Recent runs" list.
+# Linking the run back to the request: for `tickets-process` the orchestrator
+# does it. scripts/run_tickets.py generates the run's id itself, writes the
+# automation_runs row under that id, and then calls
+# client.mark_manual_run_completed(<request id>, <run id>) — no SELECT on
+# automation_runs is needed, because the id is never read back. When the
+# record could not be written the request is linked to no run. A `digest`
+# request is still correlated by timestamp in the routine detail page's
+# "Recent runs" list.
 
 set -u
 
@@ -62,10 +73,12 @@ echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] manual-run poll: claimed request $REQUEST
 
 case "$ROUTINE" in
     tickets-process)
-        # Pin MUST match scripts/run_tickets.sh — a manual run and a cron run
-        # must draft with the same model (this was sonnet-4-6 vs the cron's
-        # sonnet-4-5 until the 2026-07-23 audit unified everything on sonnet-5).
-        exec claude -p /packn-tickets --model claude-sonnet-5 --dangerously-skip-permissions
+        # The same entry point as the scheduled tick, with the claimed request
+        # id. The agent, its model pin (AGENT_MODEL in scripts/run_tickets.py)
+        # and the run record all live behind it, so a manual run and a cron
+        # run cannot drift apart again (they once drafted with different
+        # models). The wrapper's exit status is this script's.
+        exec bash scripts/run_tickets.sh --manual-request "$REQUEST_ID"
         ;;
     digest)
         # Pinned 2026-07-23 — an unpinned invocation runs the CLI default,
