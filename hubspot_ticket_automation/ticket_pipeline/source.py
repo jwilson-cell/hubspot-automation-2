@@ -45,16 +45,31 @@ The agent skill is the third reader of the setting. Its first step is
 and the mode when the skill serves it, exit 3 when it does not, exit 4 when the
 mode is unknown or unreadable. The skill stops on anything but 0.
 
+THE STATE FILE, KEPT CURRENT BY CODE
+------------------------------------
+The candidate rule reads a local state file: `last_run_at` (where the search
+starts) and `ticket_fingerprints` (what is already done). In `os` mode that
+file decides nothing, but the owner can switch back to `hubspot` at any time
+and the HubSpot path then trusts it at once. So the `os` finalizer records each
+ticket it completed through `merge_fingerprints`, the one place code writes
+the file: a ticket completed from the OS is not a HubSpot candidate after a
+switch back, and becomes one again as soon as HubSpot reports a change later
+than the moment its pass finished.
+
 This module imports the standard library only. The database client is imported
 inside `resolve_mode` and inside the guard's record write, so the pure
 functions stay usable without a driver.
 """
 from __future__ import annotations
 
+import json
 import os
+import shutil
 import sys
+import tempfile
 import time
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any, Callable, Mapping, Optional
 
 MODE_HUBSPOT = "hubspot"
@@ -460,24 +475,167 @@ def unprocessed_candidates(results: list[dict], fingerprints: dict) -> list[str]
 # ===========================================================================
 
 
+STATE_FINGERPRINTS_KEY = "ticket_fingerprints"
+STATE_LAST_RUN_KEY = "last_run_at"
+
+
 def fingerprint_entry(processed_at_iso: Any, hubspot_updated_at: Any) -> dict:
-    return {}
+    """The fingerprint code writes for a ticket a pass completed:
+
+        {"num_notes": None, "processed_at": <when the pass finished>,
+         "hs_lastmodifieddate": <the OS's copy of HubSpot's modified time>}
+
+    `num_notes` is ALWAYS None. The OS holds no note count, and a made-up one
+    is worse than none: a large value would silence the ticket for good once
+    the source is switched back to HubSpot. `unprocessed_candidates` judges
+    such a fingerprint by `processed_at`.
+
+    `processed_at_iso` must be an instant `iso_to_ms` can read (ValueError
+    otherwise): it is the value the dedupe rests on. `hubspot_updated_at` may
+    be anything; a value the candidate rule could not read is written as None.
+    """
+    if iso_to_ms(processed_at_iso) is None:
+        raise ValueError("a fingerprint needs a readable processed_at")
+    updated = hubspot_updated_at if iso_to_ms(hubspot_updated_at) is not None else None
+    return {"num_notes": None, "processed_at": processed_at_iso, "hs_lastmodifieddate": updated}
 
 
 def _read_state(state_path: Any) -> dict:
-    return {}
+    """The state file as a dict. A file that is not there, is empty, is not
+    JSON or is not a JSON object reads as {} (the pre-gate's loader reads it
+    the same way). A file that is there and cannot be READ (held open, no
+    permission) raises: it is not an empty file, and treating it as one would
+    replace every fingerprint it holds."""
+    try:
+        raw = Path(state_path).read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return {}
+    except ValueError:  # bytes that are not UTF-8
+        return {}
+    try:
+        data = json.loads(raw) if raw.strip() else {}
+    except ValueError:
+        return {}
+    return data if isinstance(data, dict) else {}
 
 
 def _merge_state(state: dict, entries: Any, last_run_at: Any = None) -> dict:
-    return {}
+    """`state` with the fingerprints of `entries` merged over the stored ones
+    and `last_run_at` moved forward. Pure: `state` is not changed, and every
+    other top-level key and every other fingerprint is carried over as it is.
+
+    An entry is rebuilt through `fingerprint_entry`, so nothing a caller passes
+    can put a numeric note count or a fourth key into the file. An entry with
+    no readable `processed_at`, or under a key that is not non-empty text, is
+    skipped. A stored fingerprint whose own `processed_at` is LATER than the
+    entry's is kept: the newer `processed_at` wins.
+
+    `last_run_at` moves to the given instant only when that is later than the
+    stored one (or nothing readable is stored). None, or a value that cannot
+    be read as an instant, moves nothing.
+    """
+    merged = dict(state)
+    stored = merged.get(STATE_FINGERPRINTS_KEY)
+    fingerprints = dict(stored) if isinstance(stored, dict) else {}
+    changed = False
+    for ticket_id, entry in (entries.items() if isinstance(entries, dict) else ()):
+        if not (isinstance(ticket_id, str) and ticket_id.strip()) or not isinstance(entry, dict):
+            continue
+        stamp_ms = iso_to_ms(entry.get("processed_at"))
+        if stamp_ms is None:
+            continue
+        existing = fingerprints.get(ticket_id)
+        if isinstance(existing, dict):
+            existing_ms = iso_to_ms(existing.get("processed_at"))
+            if existing_ms is not None and existing_ms > stamp_ms:
+                continue
+        fingerprints[ticket_id] = fingerprint_entry(
+            entry.get("processed_at"), entry.get("hs_lastmodifieddate")
+        )
+        changed = True
+    if changed:
+        merged[STATE_FINGERPRINTS_KEY] = fingerprints
+
+    given_ms = iso_to_ms(last_run_at)
+    if given_ms is not None:
+        stored_ms = iso_to_ms(merged.get(STATE_LAST_RUN_KEY))
+        if stored_ms is None or given_ms > stored_ms:
+            merged[STATE_LAST_RUN_KEY] = last_run_at
+    return merged
 
 
 def _replace_state(state_path: Any, state: dict) -> None:
-    return None
+    """Write `state` to a temp file in the target's own directory, then rename
+    it over the target. A reader sees the old file or the new one, never half
+    of either; if anything fails the target is as it was, the temp file is
+    removed and the error is raised."""
+    path = Path(state_path)
+    payload = (json.dumps(state, indent=2) + "\n").encode("utf-8")
+    handle, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
+    try:
+        with os.fdopen(handle, "wb") as out:
+            out.write(payload)
+            out.flush()
+            os.fsync(out.fileno())
+        try:
+            shutil.copymode(str(path), temp_name)  # keep the file's permissions
+        except OSError:
+            pass  # no file to copy from yet, or a platform that cannot
+        os.replace(temp_name, path)
+    except BaseException:
+        try:
+            os.unlink(temp_name)
+        except OSError:
+            pass
+        raise
 
 
 def merge_fingerprints(state_path: Any, entries: Any, last_run_at: Any = None) -> dict:
-    return {}
+    """Record in the HubSpot path's state file that code completed these tickets.
+
+    `state_path` is the file. There is no default: the real path is supplied
+    in one place (the orchestrator's `Deps.state_path`), so a test cannot reach
+    the tracked file by leaving an argument out.
+    `entries` is {HubSpot ticket id: fingerprint_entry(...)}.
+    `last_run_at`, when given, is an ISO instant the search window may start
+    from; it only ever moves the stored value forward.
+
+    Read the file (missing or unparseable = empty), merge (`_merge_state`),
+    and, when that changed anything, replace the file through a temp file and
+    a rename (`_replace_state`). A missing or corrupt file is so replaced by a
+    valid one. With nothing to merge the file is not read and not written; a
+    merge that changes nothing is not written.
+
+    Returns {"written": bool, "fingerprints": <entries added or replaced>,
+    "last_run_at_moved": bool}. RAISES when the file is there and cannot be
+    read, or the write fails; the file is then as it was. What a failure means
+    is the caller's decision.
+
+    The read-merge-replace is not locked across processes, by decision (runbook
+    tag STATE-FILE-RACE): the rename is atomic, it is not a lock, so two
+    overlapping runs can each read, merge and replace, and the later replace
+    drops the fingerprints the earlier run added. The bound: after a switch
+    back to HubSpot such a ticket can be drafted once more, and never as a
+    second pending draft, because that draft write replaces the pending one.
+
+    This is the only place code writes the state file, and nothing in `os`
+    mode reads the file to decide what to process.
+    """
+    unchanged = {"written": False, "fingerprints": 0, "last_run_at_moved": False}
+    if not entries and last_run_at is None:
+        return unchanged
+    state = _read_state(state_path)
+    merged = _merge_state(state, entries, last_run_at)
+    if merged == state:
+        return unchanged
+    before = state.get(STATE_FINGERPRINTS_KEY)
+    before = before if isinstance(before, dict) else {}
+    after = merged.get(STATE_FINGERPRINTS_KEY)
+    after = after if isinstance(after, dict) else {}
+    moved = merged.get(STATE_LAST_RUN_KEY) != state.get(STATE_LAST_RUN_KEY)
+    count = sum(1 for ticket_id, entry in after.items() if before.get(ticket_id) != entry)
+    _replace_state(state_path, merged)
+    return {"written": True, "fingerprints": count, "last_run_at_moved": moved}
 
 
 if __name__ == "__main__":

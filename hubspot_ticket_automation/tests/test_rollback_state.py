@@ -485,6 +485,14 @@ def test_nothing_to_merge_does_not_rewrite_the_file(tmp_path: Path, monkeypatch:
     assert writes == [] and path.read_bytes() == before
     assert names(tmp_path) == ["state.json"]
 
+    # and the file is not even read: a locked or unreadable file cannot matter
+    def unreadable(_path: Any) -> dict:
+        raise PermissionError("held by another process")
+
+    monkeypatch.setattr(source, "_read_state", unreadable)
+    assert source.merge_fingerprints(path, {})["written"] is False
+    assert source.merge_fingerprints(path, None)["written"] is False
+
 
 def test_merging_what_the_file_already_holds_does_not_rewrite_it(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
