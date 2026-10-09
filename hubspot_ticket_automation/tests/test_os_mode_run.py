@@ -287,6 +287,11 @@ class HubSpotOpener:
         self.patch_refused: set[str] = set()  # HubSpot ids whose property write answers 404
         self.timeline: Optional[list] = None  # OsWorld's shared call log, when set
 
+    @property
+    def reads(self) -> list[tuple[str, str]]:
+        """Every request but the number backfill's write."""
+        return [request for request in self.requests if request[0] != "PATCH"]
+
     def __call__(self, request: Any, timeout: Any = None) -> _Answer:
         method = request.get_method()
         path = request.full_url[len(hubspot_api.HUBSPOT_BASE) :]
@@ -801,7 +806,9 @@ def test_three_fixture_tickets_become_a_bundle_and_one_success_record(world: OsW
     assert record["failure_reason_code"] is None
     assert record["error_summary"] is None
     assert record["run_id"] == world.run_ids[0]
-    # the whole object, as a literal: two thread fetches (two requests each) and nothing else
+    # the whole object, as a literal: two thread fetches (two requests each) and the
+    # finalizer's one number backfill, for ticket 3, whose numbers are only in its
+    # form block (plan 17); nothing else
     assert record["hubspot_calls"] == {
         "kinds": {
             "search": 0,
@@ -811,9 +818,9 @@ def test_three_fixture_tickets_become_a_bundle_and_one_success_record(world: OsW
             "related_lookup": 0,
             "rerun_read": 0,
             "email_thread": 2,
-            "number_backfill": 0,
+            "number_backfill": 1,
         },
-        "raw_requests": 4,
+        "raw_requests": 5,
     }
     assert [entry["os_ticket_id"] for entry in world.bundle["tickets"]] == [T1_OS_ID, T2_OS_ID, T3_OS_ID]
     assert world.launch_attempts == 1
@@ -830,11 +837,13 @@ def test_the_transport_log_holds_only_the_two_requests_of_each_thread_fetch(worl
         ("POST", BATCH_PATH),
         ("GET", f"/crm/v4/objects/tickets/{T3_HS_ID}/associations/emails?limit=10"),
         ("POST", BATCH_PATH),
+        # the one write of this mode: the finalizer's number backfill (plan 17)
+        ("PATCH", f"/crm/v3/objects/tickets/{T3_HS_ID}"),
     ]
-    for _method, path in world.hubspot.requests:
+    for _method, path in world.hubspot.reads:
         assert "/search" not in path
         assert "/contacts" not in path and "/companies" not in path
-        assert not path.startswith("/crm/v3/objects/tickets")
+        assert not path.startswith("/crm/v3/objects/tickets")  # no ticket is ever READ from HubSpot
 
 
 def test_a_ticket_with_no_hubspot_id_costs_no_hubspot_request_and_no_token_read(
@@ -1321,7 +1330,7 @@ def test_a_rerun_that_cannot_be_fetched_is_skipped_and_never_read_from_hubspot(
     assert world.record["status"] == "success"
     assert note in world.record["error_summary"]
     assert world.hubspot.unexpected == []
-    assert len(world.hubspot.requests) == 4
+    assert len(world.hubspot.reads) == 4
 
 
 def test_a_rerun_read_that_fails_is_a_code_and_the_list_is_still_processed(world: OsWorld) -> None:
@@ -1469,7 +1478,9 @@ def test_a_thread_fetch_hubspot_refuses_is_processed_from_the_os_thread_with_a_c
     assert world.record["error_summary"] == "thread_fetch_failed=1"
     calls = world.record["hubspot_calls"]
     assert calls["kinds"]["email_thread"] == 2  # one logical call per linked ticket, refused or not
-    assert calls["raw_requests"] == 3  # the refused one stopped after its first request
+    # the refused fetch stopped after its first request (3), plus ticket 3's number backfill (plan 17)
+    assert calls["raw_requests"] == 4
+    assert calls["kinds"]["number_backfill"] == 1
 
 
 def test_ssk_state_reaches_the_context_through_the_lookup_and_no_child_process_starts(
@@ -1779,7 +1790,7 @@ def test_the_engine_shadow_is_handed_the_bundles_contexts_before_the_agent(world
     assert contexts == [entry["ticket_context"] for entry in world.bundle["tickets"]]
     # it asked HubSpot nothing: the request log did not grow after the thread fetches
     assert world.hubspot_requests_seen_by_engine == [4]
-    assert len(world.hubspot.requests) == 4
+    assert len(world.hubspot.reads) == 4
     assert world.engine_child_calls == 0  # the HubSpot-mode child step is not this mode's
     assert world.record["status"] == "success"
 

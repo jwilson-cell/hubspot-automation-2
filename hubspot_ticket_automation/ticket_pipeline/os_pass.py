@@ -56,6 +56,15 @@ The agent persists nothing in this mode. `finalize_os_run` does, between
     the write-back   `completed` once the draft is in place, echoing the
                      consumed signal as the list supplied it; `failed` with a
                      code of the OS's closed list for a ticket that has no draft
+    the action items the envelope names the OS ticket id (and the HubSpot id
+                     when there is one) and carries the cycle key as `pass_id`,
+                     so whether an item is created again is the OS's decision;
+                     the local seen-set is not consulted. The two ids are
+                     written to a retry file BEFORE the post, so the forwarder
+                     can resend an unconfirmed envelope with them.
+    the backfill     one HubSpot property update, only for a number that was
+                     empty in the OS payload and present in the form block
+                     (`backfill_source`, unmerged), counted as `number_backfill`
 
 A ticket is never reported `completed` without its draft. Every answer the
 write-back route can give has one action (`post_ticket_writeback`). The only
@@ -475,12 +484,11 @@ def _ticket_record(entry: dict, outcome: str, code: Optional[str], result: Any) 
     }
 
 
-def _thread(deps: Deps, hubspot_id: str, settings: dict, token_box: dict, notes: _Notes) -> list:
-    """The linked ticket's HubSpot emails: the one HubSpot read of this mode.
-
-    The token is asked for once per run, through the injected reader, the first
-    time a ticket needs it. No token, or a fetch that cannot be made, answers []
-    and the caller builds the context from the OS thread."""
+def _hubspot_token(deps: Deps, token_box: dict, notes: Optional[_Notes]) -> Optional[str]:
+    """The run's HubSpot token: asked for once per run, through the injected
+    reader, the first time anything needs it, and kept in `token_box` for the
+    thread fetches and the finalizer's number backfill alike. None when there
+    is none; `notes`, when given, gains the flag."""
     if "token" not in token_box:
         token: Any = None
         failure: Optional[str] = None
@@ -492,9 +500,19 @@ def _thread(deps: Deps, hubspot_id: str, settings: dict, token_box: dict, notes:
             _log(f"hubspot token not read: error={failure}")
         token_box["token"] = _text(token)
         if token_box["token"] is None:
-            notes.flag(HUBSPOT_TOKEN_MISSING)
-            _log(f"code={HUBSPOT_TOKEN_MISSING}: linked tickets are built from the OS thread")
-    if token_box["token"] is None:
+            if notes is not None:
+                notes.flag(HUBSPOT_TOKEN_MISSING)
+            _log(f"code={HUBSPOT_TOKEN_MISSING}: no HubSpot request is made for this run")
+    return token_box["token"]
+
+
+def _thread(deps: Deps, hubspot_id: str, settings: dict, token_box: dict, notes: _Notes) -> list:
+    """The linked ticket's HubSpot emails: the one HubSpot read of this mode.
+
+    The token is asked for once per run, through the injected reader, the first
+    time a ticket needs it. No token, or a fetch that cannot be made, answers []
+    and the caller builds the context from the OS thread."""
+    if _hubspot_token(deps, token_box, notes) is None:
         return []
     failure = None
     emails: Any = []
@@ -705,6 +723,15 @@ WRITEBACK_SIGNAL_GONE = "writeback_signal_gone"
 CLASSIFICATION_UNUSABLE = "classification_unusable"
 DRAFT_BODY_MISSING = "draft_body_missing"
 RERUN_MARK_FAILED = "rerun_mark_failed"
+ACTION_ITEMS_UNCONFIRMED = "action_items_unconfirmed"
+PASS_ID_INVALID = "pass_id_invalid"
+NUMBER_BACKFILL_FAILED = "number_backfill_failed"
+NUMBER_BACKFILL_KIND = "number_backfill"  # the HubSpot call counter's kind
+
+# How one ticket's action-item post ended.
+ITEMS_CONFIRMED = "confirmed"  # the OS answered ok with zero body errors
+ITEMS_UNCONFIRMED = "unconfirmed"  # anything else: the forwarder resends it
+ITEMS_DRY_RUN = "dry_run"
 FINALIZE_TICKET_ERROR = "finalize_ticket_error"
 FINALIZE_SETTINGS_UNREADABLE = "finalize_settings_unreadable"
 FINALIZE_FAILED = "finalize_failed"
@@ -727,7 +754,9 @@ class FinalizeSummary:
     `dry_run`, `would`   settings said dry run; `would` counts what was not done
     `tickets`            one record per bundle ticket, in bundle order:
                          {"ref", "os_ticket_id", "hubspot_ticket_id", "drafted",
-                          "draft_id", "created", "writeback": one of the WB_* or None}
+                          "draft_id", "created", "writeback": one of the WB_* or None,
+                          "action_items": one of the ITEMS_* or None (no item),
+                          "backfilled": the property names written, or None}
     """
 
     tickets_processed: int = 0
@@ -1057,12 +1086,102 @@ def post_ticket_writeback(
     return ended(WB_COUNTED if 200 <= verdict["status"] < 300 else WB_REJECTED)
 
 
+def _forwarder() -> Any:
+    """scripts/forward_action_items.py (and, as its `poster`, the envelope
+    helper), looked up when a ticket has action items. Like the orchestrator
+    script it is a flat module of scripts/, which is on the path whenever the
+    orchestrator runs."""
+    return importlib.import_module("forward_action_items")
+
+
+def post_ticket_action_items(
+    entry: dict, items: Any, seen_path: Any, *, dry_run: bool = False
+) -> dict:
+    """Send one ticket's action items to the OS, named by the OS ticket id and
+    the pass. Never raises for an answer.
+
+    `entry`      read: `ref` (the ticket key of the seen-set and the retry
+                 file), `hubspot_ticket_id` (or None), `os_ticket_id`,
+                 `cycle_key` (sent as `pass_id`, alone, when the OS's rule
+                 accepts it; otherwise omitted, with the code pass_id_invalid)
+    `items`      the agent's action items; anything that is not an object with
+                 an `action_type` is dropped
+    `seen_path`  the forwarder's seen-set; the retry file sits beside it
+
+    Returns {"end": None (nothing to send) or one of the ITEMS_* words,
+    "items": how many were sent, "codes": [codes for the run's summary]}.
+
+    The seen-set is NOT read to decide: with a pass id the OS decides whether
+    an item is created again. Order:
+        1. the retry entries are written (the OS id and the pass id, per key);
+        2. the envelope is posted;
+        3. confirmed (ok AND zero body errors) -> the keys join the seen-set and
+           leave the retry file. Anything else, a 200 with errors above zero
+           included, leaves both as they are, with the code
+           action_items_unconfirmed: the forwarder, which runs after every
+           pass, resends the same envelope with the same pass id.
+    In a dry run the poster's own dry-run path is taken and no file is written.
+    """
+    usable = [
+        item for item in (items if isinstance(items, list) else [])
+        if isinstance(item, dict) and _text(item.get("action_type"))
+    ]
+    codes: list[str] = []
+    if not usable:
+        return {"end": None, "items": 0, "codes": codes}
+    forwarder = _forwarder()
+    ref = entry.get("ref")
+    os_ticket_id = entry.get("os_ticket_id")
+    hubspot_id = _text(entry.get("hubspot_ticket_id"))
+    pass_id = entry.get("cycle_key")
+    if not forwarder.valid_pass_id(pass_id):
+        pass_id = None
+        codes.append(PASS_ID_INVALID)
+    keys = [f"{ref}:{item['action_type']}" for item in usable]
+
+    if dry_run:
+        forwarder.poster.post_action_items(
+            hubspot_id, usable, True, os_ticket_id=os_ticket_id, pass_id=pass_id
+        )
+        return {"end": ITEMS_DRY_RUN, "items": len(usable), "codes": codes}
+
+    held = {"os_ticket_id": os_ticket_id, "pass_id": pass_id}
+    forwarder.remember_retry({key: dict(held) for key in keys}, seen_path)
+    result = forwarder.poster.post_action_items(
+        hubspot_id, usable, False, os_ticket_id=os_ticket_id, pass_id=pass_id
+    )
+    if forwarder.confirmed(result):
+        forwarder.mark_forwarded(keys, seen_path)
+        forwarder.forget_retry(keys, seen_path)
+        return {"end": ITEMS_CONFIRMED, "items": len(usable), "codes": codes}
+    codes.append(ACTION_ITEMS_UNCONFIRMED)
+    mode = result.get("mode") if isinstance(result, dict) else None
+    _log(f"action items not confirmed: ticket={os_ticket_id} items={len(usable)} mode={mode}")
+    return {"end": ITEMS_UNCONFIRMED, "items": len(usable), "codes": codes}
+
+
 def backfill_properties(entry: dict) -> dict:
-    return {}
+    """The HubSpot ticket properties the number backfill writes for one entry:
+    each of `order_number` and `tracking_number` that was EMPTY in the OS
+    payload and is present in the thread's form block.
 
-
-def post_ticket_action_items(entry: dict, items: Any, seen_path: Any, *, dry_run: bool = False) -> dict:
-    return {"end": "none", "items": 0, "codes": []}
+    Decided from the entry's `backfill_source` (the two origins, unmerged),
+    never from the ticket context's form fields: those are merged, and cannot
+    say what was empty in the payload. A ticket with no HubSpot id has nothing
+    to write. Never from anything the model wrote."""
+    if not isinstance(entry, dict) or _text(entry.get("hubspot_ticket_id")) is None:
+        return {}
+    source = entry.get("backfill_source")
+    source = source if isinstance(source, dict) else {}
+    payload = source.get("payload")
+    block = source.get("form_block")
+    if not isinstance(payload, dict) or not isinstance(block, dict):
+        return {}
+    return {
+        key: block[key]
+        for key in os_bundle.BACKFILL_KEYS
+        if _text(payload.get(key)) is None and _text(block.get(key)) is not None
+    }
 
 
 @dataclass
@@ -1096,6 +1215,52 @@ def _write_back(run: _Pass, entry: dict, ticket: Optional[dict], ticket_result: 
         summary.partial = True
 
 
+def _send_action_items(run: _Pass, entry: dict, ticket: dict, items: Any) -> None:
+    """A drafted ticket's action items, folded into the summary."""
+    summary = run.summary
+    ended = post_ticket_action_items(entry, items, run.deps.seen_path, dry_run=summary.dry_run)
+    ticket["action_items"] = ended["end"]
+    for code in ended["codes"]:
+        summary.note(code)
+    if ended["end"] == ITEMS_DRY_RUN:
+        summary.would_do("action_item_posts")
+
+
+def _backfill(run: _Pass, entry: dict, ticket: dict) -> None:
+    """The number backfill of one drafted ticket: at most one property update,
+    counted once as `number_backfill`. A failure is a code; it never fails the
+    ticket, and the next pass over the ticket tries again while the payload
+    still shows the number empty."""
+    summary = run.summary
+    properties = backfill_properties(entry)
+    if not properties:
+        return
+    if summary.dry_run:
+        summary.would_do("number_backfills")
+        return
+    token = _hubspot_token(run.deps, run.token_box, None)
+    answer: Any = None
+    failure: Optional[str] = "no_token"
+    if token is not None:
+        failure = None
+        hs.record_call(NUMBER_BACKFILL_KIND)
+        try:
+            answer = hs.update_ticket_properties(entry["hubspot_ticket_id"], properties, token)
+        except Exception as e:  # noqa: BLE001
+            failure = type(e).__name__
+        if failure is None and answer is None:
+            failure = "refused"
+    if failure is not None:
+        summary.note(NUMBER_BACKFILL_FAILED)
+        _log(
+            f"number backfill not written: ticket={entry.get('hubspot_ticket_id')} "
+            f"code={NUMBER_BACKFILL_FAILED} cause={failure}"
+        )
+        return
+    ticket["backfilled"] = sorted(properties)
+    _log(f"number backfill: ticket={entry.get('hubspot_ticket_id')} properties={sorted(properties)}")
+
+
 def _failed_result(code: Any) -> dict:
     return {"outcome": OUTCOME_FAILED, "failure_reason_code": map_failure_code(code)}
 
@@ -1116,7 +1281,9 @@ def _mark_reruns(run: _Pass, entry: dict, draft_id: str) -> None:
 
 
 def _finalize_ticket(run: _Pass, entry: dict, record: dict, ticket: dict) -> None:
-    """One bundle ticket: the draft, THEN the write-back, then its reruns.
+    """One bundle ticket: the draft, THEN the write-back, then its reruns, its
+    action items and its number backfill. Only a ticket whose draft is in place
+    reaches the last three.
 
     A ticket is never reported `completed` without its draft: a classification
     that cannot be made valid, a missing draft text and a draft write that
@@ -1145,6 +1312,8 @@ def _finalize_ticket(run: _Pass, entry: dict, record: dict, ticket: dict) -> Non
         summary.would_do("drafts")
         summary.tickets_processed += 1
         _write_back(run, entry, ticket, ticket_result)
+        _send_action_items(run, entry, ticket, item.get("action_items"))
+        _backfill(run, entry, ticket)
         return
 
     draft_id: Optional[str] = None
@@ -1182,6 +1351,8 @@ def _finalize_ticket(run: _Pass, entry: dict, record: dict, ticket: dict) -> Non
         summary.drafts_created += 1
     _write_back(run, entry, ticket, ticket_result)
     _mark_reruns(run, entry, draft_id)
+    _send_action_items(run, entry, ticket, item.get("action_items"))
+    _backfill(run, entry, ticket)
 
 
 def finalize_os_run(
@@ -1205,7 +1376,13 @@ def finalize_os_run(
            keyed by the entry's ref, OS ticket id and cycle key;
         2. the write-back (`post_ticket_writeback`): `completed` once the draft
            is in place, else `failed` with a code of the OS's six;
-        3. each operator rerun the entry answers is marked processed.
+        3. each operator rerun the entry answers is marked processed;
+        4. its action items (`post_ticket_action_items`), with the OS ticket id
+           and the cycle key as the pass id;
+        5. the number backfill (`backfill_properties`), one HubSpot update.
+
+    Steps 3 to 5 are for a ticket whose draft is in place; a failed ticket gets
+    its `failed` write-back and nothing else.
 
     `result` None (the agent did not launch, or left no complete result) is a
     RUN-level failure: no draft exists to write and no ticket is reported
@@ -1269,6 +1446,8 @@ def finalize_os_run(
             "draft_id": None,
             "created": False,
             "writeback": None,
+            "action_items": None,
+            "backfilled": None,
         }
         summary.tickets.append(ticket)
         failure = None
