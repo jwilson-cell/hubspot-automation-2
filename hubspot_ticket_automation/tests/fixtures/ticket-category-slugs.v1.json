@@ -1,0 +1,20 @@
+{
+  "contract_version": "1",
+  "slugs": [
+    "wismo_tracking",
+    "shipping_delay",
+    "damaged_goods",
+    "mispack_wrong_item",
+    "inventory_discrepancy",
+    "inbound_asn_receiving",
+    "returns_rma",
+    "integration_system",
+    "billing_invoice",
+    "sla_escalation",
+    "account_onboarding",
+    "kitting_project",
+    "address_recipient",
+    "retailer_compliance",
+    "other_unclassified"
+  ]
+}
