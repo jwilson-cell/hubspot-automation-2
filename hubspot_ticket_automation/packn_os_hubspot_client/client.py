@@ -2,6 +2,10 @@
 
 Public functions (called by the existing automation's SKILL.md cron skill):
     read_routine_enabled(routine_name) -> bool
+    read_ticket_source_mode() -> dict
+        (Phase 93: {"found": bool, "value": <stored JSON>} for the app_settings
+         row `ticket_source_mode`. Raises on a database error — NOT fail-closed
+         into a value; ticket_pipeline/source.py owns the decision.)
     write_run_record(routine_name, status, error_summary, tickets_processed,
                      drafts_created, started_at_iso, finished_at_iso) -> None
     write_draft(ticket_id, routine_name, draft_body, model, prompt_version,
@@ -90,9 +94,36 @@ def read_routine_enabled(routine_name: str) -> bool:
         return False
 
 
-def read_ticket_source_mode():
-    """Skeleton (Phase 93, plan 13, RED): no behaviour yet."""
-    return None
+def read_ticket_source_mode() -> dict:
+    """Read the `ticket_source_mode` row of app_settings (Phase 93, D-01).
+
+    Returns whether a row exists AND its stored JSON value, as two keys:
+
+        {"found": False, "value": None}       no row
+        {"found": True,  "value": <stored>}   a row; <stored> is the jsonb value as
+                                              psycopg loads it, and can itself be
+                                              None when the row holds a JSON null
+
+    The two keys are why this is not a bare value: "no row" means the cron reads
+    HubSpot, while "a row holding null" is an unrecognised setting that must stop
+    the run. Returning the value alone would make them the same None.
+
+    This function decides nothing and has no default: ticket_pipeline/source.py
+    turns the pair into a mode. Unlike read_routine_enabled above, a database
+    error is NOT caught here — it propagates, and the caller reports the setting
+    as unreadable. Folding it into a safe-looking value would let a cron that
+    cannot read its setting run against the wrong source.
+    """
+    with get_pool().connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT value FROM app_settings WHERE tenant_id = %s AND key = %s",
+                (TENANT_ID, "ticket_source_mode"),
+            )
+            row = cur.fetchone()
+    if row is None:
+        return {"found": False, "value": None}
+    return {"found": True, "value": row["value"]}
 
 
 def write_draft(

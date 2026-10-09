@@ -14,6 +14,12 @@ volume, not with how often the cron fires.
 
 WHAT IT CHECKS (mirrors SKILL.md Steps 0-1, read-only)
 ------------------------------------------------------
+0. The ticket source mode (Phase 93) — `hubspot`, `shadow` or `os`, from
+   ticket_pipeline/source.py: the value the orchestrator exported, else one
+   read of the Pack'N OS setting. This script serves the HubSpot source only
+   (`hubspot` and `shadow`). In `os` mode it makes no HubSpot call and skips.
+   A mode that cannot be established (`source_unreadable`, `source_unknown`)
+   stops the tick — see FAIL-OPEN, below, for why that is not a fail-open case.
 1. report_routine_schedule — Step 0a's crontab report, done here so Pack'N OS
    sees the cron fired even on ticks where the agent never launches.
 2. read_routine_enabled — Step 0b's gate, same fail-closed posture (missing
@@ -38,11 +44,19 @@ paths that skip the agent are the two affirmative ones: routine paused
 Both write an automation_runs record so the Pack'N OS status panel and the
 "no run record" alert stay accurate.
 
+That posture belongs to the HubSpot source. The source mode itself is NOT
+fail-open (Phase 93, D-01): "launch the agent on any doubt" would mean "read
+HubSpot on any doubt", which is choosing a mode. A mode read that fails, or a
+stored value this code does not know, skips the agent and writes a 'failure'
+record naming the code. `os` mode skips with a 'skipped' record.
+
 EXIT CODES (consumed by scripts/run_tickets.sh)
 -----------------------------------------------
 0  = run the agentic pass (work exists, reruns pending, or pre-gate unsure)
 10 = skip — no new work (a status='success' 0-ticket run record was written)
-11 = skip — routine paused / gate fail-closed (status='skipped' record written)
+11 = skip — a gate failed closed: the routine is paused (status='skipped'
+     record), the source mode is `os` (status='skipped' record), or the source
+     mode could not be established (status='failure' record)
 
 Stdlib + packn_os_hubspot_client only — no new dependencies (CLAUDE.md
 invariant). PyYAML is already in scripts/requirements.txt.
@@ -58,12 +72,23 @@ import time
 import traceback
 import urllib.error
 import urllib.request
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Any, Callable, Optional
 
+# The package root goes on the path so `ticket_pipeline` and the helper client
+# import from a bare `python scripts/pregate_tickets.py` (ticket_pipeline/run.py
+# does the mirror image to import this script).
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
+
+from ticket_pipeline import source  # noqa: E402
+from ticket_pipeline.source import (  # noqa: E402,F401 — re-exported: one candidate rule
+    build_search_body,
+    iso_to_ms,
+    parse_last_run_at,
+    unprocessed_candidates,
+)
 
 ROUTINE = "tickets-process"
 # Marker substring identifying our own crontab line (the crontab invokes
@@ -82,129 +107,32 @@ EXIT_RUN_AGENT = 0
 EXIT_SKIP_NO_WORK = 10
 EXIT_SKIP_PAUSED = 11
 
+SEARCH_PATH = "/crm/v3/objects/tickets/search"
+
+# hubspot_candidates' decision and its reason.
+DECISION_RUN_AGENT = "run_agent"
+DECISION_NO_WORK = "no_work"
+REASON_CANDIDATES = "candidates"  # run_agent: at least one hit survived the dedupe
+REASON_PAGE_FULL = "page_full"  # run_agent: a full page, every hit deduped (fail-open)
+REASON_SEARCH_FAILED = "search_failed"  # run_agent: no usable answer (fail-open)
+REASON_NONE = "none"  # no_work: a clean poll with nothing new
+REASON_OS_MODE = "os_mode"  # no_work: HubSpot is not the source; nothing was asked
+
+# error_summary of the record written when this script is run in a mode it does not serve.
+SUMMARY_OS_MODE_NOT_SERVED = "pregate: source_mode_os_not_served"
+
 
 def _log(msg: str) -> None:
     print(f"[pregate] {msg}", file=sys.stderr)
 
 
 # ===========================================================================
-# PURE LAYER (unit-tested in packn_os_hubspot_client/tests/test_pregate.py).
-# No HTTP, no DB, no filesystem. Do not add side effects here.
+# PURE LAYER — lives in ticket_pipeline/source.py since Phase 93.
+# iso_to_ms, parse_last_run_at, build_search_body and unprocessed_candidates are
+# imported above and re-exported under their old names, so
+# packn_os_hubspot_client/tests/test_pregate.py and ticket_pipeline/run.py keep
+# their imports. Do not define a second copy here.
 # ===========================================================================
-
-
-def iso_to_ms(value: Optional[str]) -> Optional[int]:
-    """ISO-8601 (Z or offset) -> epoch ms, or None on any parse problem."""
-    if not value or not isinstance(value, str):
-        return None
-    raw = value.strip()
-    if not raw:
-        return None
-    iso = raw[:-1] + "+00:00" if raw.endswith("Z") else raw
-    try:
-        dt = datetime.fromisoformat(iso)
-    except ValueError:
-        return None
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return int(dt.timestamp() * 1000)
-
-
-def parse_last_run_at(value: Optional[str], now_ms: Optional[int] = None) -> int:
-    """state.json last_run_at -> epoch ms; empty/missing/bad -> 24h ago.
-
-    Mirrors SKILL.md Preconditions #3: "If empty, use the timestamp from
-    24h ago." A stale-but-parseable value is used as-is — a wide window only
-    means more candidates, which the agent's own dedupe handles.
-    """
-    parsed = iso_to_ms(value)
-    if parsed is not None:
-        return parsed
-    if now_ms is None:
-        now_ms = int(time.time() * 1000)
-    return now_ms - int(timedelta(hours=24).total_seconds() * 1000)
-
-
-def build_search_body(
-    last_run_ms: int,
-    active_stages: list[str],
-    require_last_message_from_visitor: bool,
-    per_run_cap: int,
-) -> dict:
-    """The tickets/search body — SAME filters as SKILL.md Step 1.
-
-    Only hs_lastmodifieddate is hydrated: the pre-gate decides launch/skip,
-    it never builds ticket context (that stays the agent's job).
-    """
-    filters: list[dict] = [
-        {
-            "propertyName": "hs_lastmodifieddate",
-            "operator": "GT",
-            "value": last_run_ms,
-        },
-        {
-            "propertyName": "hs_pipeline_stage",
-            "operator": "IN",
-            "values": [str(s) for s in active_stages],
-        },
-    ]
-    if require_last_message_from_visitor:
-        filters.append(
-            {
-                "propertyName": "hs_last_message_from_visitor",
-                "operator": "EQ",
-                "value": "true",
-            }
-        )
-    return {
-        "filterGroups": [{"filters": filters}],
-        "properties": ["hs_lastmodifieddate"],
-        "sorts": [{"propertyName": "hs_lastmodifieddate", "direction": "ASCENDING"}],
-        "limit": per_run_cap,
-    }
-
-
-def unprocessed_candidates(results: list[dict], fingerprints: dict) -> list[str]:
-    """Filter search hits through the state.json fingerprint dedupe.
-
-    Approximation of SKILL.md Step 2a-pre (which compares num_notes): a
-    ticket is NOT new work when either
-      (a) its fingerprint recorded an hs_lastmodifieddate >= the ticket's
-          current one — nothing changed since the skill last processed it; or
-      (b) its fingerprint's processed_at >= the ticket's current
-          hs_lastmodifieddate — every HubSpot-side change we know of predates
-          the moment the skill FINISHED that ticket. This closes the
-          echo-launch hole: the skill's own step-2a.6 property backfill bumps
-          hs_lastmodifieddate DURING processing (i.e. before processed_at is
-          stamped), so without (b) every productive tick re-flags its tickets
-          once and wastes one agent launch. A genuinely new customer message
-          arrives AFTER processed_at, bumps lastmodified past it, and still
-          fails open. Relies only on sane NTP clocks (sub-second skew vs the
-          minutes-long gap between backfill and fingerprint write).
-
-    Every ambiguous case (no fingerprint, no comparable timestamps) counts as
-    a candidate: a false positive costs one agent launch whose own dedupe
-    skips the ticket; a false negative would silently drop work.
-    """
-    candidates: list[str] = []
-    for result in results:
-        ticket_id = str(result.get("id", ""))
-        if not ticket_id:
-            continue
-        current_ms = iso_to_ms((result.get("properties") or {}).get("hs_lastmodifieddate"))
-        fp = fingerprints.get(ticket_id)
-        if not isinstance(fp, dict):
-            candidates.append(ticket_id)
-            continue
-        fp_ms = iso_to_ms(fp.get("hs_lastmodifieddate"))
-        processed_ms = iso_to_ms(fp.get("processed_at"))
-        if current_ms is not None and (
-            (fp_ms is not None and current_ms <= fp_ms)
-            or (processed_ms is not None and current_ms <= processed_ms)
-        ):
-            continue
-        candidates.append(ticket_id)
-    return candidates
 
 
 # ===========================================================================
@@ -289,9 +217,116 @@ def _write_run_record(status: str, error_summary: Optional[str], started_iso: st
         _log(f"run-record write failed ({status}): {e!r}")
 
 
-def hubspot_candidates(mode, settings, state, token, transport=None):
-    """Skeleton (Phase 93, plan 13, RED): no behaviour yet."""
-    return None
+def _candidate_decision(
+    decision: str,
+    reason: str,
+    matched: Optional[list[dict]] = None,
+    candidates: Optional[list[str]] = None,
+    page_full: bool = False,
+) -> dict:
+    return {
+        "decision": decision,
+        "reason": reason,
+        "matched": matched or [],
+        "candidates": candidates or [],
+        "page_full": page_full,
+    }
+
+
+def hubspot_candidates(
+    mode: str,
+    settings: dict,
+    state: dict,
+    token: str,
+    transport: Optional[Callable[..., Any]] = None,
+) -> dict:
+    """The HubSpot search-and-dedupe decision, for the one source mode.
+
+    Returns
+        {"decision":   "run_agent" | "no_work",
+         "reason":     "candidates" | "page_full" | "search_failed" | "none" | "os_mode",
+         "matched":    [{"id", "hs_lastmodifieddate", "deduped"}, ...]   every search hit
+         "candidates": [ticket id, ...]                                  hits that are new work
+         "page_full":  bool}                                             hits >= per_run_cap
+
+    `hubspot` and `shadow` mode: one tickets/search with the SAME body as
+    SKILL.md Step 1, then the fingerprint dedupe.
+        candidates survive                -> run_agent / candidates
+        a full page, every hit deduped    -> run_agent / page_full     (fail-open)
+        no usable answer from the search  -> run_agent / search_failed (fail-open)
+        anything else                     -> no_work  / none
+
+    `os` mode: HubSpot is not the source. Nothing is asked of it — no search, no
+    request of any kind — and the answer is no_work / os_mode with empty lists.
+    The `os`-mode list comes from the OS, in another function.
+
+    A mode outside the three raises SourceModeError(source_unknown) before any
+    request. `settings` and `state` are read, never changed. A malformed
+    `per_run_cap` raises (ValueError / TypeError): the caller owns that doubt.
+
+    `transport` is called as `transport(method, path, token, body)` and answers
+    the parsed response or None — the shape of ticket_pipeline.hubspot_api's
+    request function, and of tests/helpers/fakes.FakeHubSpotTransport.
+    """
+    mode = source.validate_mode(mode)
+    if mode == source.MODE_OS:
+        return _candidate_decision(DECISION_NO_WORK, REASON_OS_MODE)
+
+    active_stages = [str(s) for s in settings.get("active_stages") or []]
+    per_run_cap = int(settings.get("per_run_cap", 25))
+    require_visitor = bool(settings.get("require_last_message_from_visitor", False))
+    last_run_ms = parse_last_run_at(state.get("last_run_at"))
+    fingerprints = state.get("ticket_fingerprints") or {}
+
+    body = build_search_body(last_run_ms, active_stages, require_visitor, per_run_cap)
+    if transport is not None:
+        response = transport("POST", SEARCH_PATH, token, body)
+    else:
+        response = _search_tickets(body, token)
+    # A search answer always carries `results`. One that does not (a failed call,
+    # an empty or foreign body) is not a clean "nothing matched": fail open.
+    if not isinstance(response, dict) or "results" not in response:
+        _log("hubspot search failed — deferring to agent")
+        return _candidate_decision(DECISION_RUN_AGENT, REASON_SEARCH_FAILED)
+
+    results = response.get("results") or []
+    candidates = unprocessed_candidates(results, fingerprints)
+    wanted = set(candidates)
+    matched = [
+        {
+            "id": str(hit.get("id")),
+            "hs_lastmodifieddate": (hit.get("properties") or {}).get("hs_lastmodifieddate"),
+            "deduped": str(hit.get("id")) not in wanted,
+        }
+        for hit in results
+        if str(hit.get("id", ""))
+    ]
+    page_full = len(results) >= per_run_cap
+
+    if candidates:
+        _log(
+            f"{len(candidates)} candidate ticket(s) after dedupe "
+            f"({len(results)} matched) — launching agent"
+        )
+        return _candidate_decision(
+            DECISION_RUN_AGENT, REASON_CANDIDATES, matched, candidates, page_full
+        )
+
+    if page_full:
+        # Saturated-page blind spot (2026-07-23 audit): the single page is
+        # full AND every row deduped out. Already-processed tickets whose
+        # hs_lastmodifieddate keeps getting bumped can permanently occupy the
+        # ascending-sorted page, hiding newer unprocessed tickets beyond it —
+        # and since nothing advances last_run_at on a skip, the deadlock is
+        # stable across ticks. Fail open: let the agent run and page deeper.
+        _log(
+            f"page saturated ({len(results)} >= per_run_cap {per_run_cap}) with all "
+            "deduped — failing open to the agent so work beyond the page isn't hidden"
+        )
+        return _candidate_decision(DECISION_RUN_AGENT, REASON_PAGE_FULL, matched, [], True)
+
+    _log(f"no new tickets ({len(results)} matched, all deduped) — skipping agentic run")
+    return _candidate_decision(DECISION_NO_WORK, REASON_NONE, matched)
 
 
 def main() -> int:
@@ -301,6 +336,22 @@ def main() -> int:
 
     # Step 0a equivalent — fire-and-forget crontab report (never raises).
     client.report_routine_schedule(ROUTINE, CRON_MARKER)
+
+    # The one source mode (Phase 93): the exported value, else one read of the
+    # setting. NOT fail-open — see the module docstring. A mode that cannot be
+    # established is never treated as `hubspot`.
+    try:
+        mode = source.current_mode()
+    except source.SourceModeError as e:
+        _log(f"source mode not established ({e.code}) — skipping agentic run")
+        _write_run_record("failure", f"pregate: {e.code}", started_iso)
+        return EXIT_SKIP_PAUSED
+    if mode == source.MODE_OS:
+        # This script serves the HubSpot source. In `os` mode it asks HubSpot
+        # nothing and launches nothing.
+        _log("source mode is os — this pre-gate serves the HubSpot source only; skipping")
+        _write_run_record("skipped", SUMMARY_OS_MODE_NOT_SERVED, started_iso)
+        return EXIT_SKIP_PAUSED
 
     # Step 0b equivalent — fail-closed routine gate (returns False on DB
     # error too, per CONTEXT D-01). Paused => the agent would exit at its own
@@ -323,8 +374,7 @@ def main() -> int:
     try:
         settings = _load_settings()
         active_stages = [str(s) for s in settings.get("active_stages") or []]
-        per_run_cap = int(settings.get("per_run_cap", 25))
-        require_visitor = bool(settings.get("require_last_message_from_visitor", False))
+        int(settings.get("per_run_cap", 25))  # a cap that is not a number is a settings doubt
         if not active_stages:
             _log("active_stages empty in settings.yaml — deferring to agent")
             return EXIT_RUN_AGENT
@@ -338,38 +388,13 @@ def main() -> int:
         return EXIT_RUN_AGENT
 
     state = _load_state()
-    last_run_ms = parse_last_run_at(state.get("last_run_at"))
-    fingerprints = state.get("ticket_fingerprints") or {}
 
-    body = build_search_body(last_run_ms, active_stages, require_visitor, per_run_cap)
-    response = _search_tickets(body, token)
-    if response is None:
-        _log("hubspot search failed — deferring to agent")
+    # The search-and-dedupe decision lives once, in hubspot_candidates (which
+    # also holds the two fail-open branches of the search itself).
+    outcome = hubspot_candidates(mode, settings, state, token)
+    if outcome["decision"] == DECISION_RUN_AGENT:
         return EXIT_RUN_AGENT
 
-    results = response.get("results") or []
-    candidates = unprocessed_candidates(results, fingerprints)
-    if candidates:
-        _log(
-            f"{len(candidates)} candidate ticket(s) after dedupe "
-            f"({len(results)} matched) — launching agent"
-        )
-        return EXIT_RUN_AGENT
-
-    if len(results) >= per_run_cap:
-        # Saturated-page blind spot (2026-07-23 audit): the single page is
-        # full AND every row deduped out. Already-processed tickets whose
-        # hs_lastmodifieddate keeps getting bumped can permanently occupy the
-        # ascending-sorted page, hiding newer unprocessed tickets beyond it —
-        # and since nothing advances last_run_at on a skip, the deadlock is
-        # stable across ticks. Fail open: let the agent run and page deeper.
-        _log(
-            f"page saturated ({len(results)} >= per_run_cap {per_run_cap}) with all "
-            "deduped — failing open to the agent so work beyond the page isn't hidden"
-        )
-        return EXIT_RUN_AGENT
-
-    _log(f"no new tickets ({len(results)} matched, all deduped) — skipping agentic run")
     _write_run_record("success", None, started_iso)
     return EXIT_SKIP_NO_WORK
 
