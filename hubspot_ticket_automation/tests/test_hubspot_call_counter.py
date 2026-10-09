@@ -565,13 +565,10 @@ def test_os_mode_moves_no_counter_and_sends_nothing(monkeypatch: pytest.MonkeyPa
 
 
 @pytest.fixture
-def pregate_main(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> list[dict]:
+def pregate_main(monkeypatch: pytest.MonkeyPatch) -> list[dict]:
     """`pregate_tickets.main` in hubspot mode with the client, the loaders and the
     token replaced — the search itself is left to the real code."""
     records: list[dict] = []
-    # RED only: while the pre-gate still has its own token reader, point it away
-    # from the real token file. Removed with that reader in the GREEN commit.
-    monkeypatch.setattr(pg, "TOKEN_PATH", tmp_path / "no-token-here", raising=False)
     monkeypatch.delenv("PACKN_SOURCE_MODE", raising=False)
     monkeypatch.setattr(client, "report_routine_schedule", lambda *_a, **_k: None)
     monkeypatch.setattr(client, "read_routine_enabled", lambda _name: True)

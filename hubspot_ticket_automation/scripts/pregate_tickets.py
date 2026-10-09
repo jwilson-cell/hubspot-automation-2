@@ -68,10 +68,7 @@ from __future__ import annotations
 
 import json
 import sys
-import time
 import traceback
-import urllib.error
-import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -82,6 +79,7 @@ from typing import Any, Callable, Optional
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
+from ticket_pipeline import hubspot_api as hs  # noqa: E402 — the one HubSpot chokepoint
 from ticket_pipeline import source  # noqa: E402
 from ticket_pipeline.source import (  # noqa: E402,F401 — re-exported: one candidate rule
     build_search_body,
@@ -95,19 +93,12 @@ ROUTINE = "tickets-process"
 # `bash scripts/run_tickets.sh`). Keep in sync with the wrapper's filename.
 CRON_MARKER = "run_tickets.sh"
 
-HUBSPOT_BASE = "https://api.hubapi.com"
-TOKEN_PATH = ROOT / "config" / ".secrets" / "hubspot_token.txt"
 SETTINGS_PATH = ROOT / "config" / "settings.yaml"
 STATE_PATH = ROOT / "config" / "state.json"
-
-RATE_FLOOR_S = 0.34  # same hard per-call floor as backfill_complaints.py
-RETRY_SLEEP_S = 2.0  # single retry backoff on 429/5xx
 
 EXIT_RUN_AGENT = 0
 EXIT_SKIP_NO_WORK = 10
 EXIT_SKIP_PAUSED = 11
-
-SEARCH_PATH = "/crm/v3/objects/tickets/search"
 
 # hubspot_candidates' decision and its reason.
 DECISION_RUN_AGENT = "run_agent"
@@ -154,48 +145,11 @@ def _load_state() -> dict:
         return {}
 
 
-def _read_token() -> Optional[str]:
-    try:
-        token = TOKEN_PATH.read_text(encoding="utf-8").strip()
-        return token or None
-    except OSError:
-        return None
-
-
-def _acquire_rate_token() -> None:
-    """Shared-bucket token + hard sleep floor (T-20-05-01 posture: the token
-    degrades to passthrough without REDIS_URL, so the sleep is the real guard)."""
-    try:
-        from packn_os_hubspot_client.rate_limit import acquire_hubspot_token
-
-        acquire_hubspot_token()
-    except Exception:
-        pass
-    time.sleep(RATE_FLOOR_S)
-
-
-def _search_tickets(body: dict, token: str) -> Optional[dict]:
-    """POST /crm/v3/objects/tickets/search; one retry on 429/5xx; None on failure."""
-    url = f"{HUBSPOT_BASE}/crm/v3/objects/tickets/search"
-    data = json.dumps(body).encode("utf-8")
-    for attempt in (1, 2):
-        _acquire_rate_token()
-        req = urllib.request.Request(url, data=data, method="POST")
-        req.add_header("Authorization", f"Bearer {token}")
-        req.add_header("Content-Type", "application/json")
-        try:
-            with urllib.request.urlopen(req, timeout=30) as resp:
-                return json.loads(resp.read().decode("utf-8"))
-        except urllib.error.HTTPError as e:
-            _log(f"search HTTP {e.code} (attempt {attempt})")
-            if e.code in (429,) or e.code >= 500:
-                time.sleep(RETRY_SLEEP_S)
-                continue
-            return None
-        except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError) as e:
-            _log(f"search transport error (attempt {attempt}): {e!r}")
-            time.sleep(RETRY_SLEEP_S)
-    return None
+# The HubSpot request, the rate-limit floor and the token read are NOT here: they
+# live once, in ticket_pipeline/hubspot_api.py, where every request code makes is
+# counted (Phase 93). This script calls hs.read_token() and hs.search_tickets(),
+# which keep what the pre-gate relies on — one retry on 429/5xx or a transport
+# error, and None when the search fails.
 
 
 def _write_run_record(status: str, error_summary: Optional[str], started_iso: str) -> None:
@@ -264,9 +218,11 @@ def hubspot_candidates(
     request. `settings` and `state` are read, never changed. A malformed
     `per_run_cap` raises (ValueError / TypeError): the caller owns that doubt.
 
-    `transport` is called as `transport(method, path, token, body)` and answers
-    the parsed response or None — the shape of ticket_pipeline.hubspot_api's
-    request function, and of tests/helpers/fakes.FakeHubSpotTransport.
+    The search goes through ticket_pipeline.hubspot_api.search_tickets, so it is
+    counted as one `search` call. `transport`, when given, replaces the request
+    function for it: called as `transport(method, path, token, body)`, it answers
+    the parsed response or None — the shape of hubspot_api's request function and
+    of tests/helpers/fakes.FakeHubSpotTransport.
     """
     mode = source.validate_mode(mode)
     if mode == source.MODE_OS:
@@ -279,10 +235,7 @@ def hubspot_candidates(
     fingerprints = state.get("ticket_fingerprints") or {}
 
     body = build_search_body(last_run_ms, active_stages, require_visitor, per_run_cap)
-    if transport is not None:
-        response = transport("POST", SEARCH_PATH, token, body)
-    else:
-        response = _search_tickets(body, token)
+    response = hs.search_tickets(body, token, transport=transport)
     # A search answer always carries `results`. One that does not (a failed call,
     # an empty or foreign body) is not a clean "nothing matched": fail open.
     if not isinstance(response, dict) or "results" not in response:
@@ -382,7 +335,7 @@ def main() -> int:
         _log(f"settings unreadable — deferring to agent: {e!r}")
         return EXIT_RUN_AGENT
 
-    token = _read_token()
+    token = hs.read_token()
     if token is None:
         _log("hubspot token missing — deferring to agent")
         return EXIT_RUN_AGENT

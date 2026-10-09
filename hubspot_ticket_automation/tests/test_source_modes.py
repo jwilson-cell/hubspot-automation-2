@@ -725,7 +725,7 @@ class _PregateWorld:
         monkeypatch.setattr(client, "read_ticket_source_mode", _absent_setting)
         monkeypatch.setattr(pg, "_load_settings", self._load_settings)
         monkeypatch.setattr(pg, "_load_state", lambda: json.loads(json.dumps(STATE)))
-        monkeypatch.setattr(pg, "_read_token", lambda: self.token)
+        monkeypatch.setattr(hubspot_api, "read_token", lambda: self.token)
         monkeypatch.setattr(pg, "hubspot_candidates", self._hubspot_candidates)
 
     def _load_settings(self) -> dict:
