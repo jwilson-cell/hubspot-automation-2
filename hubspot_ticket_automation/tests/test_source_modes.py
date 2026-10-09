@@ -1156,3 +1156,291 @@ def test_the_source_module_imports_only_the_standard_library_at_load() -> None:
     }
     assert {name.split(".")[0] for name in names} <= set(sys.stdlib_module_names)
     assert names  # the module does import something: the check is not vacuous
+
+
+# ======================================================================================
+# THE THIRD READER: the skill's guard (Phase 93, plan 15)
+#
+# The agent skill is the third reader of the one setting. It cannot branch in code, so
+# its first step is a code guard: `python -m ticket_pipeline.source --require <modes>`.
+# The guard takes the mode from PACKN_SOURCE_MODE when the wrapper exported it and
+# otherwise resolves it through the ONE reader, so a hand-run obeys the same switch.
+# Every case below injects the environment, the reader and the record writer.
+# ======================================================================================
+
+HUBSPOT_SKILL_SERVES = ("hubspot", "shadow")
+SKILL_PATH = PACKAGE_ROOT / ".claude" / "skills" / "hubspot-tickets" / "SKILL.md"
+GUARD_COMMAND = "py -m ticket_pipeline.source --require hubspot,shadow"
+
+
+class _GuardWorld:
+    """A reader and a record writer for the guard, both recording."""
+
+    def __init__(self, found: bool = False, value=None, read_error: Exception | None = None):
+        self.found, self.value, self.read_error = found, value, read_error
+        self.reads = 0
+        self.records: list[dict] = []
+        self.write_error: Exception | None = None
+
+    def reader(self) -> dict:
+        self.reads += 1
+        if self.read_error is not None:
+            raise self.read_error
+        return {"found": self.found, "value": self.value}
+
+    def write_record(self, *args, **kwargs) -> None:
+        if self.write_error is not None:
+            raise self.write_error
+        bound = inspect.signature(client.write_run_record).bind(*args, **kwargs)
+        bound.apply_defaults()
+        self.records.append(dict(bound.arguments))
+
+    def guard(self, env: dict, served=HUBSPOT_SKILL_SERVES):
+        return source.skill_guard(served, env=env, reader=self.reader, write_record=self.write_record)
+
+
+def test_skill_guard_wrapped_takes_the_exported_mode_without_reading() -> None:
+    world = _GuardWorld(read_error=AssertionError("the setting must not be read"))
+    assert world.guard({"PACKN_SOURCE_MODE": "shadow", "PACKN_RUN_ID": "run-1"}) == (0, "shadow")
+    assert world.reads == 0
+    assert world.records == []
+
+
+def test_skill_guard_wrapped_in_os_mode_stops_and_leaves_the_record_to_the_wrapper() -> None:
+    world = _GuardWorld(read_error=AssertionError("the setting must not be read"))
+    result = world.guard({"PACKN_SOURCE_MODE": "os", "PACKN_RUN_ID": "run-1"})
+    assert result == (3, "SOURCE_MODE_NOT_SERVED os")
+    assert world.reads == 0
+    assert world.records == []  # the wrapper owns the run's one record
+
+
+@pytest.mark.parametrize(
+    "exported, token",
+    [
+        pytest.param("banana", "SOURCE_MODE_UNKNOWN", id="unknown-export"),
+        pytest.param(" os", "SOURCE_MODE_UNKNOWN", id="padded-export"),
+    ],
+)
+def test_skill_guard_wrapped_with_an_unknown_export_stops_without_a_record(exported, token) -> None:
+    world = _GuardWorld()
+    assert world.guard({"PACKN_SOURCE_MODE": exported, "PACKN_RUN_ID": "run-1"}) == (4, token)
+    assert world.reads == 0  # an unknown exported value is never replaced by a read
+    assert world.records == []
+
+
+@pytest.mark.parametrize(
+    "found, value, mode",
+    [
+        pytest.param(False, None, "hubspot", id="absent-row"),
+        pytest.param(True, {"mode": "hubspot"}, "hubspot", id="hubspot"),
+        pytest.param(True, {"mode": "shadow"}, "shadow", id="shadow"),
+    ],
+)
+def test_skill_guard_unwrapped_reads_the_one_setting_and_serves(found, value, mode) -> None:
+    world = _GuardWorld(found, value)
+    assert world.guard({}) == (0, mode)
+    assert world.reads == 1
+    assert world.records == []
+
+
+def test_skill_guard_unwrapped_in_os_mode_stops_and_writes_one_skipped_record() -> None:
+    world = _GuardWorld(True, {"mode": "os"})
+    assert world.guard({}) == (3, "SOURCE_MODE_NOT_SERVED os")
+    (record,) = world.records
+    assert record["routine_name"] == "tickets-process"
+    assert record["status"] == "skipped"
+    assert record["source_mode"] == "os"
+    assert "os" in record["error_summary"].split("_")  # the summary names the mode
+    assert record["error_summary"] == "skill: source_mode_os_not_served"
+    assert record["failure_reason_code"] is None
+    assert record["tickets_processed"] == 0 and record["drafts_created"] == 0
+
+
+def test_skill_guard_unwrapped_with_an_unrecognised_value_stops_with_a_failure_record() -> None:
+    world = _GuardWorld(True, {"mode": "banana"})
+    assert world.guard({}) == (4, "SOURCE_MODE_UNKNOWN")
+    (record,) = world.records
+    assert record["status"] == "failure"
+    assert record["failure_reason_code"] == "source_unknown"
+    assert record["source_mode"] is None
+    assert record["error_summary"] == "skill: source_unknown"
+
+
+def test_skill_guard_unwrapped_with_an_unreadable_setting_stops_with_a_failure_record(
+    caplog: pytest.LogCaptureFixture, capfd: pytest.CaptureFixture
+) -> None:
+    caplog.set_level(logging.DEBUG)
+    world = _GuardWorld(read_error=RuntimeError(f"connection refused {MARKER}"))
+    assert world.guard({}) == (4, "SOURCE_MODE_UNREADABLE")
+    (record,) = world.records
+    assert record["status"] == "failure"
+    assert record["failure_reason_code"] == "source_unreadable"
+    assert record["source_mode"] is None
+    assert MARKER not in json.dumps(record, default=str)
+    fakes.assert_marker_absent(MARKER, caplog, capfd)
+
+
+@pytest.mark.parametrize(
+    "found, value, expected",
+    [
+        pytest.param(True, {"mode": "os"}, (3, "SOURCE_MODE_NOT_SERVED os"), id="not-served"),
+        pytest.param(True, None, (4, "SOURCE_MODE_UNKNOWN"), id="unknown"),
+    ],
+)
+def test_skill_guard_still_stops_when_its_record_cannot_be_written(
+    capfd: pytest.CaptureFixture, found, value, expected
+) -> None:
+    world = _GuardWorld(found, value)
+    world.write_error = RuntimeError(f"insert refused {MARKER}")
+    assert world.guard({}) == expected
+    out, err = capfd.readouterr()
+    code_lines = [line for line in err.splitlines() if "guard_record_unwritable" in line]
+    assert code_lines == ["[source] guard_record_unwritable:RuntimeError"]
+    assert MARKER not in out + err
+
+
+def test_skill_guard_an_empty_run_id_is_not_the_wrapper() -> None:
+    world = _GuardWorld(True, {"mode": "os"})
+    assert world.guard({"PACKN_RUN_ID": ""}) == (3, "SOURCE_MODE_NOT_SERVED os")
+    assert len(world.records) == 1
+
+
+def test_skill_guard_serves_what_it_is_asked_to_serve() -> None:
+    """Plan 93-16's skill uses the same guard with `--require os`."""
+    world = _GuardWorld(True, {"mode": "os"})
+    assert world.guard({}, served=("os",)) == (0, "os")
+    assert world.guard({"PACKN_SOURCE_MODE": "hubspot", "PACKN_RUN_ID": "r"}, served=("os",)) == (
+        3,
+        "SOURCE_MODE_NOT_SERVED hubspot",
+    )
+    assert world.records == []
+    with pytest.raises(ValueError):
+        world.guard({}, served=("hubspot", "banana"))
+
+
+def test_skill_guard_default_reader_and_writer_are_the_one_reader_and_the_helpers_record(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    records: list[tuple] = []
+    monkeypatch.setattr(client, "read_ticket_source_mode", _reader(True, {"mode": "os"}))
+    monkeypatch.setattr(client, "write_run_record", lambda *a, **k: records.append((a, k)))
+    assert source.skill_guard(HUBSPOT_SKILL_SERVES, env={}) == (3, "SOURCE_MODE_NOT_SERVED os")
+    ((args, kwargs),) = records
+    assert args[:2] == ("tickets-process", "skipped")
+    assert kwargs["source_mode"] == "os"
+
+
+def test_the_guards_names_match_the_orchestrators() -> None:
+    from ticket_pipeline import run_types
+
+    assert source.RUN_ID_ENV == run_types.RUN_ID_ENV == "PACKN_RUN_ID"
+    assert source.GUARD_ROUTINE == run_types.ROUTINE == pg.ROUTINE
+    assert (source.GUARD_EXIT_SERVED, source.GUARD_EXIT_USAGE) == (0, 2)
+    assert (source.GUARD_EXIT_NOT_SERVED, source.GUARD_EXIT_NOT_ESTABLISHED) == (3, 4)
+
+
+# --- the command line
+
+
+def test_guard_command_line_prints_the_token_and_returns_the_code(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+) -> None:
+    monkeypatch.setenv("PACKN_RUN_ID", "run-1")
+    monkeypatch.setenv("PACKN_SOURCE_MODE", "shadow")
+    assert source.main(["--require", "hubspot,shadow"]) == 0
+    assert capsys.readouterr().out == "shadow\n"
+    monkeypatch.setenv("PACKN_SOURCE_MODE", "os")
+    assert source.main(["--require", "hubspot,shadow"]) == 3
+    assert capsys.readouterr().out == "SOURCE_MODE_NOT_SERVED os\n"
+    assert source.main(["--require", "os"]) == 0
+    assert capsys.readouterr().out == "os\n"
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        pytest.param(["--require", "hubspot,banana"], id="unknown-name"),
+        pytest.param(["--require", ""], id="empty-list"),
+        pytest.param(["--require"], id="no-list"),
+        pytest.param([], id="no-arguments"),
+        pytest.param(["hubspot"], id="no-flag"),
+        pytest.param(["--require", "hubspot", "extra"], id="extra-argument"),
+    ],
+)
+def test_guard_command_line_usage_error_is_exit_2_and_writes_nothing(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture, argv
+) -> None:
+    touched: list[str] = []
+    monkeypatch.delenv("PACKN_RUN_ID", raising=False)
+    monkeypatch.delenv("PACKN_SOURCE_MODE", raising=False)
+    monkeypatch.setattr(client, "read_ticket_source_mode", lambda: touched.append("read"))
+    monkeypatch.setattr(client, "write_run_record", lambda *a, **k: touched.append("write"))
+    assert source.main(argv) == 2
+    assert touched == []
+    assert capsys.readouterr().out == ""
+
+
+def test_guard_command_line_runs_as_a_module_from_the_project_root() -> None:
+    """The exact command the skill runs, with the interpreter of this test run. Under
+    the wrapper's two variables the guard reads no setting and writes no record, so
+    the child touches no database."""
+    import os
+    import subprocess
+
+    env = dict(os.environ, PACKN_RUN_ID="run-1", PACKN_SOURCE_MODE="shadow")
+    env.pop("PACKN_OS_DATABASE_URL", None)
+    served = subprocess.run(
+        [sys.executable, "-m", "ticket_pipeline.source", "--require", "hubspot,shadow"],
+        cwd=str(PACKAGE_ROOT), env=env, capture_output=True, text=True, timeout=60,
+    )
+    assert (served.returncode, served.stdout.strip()) == (0, "shadow")
+    env["PACKN_SOURCE_MODE"] = "os"
+    refused = subprocess.run(
+        [sys.executable, "-m", "ticket_pipeline.source", "--require", "hubspot,shadow"],
+        cwd=str(PACKAGE_ROOT), env=env, capture_output=True, text=True, timeout=60,
+    )
+    assert (refused.returncode, refused.stdout.strip()) == (3, "SOURCE_MODE_NOT_SERVED os")
+
+
+# --- the skill's text
+
+
+def _skill_text() -> str:
+    return SKILL_PATH.read_text(encoding="utf-8")
+
+
+def _source_mode_block(text: str) -> str:
+    start = text.index("## Source mode")
+    end = text.index("\n## ", start + 1)
+    return text[start:end]
+
+
+def test_the_skill_states_the_modes_it_serves_and_runs_the_guard() -> None:
+    block = _source_mode_block(_skill_text())
+    assert GUARD_COMMAND in block
+    assert "serves `hubspot` and `shadow`" in block
+    assert "does not serve `os`" in block
+    assert "FIRST" in block
+    # the stop rule
+    assert "STOP" in block
+    for token in ("SOURCE_MODE_NOT_SERVED", "SOURCE_MODE_UNKNOWN", "SOURCE_MODE_UNREADABLE"):
+        assert token in block
+    assert "do nothing else" in block
+
+
+def test_the_guard_comes_before_the_skills_first_hubspot_instruction() -> None:
+    text = _skill_text()
+    guard_at = text.index(GUARD_COMMAND)
+    assert text.count(GUARD_COMMAND) == 1
+    # the first instruction that calls HubSpot is the first MCP tool the skill names
+    assert guard_at < text.index("mcp__claude_ai_HubSpot__")
+    assert guard_at < text.index("## Discovery step")
+    assert guard_at < text.index("## Step 0")
+    assert guard_at < text.index("## Main loop")
+
+
+def test_the_skill_never_works_out_the_mode_another_way() -> None:
+    text = _skill_text()
+    assert "read_ticket_source_mode" not in text
+    assert "app_settings" not in text
+    assert "ticket_source_mode" not in text

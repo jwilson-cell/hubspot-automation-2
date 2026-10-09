@@ -173,6 +173,34 @@ def current_mode(
 
 
 # ===========================================================================
+# THE SKILL'S GUARD (Phase 93, plan 15) — SKELETON: names only, no behaviour
+# ===========================================================================
+
+GUARD_EXIT_SERVED = 0
+GUARD_EXIT_USAGE = 2
+GUARD_EXIT_NOT_SERVED = 3
+GUARD_EXIT_NOT_ESTABLISHED = 4
+TOKEN_NOT_SERVED = "SOURCE_MODE_NOT_SERVED"
+TOKEN_UNKNOWN = "SOURCE_MODE_UNKNOWN"
+TOKEN_UNREADABLE = "SOURCE_MODE_UNREADABLE"
+RUN_ID_ENV = "PACKN_RUN_ID"
+GUARD_ROUTINE = "tickets-process"
+
+
+def skill_guard(
+    served: Any,
+    env: Optional[Mapping[str, str]] = None,
+    reader: Optional[Callable[[], Any]] = None,
+    write_record: Optional[Callable[..., Any]] = None,
+) -> tuple[Any, Any]:
+    return None, None
+
+
+def main(argv: Optional[list] = None) -> int:
+    return None  # type: ignore[return-value]
+
+
+# ===========================================================================
 # THE CANDIDATE RULE (pure: no HTTP, no database, no filesystem)
 # Unit-tested in packn_os_hubspot_client/tests/test_pregate.py through the
 # pre-gate's re-exports, and in tests/test_source_modes.py.
