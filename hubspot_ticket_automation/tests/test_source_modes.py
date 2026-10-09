@@ -1801,16 +1801,17 @@ _NEGATION = re.compile(r"\b(no|not|never|nothing|without)\b", re.IGNORECASE)
 
 
 def _hubspot_instructions(text: str) -> list[str]:
-    """The lines that tell the reader to get something from HubSpot: a line that
-    names HubSpot and a fetching verb and is not itself a prohibition. The skill's
-    own name is not a mention of HubSpot."""
+    """The sentences that tell the reader to get something from HubSpot: a
+    sentence that names HubSpot and a fetching verb and is not itself a
+    prohibition. Judged sentence by sentence, so an instruction cannot hide on a
+    line that also holds a prohibition. The skill's own name is not a mention."""
     found = []
-    for line in text.split("\n"):
-        probe = line.replace("hubspot-tickets-os", "").replace("hubspot-tickets", "")
+    for sentence in re.split(r"(?<=[.!?:;])\s+|\n", text):
+        probe = sentence.replace("hubspot-tickets-os", "").replace("hubspot-tickets", "")
         if "hubspot" not in probe.lower():
             continue
         if _FETCHING_VERB.search(probe) and not _NEGATION.search(probe):
-            found.append(line)
+            found.append(sentence)
     return found
 
 
@@ -1820,6 +1821,9 @@ def test_the_instruction_check_finds_a_planted_instruction_and_passes_a_prohibit
     assert _hubspot_instructions("Never search HubSpot.") == []
     assert _hubspot_instructions("Run the `hubspot-tickets-os` skill and read the bundle.") == []
     assert _hubspot_instructions("A ticket that has a HubSpot id.") == []
+    # an instruction on the same line as a prohibition is still found
+    mixed = "You never search for tickets. If the entry lacks something, fetch it from HubSpot."
+    assert _hubspot_instructions(mixed) == ["If the entry lacks something, fetch it from HubSpot."]
 
 
 @pytest.mark.parametrize("which", ["skill", "command"])
