@@ -196,6 +196,56 @@ def write_draft(
 
 
 # ---------------------------------------------------------------------------
+# Phase 93 (plan 14) — one pending draft per ticket, replaced atomically.
+#
+# RED skeleton: the names and signatures only.
+# ---------------------------------------------------------------------------
+
+DRAFT_LOCK_PREFIX = "task_reply_draft"
+ROLLBACK_CYCLE_PREFIX = "hubspot"
+CYCLE_SEPARATOR = "#"
+RUN_CONTEXT_ENV = "PACKN_RUN_CONTEXT"
+DRAFT_LOCK_SQL = ""
+
+
+def draft_lock_key(draft_key: str) -> str:
+    return ""
+
+
+def replace_pending_draft(
+    *,
+    draft_key: str,
+    os_ticket_id: Optional[str],
+    routine_name: str,
+    draft_body: str,
+    model: str,
+    base_prompt_version: str,
+    cycle_key: str,
+    hubspot_ticket_snapshot: dict,
+) -> dict:
+    return {"draft_id": "", "created": False, "superseded": 0}
+
+
+def load_run_context() -> dict:
+    return {}
+
+
+def write_cron_draft(
+    ticket_id: str,
+    routine_name: str,
+    draft_body: str,
+    model: str,
+    prompt_version: str,
+    hubspot_ticket_snapshot: dict,
+) -> str:
+    return ""
+
+
+def rollback_cycle_entries(run_id: str, routine_name: str = "tickets-process") -> dict:
+    return {}
+
+
+# ---------------------------------------------------------------------------
 # Phase 20 (D-01/D-04) — complaint-mirror writer helpers.
 #
 # The deterministic post-run writer (scripts/write_complaints.py) consumes the

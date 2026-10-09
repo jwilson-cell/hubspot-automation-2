@@ -14,7 +14,8 @@ Env vars expected (defaults below match docker-compose.yml host mapping):
 
 import os
 import urllib.parse
-from typing import Generator, Mapping, Optional
+import uuid
+from typing import Callable, Generator, Mapping, Optional
 
 import psycopg
 import pytest
@@ -25,6 +26,8 @@ from psycopg.rows import dict_row
 # roots, so the import resolves whichever root is run; if it ever does not, the
 # ImportError stops collection, which is louder than running with no guard.
 from tests.helpers import network_guard
+
+from packn_os_hubspot_client.tenant import TENANT_ID
 
 # Default points at the dev docker Postgres (port 5433 to match the
 # docker-compose host mapping that avoids the native Windows postgres on
@@ -265,3 +268,97 @@ def _cleanup(conn: psycopg.Connection) -> None:
             "DELETE FROM customer_complaints WHERE hubspot_ticket_id LIKE 'pytest-%'"
         )
     conn.commit()
+
+
+# ---------------------------------------------------------------------------
+# Phase 93 (plan 14) — a ticket row for the draft tests.
+#
+# automation_drafts.os_ticket_id is a foreign key to tickets, so a draft that
+# carries one needs a real ticket. These fixtures insert a minimal row under the
+# shared tenant on their own committed connection and remove it afterwards. The
+# row is recognisable two ways: its HubSpot id starts with `pytest-` (when it has
+# one) and its subject starts with SEEDED_TICKET_SUBJECT_PREFIX (always), which
+# is what the sweep before and after each test keys on.
+# ---------------------------------------------------------------------------
+
+SEEDED_TICKET_SUBJECT_PREFIX = "pytest-93-14-seeded"
+
+
+def _sweep_seeded_tickets(conn: psycopg.Connection) -> None:
+    """Remove the suite's drafts first (they point at the tickets), then the tickets."""
+    like = SEEDED_TICKET_SUBJECT_PREFIX + "%"
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            DELETE FROM automation_drafts
+            WHERE routine_name LIKE 'pytest-%%'
+               OR os_ticket_id IN (
+                    SELECT id FROM tickets WHERE tenant_id = %s AND subject LIKE %s
+               )
+            """,
+            (TENANT_ID, like),
+        )
+        cur.execute(
+            "DELETE FROM tickets WHERE tenant_id = %s AND subject LIKE %s",
+            (TENANT_ID, like),
+        )
+    conn.commit()
+
+
+@pytest.fixture
+def seeded_tickets(test_db_url: str) -> Generator[Callable[..., dict], None, None]:
+    """A factory: `make(with_hubspot_id=True)` inserts one ticket and returns
+
+        {"id": <OS uuid as text>, "hubspot_ticket_id": <"pytest-…" or None>,
+         "draft_key": <the text key a draft of this ticket is written under>}
+
+    `draft_key` follows the OS rule (draftTicketKeyValue): the HubSpot id when the
+    ticket has one, else the OS id as text.
+    """
+    conn = psycopg.connect(test_db_url, row_factory=dict_row)
+    _sweep_seeded_tickets(conn)
+
+    def make(with_hubspot_id: bool = True) -> dict:
+        ticket_id = str(uuid.uuid4())
+        hubspot_id = f"pytest-{uuid.uuid4().hex[:12]}" if with_hubspot_id else None
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO tickets
+                  (id, tenant_id, hubspot_ticket_id, source_of_record, channel, state, subject)
+                VALUES (%s, %s, %s, %s, %s, 'open', %s)
+                """,
+                (
+                    ticket_id,
+                    TENANT_ID,
+                    hubspot_id,
+                    "hubspot" if with_hubspot_id else "os",
+                    "hubspot_email" if with_hubspot_id else "portal",
+                    f"{SEEDED_TICKET_SUBJECT_PREFIX} {ticket_id}",
+                ),
+            )
+        conn.commit()
+        return {
+            "id": ticket_id,
+            "hubspot_ticket_id": hubspot_id,
+            "draft_key": hubspot_id if hubspot_id is not None else ticket_id,
+        }
+
+    try:
+        yield make
+    finally:
+        conn.rollback()
+        _sweep_seeded_tickets(conn)
+        conn.close()
+
+
+@pytest.fixture
+def seeded_ticket(seeded_tickets: Callable[..., dict]) -> dict:
+    """One ticket that has a HubSpot id (the common case)."""
+    return seeded_tickets()
+
+
+@pytest.fixture
+def seeded_ticket_without_hubspot_id(seeded_tickets: Callable[..., dict]) -> dict:
+    """One ticket with no HubSpot id: its draft key is its OS id as text."""
+    return seeded_tickets(with_hubspot_id=False)
