@@ -69,6 +69,7 @@ import importlib
 import json
 import re
 import sys
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
@@ -129,6 +130,51 @@ RERUN_FETCH_FAILED = "rerun_fetch_failed"
 RESULT_UNKNOWN_REFS = "result_unknown_refs"
 RESULT_DUPLICATE_REFS = "result_duplicate_refs"
 BUNDLE_UNWRITABLE = "bundle_unwritable"
+
+# --- persistence (Plan 93-17): the contract's constants -----------------------
+# tests/test_contract_fixtures.py pins each of these to Pack'N OS's fixture
+# docs/contracts/fixtures/tickets-api-classification.v1.json.
+#
+# The prompt version a write-back reports: the real one, never the
+# cycle-suffixed version a draft row carries.
+BASE_PROMPT_VERSION = "v3.3.0"
+SOURCE_MODE_OS = "os"
+DRAFT_WRITE_FAILED = "draft_write_failed"
+# The OS's closed list of per-ticket failure codes (CRON_PASS_FAILURE_CODES).
+PASS_FAILURE_CODES = (
+    AGENT_NO_RESULT,
+    AGENT_TICKET_ERROR,
+    BUNDLE_BUILD_FAILED,
+    THREAD_FETCH_FAILED,
+    DRAFT_WRITE_FAILED,
+    OTHER,
+)
+REASON_MAX_CHARS = 1000
+FORM_TOPIC_MAX_CHARS = 200
+PRIORITIES = ("urgent", "normal")
+# The contract's fifteen category slugs. A copy, on purpose: the classifier's
+# own set lives in a module that imports the model SDK, which a run that only
+# persists must not need. A test compares this with the contract fixture AND
+# with the classifier's set, so the copy cannot drift.
+CATEGORY_SLUGS = (
+    "wismo_tracking",
+    "shipping_delay",
+    "damaged_goods",
+    "mispack_wrong_item",
+    "inventory_discrepancy",
+    "inbound_asn_receiving",
+    "returns_rma",
+    "integration_system",
+    "billing_invoice",
+    "sla_escalation",
+    "account_onboarding",
+    "kitting_project",
+    "address_recipient",
+    "retailer_compliance",
+    "other_unclassified",
+)
+# One retry of a write-back the OS could not be asked, after this pause.
+WRITEBACK_RETRY_PAUSE_S = 2.0
 
 # The keys of one bundle entry, in the order they are written.
 ENTRY_KEYS = (
@@ -607,6 +653,67 @@ def reconcile(entries: list, result: Any) -> tuple[list, dict]:
     if duplicates:
         counts[RESULT_DUPLICATE_REFS] = duplicates
     return tickets, counts
+
+
+# ===========================================================================
+# PERSISTENCE (Plan 93-17)
+# ===========================================================================
+
+# The pause before the one retry. A module name so a test never waits.
+_sleep = time.sleep
+
+
+@dataclass
+class FinalizeSummary:
+    """What the finalizer did, in ids, codes and counts."""
+
+    tickets_processed: int = 0
+    drafts_created: int = 0
+    codes: dict = field(default_factory=dict)
+    partial: bool = False
+    dry_run: bool = False
+    would: dict = field(default_factory=dict)
+    tickets: list = field(default_factory=list)
+
+
+def summary_text(summary: FinalizeSummary) -> Optional[str]:
+    return None
+
+
+def normalise_classification(raw: Any) -> Optional[dict]:
+    return None
+
+
+def map_failure_code(code: Any) -> str:
+    return ""
+
+
+def build_classification_payload(entry: dict, ticket_result: dict, run_id: str, source_mode: str) -> dict:
+    return {}
+
+
+def build_draft_snapshot(entry: dict, ticket_result: dict, now_iso: str) -> dict:
+    return {}
+
+
+def post_ticket_writeback(
+    api: Any, entry: dict, ticket_result: dict, run_id: str, source_mode: str, *, sleep: Any = None
+) -> dict:
+    return {}
+
+
+def finalize_os_run(
+    ctx: RunContext,
+    deps: Deps,
+    bundle_entries: list,
+    result: Any,
+    *,
+    settings: Any = None,
+    token_box: Optional[dict] = None,
+    unbundled: Any = (),
+    sleep: Any = None,
+) -> FinalizeSummary:
+    return FinalizeSummary()
 
 
 # ===========================================================================

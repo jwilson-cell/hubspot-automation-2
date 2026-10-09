@@ -1,0 +1,48 @@
+{
+  "contract_version": "1",
+  "completed": {
+    "contract_version": "1",
+    "run_id": "7c9e6679-7425-40de-944b-e07fc1f90ae7",
+    "outcome": "completed",
+    "source_mode": "os",
+    "signal": {
+      "id": "1c7d2e3f-4a5b-4c6d-9e8f-0a1b2c3d4e5f",
+      "at": "2026-10-08T10:00:00.123Z"
+    },
+    "prompt_version": "v3.3.0",
+    "model": "claude-sonnet-5",
+    "category": "wismo_tracking",
+    "confidence": 0.9,
+    "priority": "normal",
+    "reason": "The client asks where the parcel is; the last carrier scan is two days old.",
+    "form_topic": "Shipping question"
+  },
+  "failed": {
+    "contract_version": "1",
+    "run_id": "7c9e6679-7425-40de-944b-e07fc1f90ae7",
+    "outcome": "failed",
+    "source_mode": "os",
+    "signal": {
+      "id": "1c7d2e3f-4a5b-4c6d-9e8f-0a1b2c3d4e5f",
+      "at": "2026-10-08T10:00:00.123Z"
+    },
+    "prompt_version": "v3.3.0",
+    "model": "claude-sonnet-5",
+    "failure_reason_code": "agent_no_result"
+  },
+  "failure_reason_codes": [
+    "agent_no_result",
+    "agent_ticket_error",
+    "bundle_build_failed",
+    "thread_fetch_failed",
+    "draft_write_failed",
+    "other"
+  ],
+  "limits": {
+    "reason_max_chars": 1000,
+    "form_topic_max_chars": 200,
+    "prompt_version_max_chars": 64,
+    "model_max_chars": 100,
+    "max_body_bytes": 65536
+  }
+}

@@ -15,18 +15,28 @@ The second half pins the cron's category list to the contract's: the classifier'
 own set, and the category keys of config/categories.yaml as picked by
 `os_bundle.category_keys` — an exclude-list, so the comparison is a real check.
 
+A fourth file is the WRITE contract (plan 17), copied from the OS's plan 93-05:
+
+    tickets-api-classification.v1.json   POST /api/tickets/{id}/classification
+
+It is pinned the same way, and the third half ties the cron's write-back to it:
+the six failure codes, the two text limits, the prompt version and the model
+are named constants of `os_pass` that equal the fixture's values, and the
+request builder reproduces both fixture bodies key for key.
+
 No network, no database, no model call.
 """
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 from pathlib import Path
 
 import pytest
 import yaml
 
-from ticket_pipeline import llm, os_bundle
+from ticket_pipeline import llm, os_bundle, os_pass
 
 PACKAGE_ROOT = Path(__file__).resolve().parent.parent  # hubspot_ticket_automation/
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
@@ -35,6 +45,7 @@ CATEGORIES_PATH = PACKAGE_ROOT / "config" / "categories.yaml"
 LIST_FIXTURE = "tickets-api-list.v1.json"
 TICKET_FIXTURE = "tickets-api-ticket.v1.json"
 SLUGS_FIXTURE = "ticket-category-slugs.v1.json"
+CLASSIFICATION_FIXTURE = "tickets-api-classification.v1.json"
 
 # The literals of 93-04-SUMMARY ("Fixtures"). Pack'N OS asserts the same three in
 # tests/unit/tickets/cron-contract.test.ts.
@@ -42,6 +53,8 @@ PINNED_CHECKSUMS = {
     LIST_FIXTURE: "8205533cee0f4195f5a97d44c76f30adf4f65467a3f423bbfbbc43694e3580ce",
     TICKET_FIXTURE: "3a7b120917d024b9ae596732215ff53ad3cd2f6a795502f088d311881ad6b396",
     SLUGS_FIXTURE: "fadc6c90ab14c62f1360ca8992afdb4d43305a4ca581254b0129cdb021107e85",
+    # 93-05-SUMMARY ("Fixture"): 1303 bytes.
+    CLASSIFICATION_FIXTURE: "f585b19aef732d6e3bb07d93383e3b5dcc395948e242671cd96b341edbdf2aa1",
 }
 
 # The four top-level keys of config/categories.yaml that are not categories.
@@ -260,3 +273,91 @@ def test_category_keys_does_not_know_the_category_list() -> None:
 def test_category_keys_refuses_a_config_that_is_not_a_mapping(not_a_config) -> None:
     with pytest.raises(TypeError):
         os_bundle.category_keys(not_a_config)
+
+
+# ------------------------------------------------------------------ the write-back contract (plan 17)
+
+# The run id of both fixture bodies. The ticket is ticket 1 of the list fixture.
+FIXTURE_RUN_ID = "7c9e6679-7425-40de-944b-e07fc1f90ae7"
+
+
+def _fixture_entry() -> dict:
+    """What the write-back builder reads of a bundle entry, for list ticket 1."""
+    ticket = load_fixture(LIST_FIXTURE)["tickets"][0]
+    return {"os_ticket_id": ticket["id"], "signal": dict(ticket["signal"])}
+
+
+def test_the_classification_fixture_is_two_bodies_the_codes_and_the_limits() -> None:
+    body = load_fixture(CLASSIFICATION_FIXTURE)
+    assert list(body) == ["contract_version", "completed", "failed", "failure_reason_codes", "limits"]
+    assert len(read_fixture_text(CLASSIFICATION_FIXTURE).replace(CR + LF, LF).encode("utf-8")) == 1303
+    assert body["completed"]["signal"] == body["failed"]["signal"]
+    ticket = load_fixture(LIST_FIXTURE)["tickets"][0]
+    assert body["completed"]["signal"] == {"id": ticket["signal"]["id"], "at": ticket["signal"]["at"]}
+
+
+def test_the_pass_failure_codes_are_the_fixtures_six_in_order() -> None:
+    assert list(os_pass.PASS_FAILURE_CODES) == load_fixture(CLASSIFICATION_FIXTURE)["failure_reason_codes"]
+    assert len(set(os_pass.PASS_FAILURE_CODES)) == 6
+
+
+def test_the_two_text_limits_are_the_fixtures() -> None:
+    limits = load_fixture(CLASSIFICATION_FIXTURE)["limits"]
+    assert os_pass.REASON_MAX_CHARS == limits["reason_max_chars"] == 1000
+    assert os_pass.FORM_TOPIC_MAX_CHARS == limits["form_topic_max_chars"] == 200
+
+
+def test_the_prompt_version_and_the_model_are_the_fixtures_literals() -> None:
+    """Checker WIRE-W4: the write-back reports the real prompt version and the
+    agent's model, and both are named constants the builder cannot be argued out of."""
+    body = load_fixture(CLASSIFICATION_FIXTURE)
+    for shape in ("completed", "failed"):
+        assert os_pass.BASE_PROMPT_VERSION == body[shape]["prompt_version"] == "v3.3.0"
+        assert os_pass.AGENT_MODEL == body[shape]["model"]
+    assert os_pass.AGENT_MODEL == llm.DRAFT_MODEL
+    assert os_pass.AGENT_MODEL != llm.CLASSIFY_MODEL
+    limits = body["limits"]
+    assert 1 <= len(os_pass.BASE_PROMPT_VERSION) <= limits["prompt_version_max_chars"]
+    assert 1 <= len(os_pass.AGENT_MODEL) <= limits["model_max_chars"]
+    assert "#" not in os_pass.BASE_PROMPT_VERSION  # never the cycle-suffixed draft version
+
+
+def test_the_write_backs_category_list_is_the_contracts_and_the_classifiers() -> None:
+    slugs = load_fixture(SLUGS_FIXTURE)["slugs"]
+    assert list(os_pass.CATEGORY_SLUGS) == slugs
+    assert set(os_pass.CATEGORY_SLUGS) == llm.VALID_CATEGORIES
+
+
+def test_the_builder_takes_the_entry_the_ticket_result_the_run_id_and_the_mode_only() -> None:
+    assert list(inspect.signature(os_pass.build_classification_payload).parameters) == [
+        "entry",
+        "ticket_result",
+        "run_id",
+        "source_mode",
+    ]
+
+
+def test_the_completed_builder_reproduces_the_fixture_body_key_for_key() -> None:
+    expected = load_fixture(CLASSIFICATION_FIXTURE)["completed"]
+    ticket_result = {
+        "outcome": "completed",
+        "classification": {
+            "category": expected["category"],
+            "confidence": expected["confidence"],
+            "priority": expected["priority"],
+            "reason": expected["reason"],
+            "form_topic": expected["form_topic"],
+        },
+    }
+    built = os_pass.build_classification_payload(_fixture_entry(), ticket_result, FIXTURE_RUN_ID, "os")
+    assert built == expected
+    assert list(built) == list(expected)
+    assert list(built["signal"]) == ["id", "at"]
+
+
+def test_the_failed_builder_reproduces_the_fixture_body_key_for_key() -> None:
+    expected = load_fixture(CLASSIFICATION_FIXTURE)["failed"]
+    ticket_result = {"outcome": "failed", "failure_reason_code": expected["failure_reason_code"]}
+    built = os_pass.build_classification_payload(_fixture_entry(), ticket_result, FIXTURE_RUN_ID, "os")
+    assert built == expected
+    assert list(built) == list(expected)

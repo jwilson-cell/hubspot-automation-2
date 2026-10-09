@@ -396,6 +396,38 @@ class OsAgent:
         return self.exit_code
 
 
+class ScriptedOsApi(fakes.FakeOsApi):
+    """`fakes.FakeOsApi`, plus two things the finalizer's tests need (plan 17):
+
+        timeline   every write-back is also appended to a list the draft fake
+                   shares, as ("writeback", <OS ticket id>, <outcome>), so one
+                   log shows which came first
+        script     the answers of the next write-backs, in order: a result dict
+                   is returned, an exception is raised; when it is empty the
+                   fake's canned result answers
+    """
+
+    def __init__(self, timeline: list, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.timeline = timeline
+        self.script: list = []
+
+    def post_classification(self, os_ticket_id, payload):
+        self.timeline.append(("writeback", str(os_ticket_id), payload.get("outcome")))
+        self._record("post_classification", os_ticket_id, payload)
+        if self.script:
+            step = self.script.pop(0)
+            if isinstance(step, BaseException):
+                raise step
+            return copy.deepcopy(step)
+        return copy.deepcopy(
+            self.classification_results.get(str(os_ticket_id), self.classification_result)
+        )
+
+
+_UUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.I)
+
+
 class OsWorld:
     """One orchestrator in `os` mode with every collaborator replaced."""
 
@@ -406,7 +438,8 @@ class OsWorld:
         self.root = base / "root"
         self.root.mkdir()
         self.client = FakeClient()
-        self.os_api: Any = fakes.FakeOsApi(unprocessed=_list())
+        self.timeline: list[tuple] = []  # draft and write-back calls, in the order made
+        self.os_api: Any = ScriptedOsApi(self.timeline, unprocessed=_list())
         self.read_os_origin: Any = self._read_os_origin
         self.origin_reads = 0
         self.hubspot = HubSpotOpener({T1_HS_ID: list(T1_EMAILS), T3_HS_ID: list(T3_EMAILS)})
@@ -427,9 +460,21 @@ class OsWorld:
         self.environ = {"PATH": "kept-path", "PACKN_KEEP_ME": "1"}
         self._tick = datetime(2026, 10, 9, 12, 0, 0, tzinfo=timezone.utc)
         self.outcomes: list[Any] = []
+        # The finalizer (plan 17) writes through the atomic replace ONLY. The two
+        # plain writers still fail a test; the replace and the rerun mark are
+        # recording fakes, and no test ever waits for a retry pause.
         self.draft_writes: list[str] = []
-        for name in ("write_draft", "write_cron_draft", "replace_pending_draft"):
+        for name in ("write_draft", "write_cron_draft"):
             monkeypatch.setattr(client, name, self._draft_writer(name))
+        self.drafts: list[dict] = []  # the keyword arguments of each replace call
+        self.draft_errors: dict[str, Exception] = {}  # draft key -> what the write raises
+        self._draft_cycles: dict[tuple, str] = {}
+        self.rerun_marks: list[tuple[str, str]] = []
+        self.rerun_mark_error: Optional[Exception] = None
+        self.sleeps: list[float] = []
+        monkeypatch.setattr(client, "replace_pending_draft", self._replace_pending_draft)
+        monkeypatch.setattr(client, "mark_rerun_processed", self._mark_rerun_processed)
+        monkeypatch.setattr(os_pass, "_sleep", self.sleeps.append)
 
         def spy(ctx: Any, deps: Any) -> Any:
             outcome = os_pass.run_os(ctx, deps)
@@ -443,9 +488,61 @@ class OsWorld:
     def _draft_writer(self, name: str) -> Callable[..., Any]:
         def record(*_args: Any, **_kwargs: Any) -> Any:
             self.draft_writes.append(name)
-            raise AssertionError(f"plan 93-16 writes no draft, yet {name} was called")
+            raise AssertionError(f"os mode writes a draft through the atomic replace only, yet {name} was called")
 
         return record
+
+    def _replace_pending_draft(
+        self,
+        *,
+        draft_key: str,
+        os_ticket_id: Optional[str],
+        routine_name: str,
+        draft_body: str,
+        model: str,
+        base_prompt_version: str,
+        cycle_key: str,
+        hubspot_ticket_snapshot: dict,
+    ) -> dict:
+        """`client.replace_pending_draft` without a database: the same keyword-only
+        parameters (a test compares the two signatures), the same refusals before
+        any write, and the same answer for a cycle it has already seen."""
+        self.timeline.append(("draft", draft_key))
+        self.drafts.append(
+            copy.deepcopy(
+                {
+                    "draft_key": draft_key,
+                    "os_ticket_id": os_ticket_id,
+                    "routine_name": routine_name,
+                    "draft_body": draft_body,
+                    "model": model,
+                    "base_prompt_version": base_prompt_version,
+                    "cycle_key": cycle_key,
+                    "hubspot_ticket_snapshot": hubspot_ticket_snapshot,
+                }
+            )
+        )
+        error = self.draft_errors.get(draft_key)
+        if error is not None:
+            raise error
+        if "category" not in hubspot_ticket_snapshot or "captured_at" not in hubspot_ticket_snapshot:
+            raise ValueError("the snapshot needs category and captured_at")
+        if client.CYCLE_SEPARATOR in base_prompt_version:
+            raise ValueError("base_prompt_version already carries a cycle key")
+        if os_ticket_id is not None and not _UUID_RE.fullmatch(str(os_ticket_id)):
+            raise ValueError("os_ticket_id must be a uuid string or None")
+        cycle = (routine_name, draft_key, cycle_key)
+        if cycle in self._draft_cycles:
+            return {"draft_id": self._draft_cycles[cycle], "created": False, "superseded": 0}
+        draft_id = f"draft-{len(self._draft_cycles) + 1}"
+        self._draft_cycles[cycle] = draft_id
+        return {"draft_id": draft_id, "created": True, "superseded": 0}
+
+    def _mark_rerun_processed(self, rerun_request_id: str, resulting_draft_id: str) -> None:
+        self.timeline.append(("rerun_mark", rerun_request_id))
+        self.rerun_marks.append((rerun_request_id, resulting_draft_id))
+        if self.rerun_mark_error is not None:
+            raise self.rerun_mark_error
 
     def _now(self) -> datetime:
         self._tick += timedelta(seconds=5)
@@ -555,7 +652,10 @@ class OsWorld:
         agent, no draft, no engine shadow, no rerun read, no token read."""
         assert self.hubspot.requests == []
         assert self.launch_attempts == 0
-        assert self.draft_writes == []
+        assert self.draft_writes == [] and self.drafts == []
+        assert self.os_api is None or not hasattr(self.os_api, "calls_to") or (
+            self.os_api.calls_to("post_classification") == []
+        )
         assert self.engine_contexts == [] and self.engine_child_calls == 0
         assert self.token_reads == 0
         assert self.decide_calls == 0
