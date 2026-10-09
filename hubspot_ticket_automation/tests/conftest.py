@@ -9,9 +9,13 @@ behaviour: a URL left exported in the shell is never used, because nothing asks
 for a pool.
 
 The helper package's own suite under packn_os_hubspot_client/tests/ does use the
-pool. It is not affected when both directories run in one session: monkeypatch
-undoes the replacement after each test, and a module that was first imported
-while a test ran (and so bound the guard by name) is handed the real getter back.
+pool, and both directories are often run in one session. Then pytest takes its
+rootdir from packn_os_hubspot_client/pyproject.toml, this conftest lies outside
+that rootdir, and pytest applies its autouse fixtures to EVERY test of the
+session, the helper suite's database tests included. So the guard asks where the
+test's file is and acts only on a test under this directory. Between tests,
+monkeypatch undoes the replacement, and a module that was first imported while a
+test ran (and so bound the guard by name) is handed the real getter back.
 
 What a caller sees: `RuntimeError` with NO_DATABASE_MESSAGE. A function that
 swallows every exception by its own fail-closed rule (`client.read_routine_enabled`
@@ -23,6 +27,7 @@ The fixture reads no environment variable and prints nothing.
 from __future__ import annotations
 
 import sys
+from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator, Optional
 
 import pytest
@@ -34,8 +39,27 @@ NO_DATABASE_MESSAGE = (
 )
 
 
+PURE_SUITE_ROOT = Path(__file__).resolve().parent
+
+
 def _no_database_pool(*_args: Any, **_kwargs: Any) -> Any:
     raise RuntimeError(NO_DATABASE_MESSAGE)
+
+
+def _is_pure_suite_test(node: Any) -> bool:
+    """True when the test's file is under this directory.
+
+    A node with no file path is treated as a pure-suite test: when in doubt the
+    guard is on.
+    """
+    path = getattr(node, "path", None)
+    if path is None:
+        return True
+    try:
+        Path(path).resolve().relative_to(PURE_SUITE_ROOT)
+    except ValueError:
+        return False
+    return True
 
 
 def _holders(getter: Callable[..., Any], modules: Optional[Iterable[Any]] = None) -> list[Any]:
@@ -55,7 +79,14 @@ def _hand_back(real: Callable[..., Any], modules: Optional[Iterable[Any]] = None
 
 
 @pytest.fixture(autouse=True)
-def _pure_suite_has_no_database(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+def _pure_suite_has_no_database(
+    request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch
+) -> Iterator[None]:
+    if not _is_pure_suite_test(request.node):
+        # A helper-suite test in a shared session: it owns its own database rule
+        # (packn_os_hubspot_client/tests/conftest.py).
+        yield
+        return
     try:
         from packn_os_hubspot_client import db
     except ImportError:
