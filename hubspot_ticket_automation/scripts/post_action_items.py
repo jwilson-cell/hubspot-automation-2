@@ -202,7 +202,13 @@ def _post(envelope: dict, dry_run: bool) -> dict:
         return {"ok": False, "mode": "error", "status": None, "error": repr(e)}
 
 
-def post_action_items(ticket_id: str, items: list[dict], dry_run: bool) -> dict:
+def build_envelope(ticket_id, items, os_ticket_id=None, pass_id=None) -> dict:
+    return {}
+
+
+def post_action_items(
+    ticket_id: str, items: list[dict], dry_run: bool, os_ticket_id=None, pass_id=None
+) -> dict:
     """POST the action_items envelope for one ticket. Never raises out.
 
     envelope shape (Plan 04 ActionIngestSchema discriminated union):

@@ -430,7 +430,8 @@ def test_the_draft_call_precedes_the_write_back_for_every_ticket(world: OsWorld)
     entries = [make_entry(0), make_entry(1), make_entry(2)]
     finalize(world, entries, result_of(*[completed(entry) for entry in entries]))
 
-    assert [step[0] for step in world.timeline] == ["draft", "writeback"] * 3
+    # ticket 3's number backfill (a later step of the same pass) is in the log too
+    assert [step[0] for step in world.timeline if step[0] != "backfill"] == ["draft", "writeback"] * 3
     for entry in entries:
         drafted = world.timeline.index(("draft", entry["ref"]))
         written_back = world.timeline.index(("writeback", entry["os_ticket_id"], "completed"))

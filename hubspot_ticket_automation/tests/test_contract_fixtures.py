@@ -19,7 +19,14 @@ A fourth file is the WRITE contract (plan 17), copied from the OS's plan 93-05:
 
     tickets-api-classification.v1.json   POST /api/tickets/{id}/classification
 
-It is pinned the same way, and the third half ties the cron's write-back to it:
+A fifth is the action-item envelope (the OS's plan 93-06), pinned here by its
+checksum; tests/test_action_item_forwarding.py ties the cron's envelope builder
+to its three bodies:
+
+    action-items-envelope.v1.json        POST /api/ingest/action-items
+
+The classification file is pinned the same way, and the third half ties the
+cron's write-back to it:
 the six failure codes, the two text limits, the prompt version and the model
 are named constants of `os_pass` that equal the fixture's values, and the
 request builder reproduces both fixture bodies key for key.
@@ -46,6 +53,7 @@ LIST_FIXTURE = "tickets-api-list.v1.json"
 TICKET_FIXTURE = "tickets-api-ticket.v1.json"
 SLUGS_FIXTURE = "ticket-category-slugs.v1.json"
 CLASSIFICATION_FIXTURE = "tickets-api-classification.v1.json"
+ENVELOPE_FIXTURE = "action-items-envelope.v1.json"
 
 # The literals of 93-04-SUMMARY ("Fixtures"). Pack'N OS asserts the same three in
 # tests/unit/tickets/cron-contract.test.ts.
@@ -55,6 +63,8 @@ PINNED_CHECKSUMS = {
     SLUGS_FIXTURE: "fadc6c90ab14c62f1360ca8992afdb4d43305a4ca581254b0129cdb021107e85",
     # 93-05-SUMMARY ("Fixture"): 1303 bytes.
     CLASSIFICATION_FIXTURE: "f585b19aef732d6e3bb07d93383e3b5dcc395948e242671cd96b341edbdf2aa1",
+    # 93-06-SUMMARY ("Fixture"): 2895 bytes. The action-item envelope, with pass_id.
+    ENVELOPE_FIXTURE: "3a69a7248dcc20e4695bc94900fb96a1621712896d2c43a4cf124f4f84677872",
 }
 
 # The four top-level keys of config/categories.yaml that are not categories.

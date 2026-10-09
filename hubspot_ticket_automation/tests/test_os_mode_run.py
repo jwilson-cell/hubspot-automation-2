@@ -44,6 +44,8 @@ import pytest
 PACKAGE_ROOT = Path(__file__).resolve().parent.parent  # hubspot_ticket_automation/
 sys.path.insert(0, str(PACKAGE_ROOT / "scripts"))  # scripts/ is imported flat
 
+import forward_action_items as forwarder  # noqa: E402
+import post_action_items as poster  # noqa: E402
 import pregate_tickets as pg  # noqa: E402
 import run_tickets as rt  # noqa: E402
 from packn_os_hubspot_client import client, tickets_api  # noqa: E402
@@ -160,6 +162,12 @@ def _no_real_file_and_a_clean_counter(
     monkeypatch.setattr(hubspot_api, "TOKEN_PATH", nowhere / "hubspot_token.txt")
     monkeypatch.setattr(tickets_api, "SECRET_PATH", nowhere / "tickets_api_secret.txt")
     monkeypatch.setattr(tickets_api, "SETTINGS_PATH", nowhere / "settings.yaml")
+    # the action-item poster and forwarder (plan 17): no secret, no ingest URL,
+    # no queue and no seen-set of the real checkout is ever opened
+    monkeypatch.setattr(poster, "SECRET_PATH", nowhere / "action_ingest_secret.txt")
+    monkeypatch.setattr(poster, "SETTINGS_PATH", nowhere / "settings.yaml")
+    monkeypatch.setattr(forwarder, "QUEUE_PATH", nowhere / "pending_actions.json")
+    monkeypatch.setattr(forwarder, "SEEN_PATH", nowhere / ".action_items_forwarded.json")
     monkeypatch.setattr(hubspot_api, "_acquire_rate_token", lambda: None)
     monkeypatch.setattr(hubspot_api, "RETRY_SLEEP_S", 0)
     hubspot_api.reset_calls()
@@ -240,6 +248,7 @@ T3_EMAILS = [
 ]
 
 _ASSOCIATION_RE = re.compile(r"^/crm/v4/objects/tickets/(\d+)/associations/emails\?limit=\d+$")
+_TICKET_PATCH_RE = re.compile(r"^/crm/v3/objects/tickets/(\d+)$")
 BATCH_PATH = "/crm/v3/objects/emails/batch/read"
 
 
@@ -264,15 +273,19 @@ class HubSpotOpener:
     """Stands in for `hubspot_api._default_opener`, below the real request
     function, so the raw request total is counted as it is in production.
 
-    It knows the two requests of a thread fetch and nothing else. Any other
-    request is kept in `unexpected` (the code under test may swallow the
-    AssertionError, so tests assert that list is empty)."""
+    It knows the two requests of a thread fetch and the one write of this
+    mode, the number backfill (a PATCH of one ticket's properties, plan 17),
+    and nothing else. Any other request is kept in `unexpected` (the code under
+    test may swallow the AssertionError, so tests assert that list is empty)."""
 
     def __init__(self, threads: dict[str, list[dict]]) -> None:
         self.threads = threads
         self.requests: list[tuple[str, str]] = []
         self.unexpected: list[tuple[str, str]] = []
         self.refused: set[str] = set()  # HubSpot ids whose association request answers 404
+        self.patches: list[tuple[str, dict]] = []  # (HubSpot id, the properties written)
+        self.patch_refused: set[str] = set()  # HubSpot ids whose property write answers 404
+        self.timeline: Optional[list] = None  # OsWorld's shared call log, when set
 
     def __call__(self, request: Any, timeout: Any = None) -> _Answer:
         method = request.get_method()
@@ -285,6 +298,16 @@ class HubSpotOpener:
                 raise urllib.error.HTTPError(request.full_url, 404, "not found", None, io.BytesIO(b""))
             emails = self.threads.get(ticket_id, [])
             return _Answer({"results": [{"toObjectId": email["id"]} for email in emails]})
+        patched = _TICKET_PATCH_RE.match(path)
+        if method == "PATCH" and patched:
+            ticket_id = patched.group(1)
+            properties = json.loads(request.data.decode("utf-8"))["properties"]
+            self.patches.append((ticket_id, properties))
+            if self.timeline is not None:
+                self.timeline.append(("backfill", ticket_id))
+            if ticket_id in self.patch_refused:
+                raise urllib.error.HTTPError(request.full_url, 404, "not found", None, io.BytesIO(b""))
+            return _Answer({"id": ticket_id, "properties": properties})
         if method == "POST" and path == BATCH_PATH:
             wanted = [item["id"] for item in json.loads(request.data.decode("utf-8"))["inputs"]]
             held = {email["id"]: email for emails in self.threads.values() for email in emails}
@@ -428,6 +451,44 @@ class ScriptedOsApi(fakes.FakeOsApi):
 _UUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.I)
 
 
+class IngestRecorder:
+    """Stands in for `post_action_items._post`, below the real envelope builder:
+    `_post(envelope, dry_run) -> result`. Nothing is signed and nothing is sent.
+
+        posts      a copy of every envelope handed over, in order
+        dry_runs   the dry_run flag of each
+        script     the results of the next live posts, in order; when it is
+                   empty a live post is confirmed (HTTP 200, errors 0)
+        before     called with the envelope before it is recorded (a test reads
+                   a file "at the moment of the post" with it)
+    """
+
+    def __init__(self, timeline: list) -> None:
+        self.timeline = timeline
+        self.posts: list[dict] = []
+        self.dry_runs: list[bool] = []
+        self.script: list[dict] = []
+        self.before: Optional[Callable[[dict], None]] = None
+
+    def __call__(self, envelope: dict, dry_run: bool) -> dict:
+        self.timeline.append(("action_items", envelope.get("ticket_id") or envelope.get("os_ticket_id")))
+        if self.before is not None:
+            self.before(envelope)
+        self.posts.append(copy.deepcopy(envelope))
+        self.dry_runs.append(dry_run)
+        if dry_run:
+            return {"ok": True, "mode": "dry-run"}
+        if self.script:
+            return copy.deepcopy(self.script.pop(0))
+        items = envelope.get("items") or []
+        return {
+            "ok": True,
+            "mode": "sent",
+            "status": 200,
+            "response": {"ok": True, "emitted": len(items), "errors": 0},
+        }
+
+
 class OsWorld:
     """One orchestrator in `os` mode with every collaborator replaced."""
 
@@ -444,6 +505,10 @@ class OsWorld:
         self.origin_reads = 0
         self.hubspot = HubSpotOpener({T1_HS_ID: list(T1_EMAILS), T3_HS_ID: list(T3_EMAILS)})
         monkeypatch.setattr(hubspot_api, "_default_opener", self.hubspot)
+        self.hubspot.timeline = self.timeline
+        self.ingest = IngestRecorder(self.timeline)  # every action-item post lands here
+        monkeypatch.setattr(poster, "_post", self.ingest)
+        self.seen_path = base / "seen.json"
         self.agent: Any = OsAgent()
         self.launch_attempts = 0
         self.settings: Any = copy.deepcopy(SETTINGS)
@@ -591,7 +656,7 @@ class OsWorld:
         return run_types.Deps(
             root=self.root,
             state_path=self.state_path,
-            seen_path=self.base / "seen.json",
+            seen_path=self.seen_path,
             now=self._now,
             new_run_id=self._new_run_id,
             resolve_mode=lambda: "os",
@@ -653,6 +718,7 @@ class OsWorld:
         assert self.hubspot.requests == []
         assert self.launch_attempts == 0
         assert self.draft_writes == [] and self.drafts == []
+        assert self.ingest.posts == [] and self.hubspot.patches == []
         assert self.os_api is None or not hasattr(self.os_api, "calls_to") or (
             self.os_api.calls_to("post_classification") == []
         )

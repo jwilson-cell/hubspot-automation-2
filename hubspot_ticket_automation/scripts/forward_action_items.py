@@ -62,7 +62,51 @@ def _key(ticket_id: str, action_type: str) -> str:
     return f"{ticket_id}:{action_type}"
 
 
-def main() -> int:
+RETRY_FILE_NAME = ".action_items_retry.json"
+
+
+def retry_path(seen_path=None) -> Path:
+    return Path(seen_path if seen_path is not None else SEEN_PATH)
+
+
+def load_seen(seen_path=None) -> set:
+    return set()
+
+
+def mark_forwarded(keys, seen_path=None) -> bool:
+    return False
+
+
+def load_retry(seen_path=None) -> dict:
+    return {}
+
+
+def remember_retry(entries, seen_path=None) -> bool:
+    return False
+
+
+def forget_retry(keys, seen_path=None) -> bool:
+    return False
+
+
+def valid_pass_id(value) -> bool:
+    return False
+
+
+def is_os_ticket_id(value) -> bool:
+    return False
+
+
+def confirmed(result) -> bool:
+    return False
+
+
+def main(queue_path=None, seen_path=None) -> int:
+    global QUEUE_PATH, SEEN_PATH
+    if queue_path is not None:
+        QUEUE_PATH = Path(queue_path)
+    if seen_path is not None:
+        SEEN_PATH = Path(seen_path)
     records = _load_json(QUEUE_PATH, [])
     if not isinstance(records, list):
         _log(f"{QUEUE_PATH.name} is not a JSON array — nothing to forward.")

@@ -1057,6 +1057,14 @@ def post_ticket_writeback(
     return ended(WB_COUNTED if 200 <= verdict["status"] < 300 else WB_REJECTED)
 
 
+def backfill_properties(entry: dict) -> dict:
+    return {}
+
+
+def post_ticket_action_items(entry: dict, items: Any, seen_path: Any, *, dry_run: bool = False) -> dict:
+    return {"end": "none", "items": 0, "codes": []}
+
+
 @dataclass
 class _Pass:
     """What the per-ticket steps of one finalize share."""
