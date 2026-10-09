@@ -752,6 +752,10 @@ def read_pending_drafts(routine_name: str, since_hours: int = 48) -> list[dict]:
         return []
 
 
+# Phase 93 (plan 14) RED skeleton: the cache the column check will use.
+_RUN_RECORD_PHASE93_COLUMNS: Optional[bool] = None
+
+
 def write_run_record(
     routine_name: str,
     status: str,  # 'success' | 'failure' | 'skipped' | 'partial'
@@ -760,6 +764,11 @@ def write_run_record(
     drafts_created: int,
     started_at_iso: str,
     finished_at_iso: Optional[str],
+    *,
+    run_id: Optional[str] = None,
+    source_mode: Optional[str] = None,
+    failure_reason_code: Optional[str] = None,
+    hubspot_calls: Optional[dict] = None,
 ) -> None:
     """INSERT into automation_runs.
 
