@@ -455,5 +455,30 @@ def unprocessed_candidates(results: list[dict], fingerprints: dict) -> list[str]
     return candidates
 
 
+# ===========================================================================
+# THE HUBSPOT PATH'S STATE FILE, KEPT CURRENT BY CODE (Phase 93, plan 23)
+# ===========================================================================
+
+
+def fingerprint_entry(processed_at_iso: Any, hubspot_updated_at: Any) -> dict:
+    return {}
+
+
+def _read_state(state_path: Any) -> dict:
+    return {}
+
+
+def _merge_state(state: dict, entries: Any, last_run_at: Any = None) -> dict:
+    return {}
+
+
+def _replace_state(state_path: Any, state: dict) -> None:
+    return None
+
+
+def merge_fingerprints(state_path: Any, entries: Any, last_run_at: Any = None) -> dict:
+    return {}
+
+
 if __name__ == "__main__":
     sys.exit(main())
