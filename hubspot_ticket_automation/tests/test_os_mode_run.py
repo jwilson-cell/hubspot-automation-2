@@ -1087,6 +1087,24 @@ def test_two_reruns_naming_one_unlisted_ticket_by_its_two_ids_are_one_entry(worl
     assert world.record["hubspot_calls"]["kinds"]["email_thread"] == 1
 
 
+def test_a_rerun_the_os_resolves_to_a_ticket_already_picked_is_still_one_entry(
+    world: OsWorld,
+) -> None:
+    # The request names an id no picked payload carries, and the OS answers with a
+    # ticket the list already holds. One entry per distinct OS ticket, whatever
+    # id named it: never a second entry with the same ref.
+    world.os_api.tickets["9300000000555"] = _single_answer(_payload(1))
+    world.client.reruns = [_rerun(RERUN_A, "9300000000555")]
+    assert world.run() == 0
+    assert world.os_api.calls_to("fetch_ticket") == [("9300000000555",)]
+    assert world.refs == [T1_HS_ID, T2_OS_ID, T3_HS_ID]
+    entry = world.entry(T2_OS_ID)
+    assert entry["is_rerun"] is True and entry["rerun_request_ids"] == [RERUN_A]
+    assert entry["cycle_key"] == f"rerun:{RERUN_A}"
+    assert world.record["status"] == "success" and world.record["tickets_processed"] == 3
+    assert world.record["error_summary"] is None
+
+
 def test_a_rerun_request_id_that_is_a_uuid_object_is_written_as_text(world: OsWorld) -> None:
     import uuid
 
