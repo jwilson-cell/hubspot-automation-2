@@ -69,6 +69,15 @@ itself, from the result file you write in Step 4.5. Under the wrapper this
 overrides every other instruction in this file about a run record: skip Steps
 0a and 0b, and never call `client.write_run_record`.
 
+## HubSpot tool names on the droplet
+
+This file names HubSpot tools with the prefix `mcp__claude_ai_HubSpot__*`, the
+names it was first written against. On the droplet the HubSpot tools belong to
+the locally registered MCP server named `hubspot`, and their names start with
+`mcp__hubspot__*`. Wherever a step below names a tool with the first prefix, use
+the tool of that server that does the same thing. The steps, the properties and
+the rate-limit rule are the same either way.
+
 ## Discovery step (first run only)
 
 If `pipeline_id` or `active_stages` are empty in `settings.yaml`:
@@ -283,11 +292,19 @@ Before any hydration or classification, check `state.json:ticket_fingerprints[ti
 - If **a fingerprint exists** AND `current_num_notes <= fingerprint.num_notes` → **skip this ticket without hydrating**. Log as `{ticket_id, skipped: "dedupe_no_new_notes", num_notes: N, last_processed_at: "<ISO>"}` in the run log and continue to the next ticket.
 - If **a fingerprint exists** AND `current_num_notes > fingerprint.num_notes` → a new note was added since our last pass (either by us on a prior run that failed to commit, or by a human). Proceed to hydration and re-draft.
 
+**A fingerprint written by code (Phase 93): `num_notes` is `null`.** While the ticket source was `os`, code — not this skill — recorded each ticket it completed, as `{ "num_notes": null, "processed_at": "<when that pass finished>", "hs_lastmodifieddate": "<Pack'N OS's copy, or null>" }`. Pack'N OS holds no note count, so there is nothing to compare one with. You meet such a fingerprint after the source has been switched back to `hubspot`. When the fingerprint's note count is `null` (or the key is missing), the two note-count rules above do not apply. Such a fingerprint is judged by its `processed_at`:
+
+- The ticket's current `hs_lastmodifieddate` is not later than `fingerprint.processed_at` (or not later than the fingerprint's own `hs_lastmodifieddate`) → nothing has happened in HubSpot since that pass finished: **skip this ticket without hydrating**. Log it as `{ticket_id, skipped: "dedupe_processed_at", last_processed_at: "<ISO>"}` and count it in `tickets_skipped_dedupe` like any other dedupe skip.
+- The ticket's current `hs_lastmodifieddate` is later than `fingerprint.processed_at` → the ticket changed after the pass. Proceed to hydration and re-draft.
+- Either timestamp is missing or cannot be read → proceed to hydration. When in doubt a ticket is processed, never dropped.
+
+Never compare a `null` note count as if it were a number (it is not `0`), and never write a number into it yourself to make the note-count rules fit. The reference for this rule is `unprocessed_candidates` in `ticket_pipeline/source.py`, the one function the wrapper's pre-gate uses to decide the same thing; if this text and that function ever disagree, the function is right. After you process such a ticket, write its fingerprint as usual, with the real note count: yours is then the newer pass.
+
 **Why this matters:** tickets on which we've only posted an internal note keep `hs_last_message_from_visitor = true` indefinitely (until someone posts a customer-visible reply), so the main-loop filter re-matches them every run. Without this check, each run wastes MCP calls hydrating a ticket we can't meaningfully progress.
 
 **Writing the fingerprint (success path):** after successfully posting a draft (step 2f) — OR after successfully completing the loop for a ticket even if no note was posted (e.g., informational replies with no draft mode) — update `state.json:ticket_fingerprints[ticket_id] = { num_notes: <current_num_notes_plus_posted_notes>, processed_at: "<ISO now>", hs_lastmodifieddate: "<ticket's hs_lastmodifieddate at time of processing>" }`.
 
-**Fingerprint reset**: if a ticket's `hs_last_message_from_visitor` flips back to `true` AFTER being `false` (i.e., customer replied after an agent's public response), the implicit dedupe still triggers if num_notes hasn't changed. In that case, the operator can manually clear the ticket's fingerprint from `state.json` to force re-processing. Document this in run-log observations if you spot the pattern.
+**Fingerprint reset**: if a ticket's `hs_last_message_from_visitor` flips back to `true` AFTER being `false` (i.e., customer replied after an agent's public response), the implicit dedupe still triggers if num_notes hasn't changed. In that case, the operator can manually clear the ticket's fingerprint from `state.json` to force re-processing. Document this in run-log observations if you spot the pattern. This manual clear applies to the `hubspot` source only (and to the HubSpot half of `shadow`, which reads the same file). In `os` the state file plays no part in which tickets are selected — Pack'N OS decides — so clearing a fingerprint there changes nothing; a ticket is processed again when Pack'N OS lists it again (a newer client message, or an operator rerun).
 
 #### 2a. Hydrate context
 
@@ -1051,8 +1068,8 @@ repeatedly.
 ### 5. Exit
 
 Tell the user (if running interactively) a one-line summary:
-"Processed N tickets — A auto-sent to customer, M drafts posted, U urgent emails, Q tickets queued for digest."
-(Where A = `auto_sends`, M = `notes_posted`, U = `urgent_emails_drafted`, Q = `tickets_queued_for_digest`. If `auto_send_failures > 0`, append: ", F auto-send failures fell back to draft.")
+"Processed N tickets — M drafts written to Pack'N OS, U urgent emails, Q tickets queued for digest."
+(Where M = `notes_posted + auto_sends` — both counters count a pending draft written to Pack'N OS; nothing is sent to a customer by this skill — U = `urgent_emails_drafted`, Q = `tickets_queued_for_digest`. If `auto_send_failures > 0`, append: ", F draft writes failed.")
 
 ## Output contract
 

@@ -4,19 +4,31 @@ This project is **Pack'N's HubSpot help desk ticket automation**. Pack'N is a 3P
 
 ## Architecture at a glance
 
-Two skills, run on cron on a DigitalOcean Ubuntu droplet (server IP `167.99.229.91`, runs as `packn` user, project rooted at `/opt/packn/hubspot_ticket_automation`):
+Three skills, run on cron on a DigitalOcean Ubuntu droplet (server IP `167.99.229.91`, runs as `packn` user, project rooted at `/opt/packn/hubspot_ticket_automation`):
 
-1. **`hubspot-tickets`** — every 30 minutes. Pulls new/updated tickets, classifies, drafts a reply grounded in `kb/`, hydrates live ShipSidekick order state when applicable, then either (a) auto-sends the reply to the customer via Gmail + logs an `[AUTO-SENT TO CUSTOMER]` note (for FORM + Mispack/Carrier tickets) or (b) posts a `[DRAFT — REVIEW BEFORE SENDING]` internal note (everything else). Action items: `urgent` → solo Gmail email immediately; `normal` → stays on the HubSpot ticket note with a `PACKN_METADATA_V1` block.
-2. **`hubspot-actions-digest`** — 8am / 12pm / 3pm ET on weekdays. Queries HubSpot for tickets whose automation notes haven't been digested yet, composes a single email split into Luca (billing/account/escalation) and Charlie (warehouse/general) sections, sends via Gmail, and posts `[DIGESTED at ...]` marker notes on each included ticket so the next run skips them. **HubSpot is the source of truth for the digest queue** (no local queue file) — this lets the skill run anywhere that has the private-app token + Gmail OAuth.
+1. **`hubspot-tickets`** — the ticket run when the ticket source is `hubspot` or `shadow` (see "Ticket source" below). Started by the wrapper `scripts/run_tickets.sh` on the droplet's crontab schedule and by Run now. Pulls new/updated tickets from HubSpot, classifies, drafts a reply grounded in `kb/`, hydrates live ShipSidekick order state when applicable, then writes every reply it drafts as a pending draft in Pack'N OS (`automation_drafts`). Nothing is sent to a customer by this automation: an operator reviews the draft in Pack'N OS, approves and sends it from there. No note is posted on the HubSpot ticket. Action items: `urgent` → solo Gmail email to the team immediately; each ticket's action items are queued in `config/pending_actions.json` and forwarded to Pack'N OS `/tasks` by `scripts/forward_action_items.py` after the run.
+2. **`hubspot-tickets-os`** — the ticket run when the ticket source is `os`. Code fetches the ticket list from Pack'N OS and hands the agent a finished bundle; the agent classifies, drafts and extracts action items, and writes a result file; code then writes the pending drafts and reports each pass back to Pack'N OS. The skill has no HubSpot step.
+3. **`hubspot-actions-digest`** — 8am / 12pm / 3pm ET on weekdays. Queries HubSpot for tickets whose automation notes haven't been digested yet, composes a single email split into Luca (billing/account/escalation) and Charlie (warehouse/general) sections, sends via Gmail, and posts `[DIGESTED at ...]` marker notes on each included ticket so the next run skips them. **HubSpot is the source of truth for the digest queue** (no local queue file) — this lets the skill run anywhere that has the private-app token + Gmail OAuth.
 
 Helpers on the server:
-- `scripts/send_customer_reply.py` — one-step Gmail send + HubSpot v1 engagement + `[AUTO-SENT]` note (auto-send path).
+- `scripts/run_tickets.sh` → `scripts/run_tickets.py` — the one entry point of every ticket run (cron and Run now). The orchestrator reads the ticket source once, runs that source's path and writes exactly one run record; the shell script then always runs `scripts/forward_action_items.py` and `scripts/write_complaints.py`.
+- `scripts/send_customer_reply.py` — one-step Gmail send + HubSpot v1 engagement + `[AUTO-SENT]` note. Legacy: not called for customer replies since the Pack'N OS drafts queue (Phase 4.1); kept in the repo.
 - `scripts/send_digest_email.py` — one-step Gmail send for the digest (no Drafts intermediary).
 - `scripts/send_draft.py` — Gmail draft-to-sent promoter (legacy; used by the urgent email path).
 - `scripts/ssk_order_lookup.py` — ShipSidekick order + shipment state, injected into ticket_context before drafting.
 - `scripts/sheets_sync.py` — non-blocking Google Sheets export (KPI + mispack + carrier_issue rollups).
 
-GitHub repo: `https://github.com/jwilson-cell/hubspot-automation-2`. The server pulls from `main` each time cron starts Claude Code; doc/skill/config changes land by `git push` from the laptop clone + `git pull` on the server.
+GitHub repo: `https://github.com/jwilson-cell/hubspot-automation-2`. The wrapper does not pull from git, and nothing on the server updates itself: a doc, skill, config or code change reaches the droplet by `git push` from the laptop clone and then a manual `git pull` on the server. `config/state.json` and `config/pending_actions.json` are tracked AND rewritten by every run on the droplet; the README's Phase 93 section has the pull procedure that keeps them.
+
+## Ticket source (Phase 93)
+
+Where the ticket list comes from is one owner switch in Pack'N OS (the Ticket flow card on `/automation`), stored as the `app_settings` row `ticket_source_mode`. `scripts/run_tickets.py` reads it once at the start of every run, runs that source's path and writes exactly one run record. It never falls back: a setting it cannot read or does not recognise, or a Pack'N OS list it cannot get, ends the run as a failure record and nothing is processed.
+
+- `hubspot` — the agent searches HubSpot and works as item 1 above describes. An absent setting means this.
+- `shadow` — the same HubSpot run. In the same run, code also fetches the Pack'N OS list, compares what the two sources would select and how each classifies, and reports the comparison and each pass to Pack'N OS. No draft comes from the Pack'N OS side.
+- `os` — code takes the list from Pack'N OS, hands the agent (`/packn-tickets-os`) a finished bundle, and after the agent exits writes the drafts, reports each pass, forwards action items and keeps `config/state.json` current. The only HubSpot traffic in this source is made by code: the email thread of a ticket that has a HubSpot id, and the one-off fill of an empty order or tracking number. The agent is launched with the HubSpot MCP tools removed.
+
+The HubSpot path, the HubSpot MCP registration and the HubSpot token stay in place until Phase 94. Switching the source back to `hubspot` is the rollback; it needs no code change. Deploy steps, grants, the new secret file and what an operator should know are in the README, § "Phase 93 — ticket source".
 
 ## Invariants (do not violate)
 
@@ -24,7 +36,7 @@ GitHub repo: `https://github.com/jwilson-cell/hubspot-automation-2`. The server 
 2. **All categories start in `draft` mode.** No auto-send anywhere until a category has been reviewed for a week.
 3. **Never invent rates, SLAs, dollar amounts, or policies** in a drafted reply. If the KB lacks it, the draft says "let me confirm with the team" and flags a `billing_specialist_follow_up` or similar action item.
 4. **Never commit** to credits, refunds, or reships in the drafted reply. Always flag as action item for the reviewer.
-5. **Read-only on HubSpot tickets except:** the skill MAY create internal notes (engagement records) associated to a ticket. It must NOT change stage, owner, priority, or any other ticket property. It MUST NOT close or delete tickets.
+5. **Read-only on HubSpot tickets except:** the skill MAY create internal notes (engagement records) associated to a ticket, and an empty `order_number` / `tracking_number` property MAY be filled from the form block (skill step 2a.6; in the `os` source that one write is made by code, for those two properties only). Nothing else on a ticket is written: it must NOT change stage, owner, priority, or any other ticket property. It MUST NOT close or delete tickets.
 6. **Keep secrets out of `kb/`**. KB content is loaded into every prompt — no credentials, no PII.
 7. **Never hydrate customer attachments into model context.** Do not fetch `hs_file_upload`, file URLs, or file contents via any MCP tool. The HubSpot MCP returns attachments as inline image blocks that poison the conversation with `400 Could not process image` errors, forcing a /clear. Detect attachment presence only (via association count or body mentions); draft reviewers open the HubSpot ticket directly to inspect files. See the attachment-handling section at the top of `.claude/skills/hubspot-tickets/SKILL.md`.
 
@@ -34,7 +46,7 @@ GitHub repo: `https://github.com/jwilson-cell/hubspot-automation-2`. The server 
 
 10. **Column order in the Sheet is operator-controlled.** Operators can reorder columns, insert their own (e.g., "escalation owner", "internal notes"), or re-theme rows — all of that survives skill writes because `sheets_sync.py` resolves column positions by exact header-name match at write time. Never refer to columns by position in the sheet. Never rename or delete a skill-owned header — that breaks the header-name lookup and the skill will log an error.
 
-11. **HubSpot Help Desk ticket timelines only render conversation-thread messages and note engagements — NOT email engagements.** Form-sourced tickets have no conversation thread, so any customer-facing reply that's *not* an internal note is invisible to the reviewer on the ticket. Consequences:
+11. **HubSpot Help Desk ticket timelines only render conversation-thread messages and note engagements — NOT email engagements.** Form-sourced tickets have no conversation thread, so any customer-facing reply that's *not* an internal note is invisible to the reviewer on the ticket. Since the Pack'N OS drafts queue (Phase 4.1) this automation sends no customer email at all — every reply is a pending draft that Pack'N OS sends — so the consequences below describe the retired auto-send path and matter only if it is ever revived. Consequences:
     - Auto-sent customer emails (form Mispack/Carrier path via `scripts/send_customer_reply.py`) MUST create a companion `[AUTO-SENT TO CUSTOMER]` note engagement alongside the email engagement. The note is the reviewer's only visual record.
     - The legacy v1 engagements endpoint (`POST /engagements/v1/engagements`) is the preferred path for creating both email and note engagements from the auto-send helper. The v3 `POST /crm/v3/objects/emails` endpoint does not correctly parse synthetic `hs_email_headers`, so `metadata.to/from` come out empty and the engagement is doubly-hidden.
     - HubSpot's Conversations Custom Channels API could create native threads that *would* render on the timeline, but requires an OAuth app (not a private app) plus a 24/7 webhook receiver and inbound email pipeline — scope of ~4-7 days of integration work, rejected as disproportionate for two ticket categories.
@@ -44,7 +56,8 @@ GitHub repo: `https://github.com/jwilson-cell/hubspot-automation-2`. The server 
 
 | Path | Purpose |
 |---|---|
-| `.claude/skills/hubspot-tickets/SKILL.md` | Main processing skill |
+| `.claude/skills/hubspot-tickets/SKILL.md` | Main processing skill (ticket sources `hubspot` and `shadow`) |
+| `.claude/skills/hubspot-tickets-os/SKILL.md` | Processing skill for the `os` ticket source: a bundle in, a result file out, no HubSpot step |
 | `.claude/skills/hubspot-actions-digest/SKILL.md` | Hourly digest skill |
 | `config/settings.yaml` | Runtime config (dry_run, caps, pipeline, notify email, urgent signals) |
 | `config/categories.yaml` | Form-topic mapping, auto-send topic allow-list, category → KB file mapping |
@@ -63,10 +76,21 @@ GitHub repo: `https://github.com/jwilson-cell/hubspot-automation-2`. The server 
 | `kb/returns_rma.md` | RMA flow |
 | `kb/billing_faq.md` | Billing dispute handling |
 | `kb/integration_errors.md` | Unknown SKU, address, EDI, retailer chargebacks |
-| `.claude/commands/packn-tickets.md` | Slash command for ticket processing (invoked by cron via `claude -p /packn-tickets`). |
+| `.claude/commands/packn-tickets.md` | Slash command for ticket processing in the `hubspot` and `shadow` sources (started by `scripts/run_tickets.py`, never directly by cron). |
+| `.claude/commands/packn-tickets-os.md` | Slash command for ticket processing in the `os` source (started only by `scripts/run_tickets.py`). |
+| `scripts/run_tickets.sh` | The crontab and Run now entry: runs the orchestrator, then always the action-item forwarder and the complaint mirror. Do not rename — Pack'N OS finds the crontab line by this file name. |
+| `scripts/run_tickets.py` | The orchestrator: reads the ticket source once, runs that source's runner, writes exactly one `automation_runs` record. |
+| `scripts/pregate_tickets.py` | The pre-gate decision for the HubSpot path (`decide`): paused, pending reruns, or whether HubSpot has a candidate. |
+| `scripts/forward_action_items.py` | Deterministic forward of queued action items to Pack'N OS `/tasks`, run after every ticket run. |
+| `scripts/post_action_items.py` | The signed POST of one ticket's action items (used by the forwarder and by the `os` finalizer). |
+| `ticket_pipeline/source.py` | The one reader of the ticket source, the skills' source guard, the shared dedupe rule, and the one writer of `config/state.json` used by code. |
+| `ticket_pipeline/os_pass.py` | The `os` runner and its finalizer (drafts, write-backs, action items, number fill, state upkeep). |
+| `ticket_pipeline/os_bundle.py` | Builds the agent's ticket context from a Pack'N OS ticket payload. |
+| `ticket_pipeline/source_shadow.py` | The `shadow` runner and the comparison it reports to Pack'N OS. |
+| `packn_os_hubspot_client/tickets_api.py` | The signed client for the Pack'N OS tickets routes. |
 | `.claude/commands/packn-digest.md` | Slash command for the digest (invoked at 8/12/3 ET weekdays). |
 | `.claude/settings.json` | Pre-authorized tool allow-list so headless cron runs don't hang on permission prompts. |
-| `scripts/send_customer_reply.py` | Auto-send helper for form Mispack/Carrier tickets — Gmail send + v1 email engagement + v1 note engagement |
+| `scripts/send_customer_reply.py` | Legacy auto-send helper for form Mispack/Carrier tickets — Gmail send + v1 email engagement + v1 note engagement. Not called for customer replies since Phase 4.1. |
 | `scripts/send_digest_email.py` | Sends the digest directly via Gmail (one-step send, no draft). Invoked by hubspot-actions-digest SKILL step 8. Requires `--send` for live send. |
 | `scripts/send_draft.py` | Promotes Gmail drafts to Sent (used by urgent solo emails) |
 | `scripts/sheets_sync.py` | Non-blocking Sheets export (KPI + mispack + carrier_issue rollups) |
@@ -75,6 +99,7 @@ GitHub repo: `https://github.com/jwilson-cell/hubspot-automation-2`. The server 
 | `config/.secrets/hubspot_token.txt` | HubSpot private-app access token (gitignored) |
 | `config/.secrets/shipsidekick_token.txt` | ShipSidekick API bearer token (gitignored) |
 | `config/.secrets/token.json` | Gmail OAuth refresh token (gitignored) |
+| `config/.secrets/tickets_api_secret.txt` | Shared secret that signs requests to the Pack'N OS tickets routes (gitignored; owner-provisioned on the droplet; the same value as the Pack'N OS environment's tickets secret) |
 | `outputs/runs/` | Per-run logs (`cron-tickets.log` collects all server cron stdout/stderr for /packn-tickets; digests under `cron-digest.log`) |
 | `outputs/digests/` | Per-digest archives (subset of historical runs; the HubSpot-first digest no longer writes these but they're preserved for audit) |
 
@@ -95,6 +120,8 @@ The automation works without these filled in — drafts will be slightly more he
 
 ## When making changes
 
+On the droplet every change below also needs a manual `git pull` first: nothing there pulls by itself.
+
 - Editing `kb/` → takes effect on next skill run. No redeploy.
 - Editing `prompts/` → takes effect on next skill run.
 - Editing `config/categories.yaml` (e.g., graduating a category to `auto-send`) → takes effect on next run. Review at least one week of drafted output for that category first.
@@ -106,5 +133,5 @@ Before running anything live:
 
 1. `dry_run: true` run → inspect `outputs/runs/<latest>.md`.
 2. Run Gmail auth if not already done.
-3. Set `dry_run: false` with `per_run_cap: 1` → confirm note posts and, if applicable, urgent/digest email lands.
+3. Set `dry_run: false` with `per_run_cap: 1` → confirm a pending draft appears in Pack'N OS and, if applicable, urgent/digest email lands.
 4. Scale up `per_run_cap` and schedule the cron.
