@@ -1988,6 +1988,18 @@ def test_the_acceptance_fixture_one_observation_one_draft_two_write_backs_and_no
     assert shadow.token_reads == 1  # the pre-gate's own read; the comparison needed none
 
 
+def test_a_result_ref_written_as_a_json_number_still_gets_its_write_back(shadow: ShadowWorld) -> None:
+    """Review WR-43, the same test in this runner: an entry whose `ref` is the
+    ticket's digits as a JSON number is that ticket's entry, not no entry."""
+    shadow.agent.result = agent_result(done(int(B_HS_ID), "draft-B"), broke(int(H_HS_ID)))
+    shadow.run()
+    assert [(ticket_id, body["outcome"]) for ticket_id, body in shadow.writebacks] == [
+        (B_OS_ID, "completed"),
+        (H_OS_ID, "failed"),
+    ]
+    assert shadow.record["status"] == "partial" and shadow.record["tickets_processed"] == 1
+
+
 def test_both_hubspot_tickets_completing_is_two_drafts_and_still_nothing_from_the_os_half(shadow: ShadowWorld) -> None:
     shadow.agent.result = agent_result(done(B_HS_ID, "draft-B"), done(H_HS_ID, "draft-H"))
     shadow.run()

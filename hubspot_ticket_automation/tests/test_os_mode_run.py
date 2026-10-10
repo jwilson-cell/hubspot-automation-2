@@ -1729,6 +1729,66 @@ def test_reconcile_is_a_pure_function_of_the_entries_and_the_result() -> None:
     assert counts == {"agent_no_result": 2}
 
 
+def test_a_result_entry_whose_ref_is_a_json_number_is_matched_by_its_digits(world: OsWorld) -> None:
+    """Review WR-43. A HubSpot id is all digits, and an agent writing JSON by
+    hand can emit it as a number. The entry is the ticket's all the same: it
+    must not be dropped, reported `agent_no_result` and (twice) parked."""
+
+    def number_the_first(result: dict) -> None:
+        assert result["tickets"][0]["ref"] == T1_HS_ID
+        result["tickets"][0]["ref"] = int(T1_HS_ID)
+
+    world.agent = OsAgent(edit=number_the_first)
+    assert world.run() == 0
+
+    assert '"ref": 9300000000001,' in json.dumps(world.agent.results[0])  # a JSON number reached the file
+    assert world.record["status"] == "success" and world.record["tickets_processed"] == 3
+    assert world.record["error_summary"] is None
+    assert [ticket["outcome"] for ticket in world.outcome.tickets] == ["completed"] * 3
+    assert [draft["draft_key"] for draft in world.drafts] == [T1_HS_ID, T2_OS_ID, T3_HS_ID]
+    first = world.os_api.calls_to("post_classification")[0]
+    assert (first[0], first[1]["outcome"]) == (T1_OS_ID, "completed")
+
+
+@pytest.mark.parametrize(
+    "ref, matched",
+    [
+        ("9300000000001", True),
+        (9300000000001, True),  # a whole number: its canonical digits
+        (9300000000001.0, False),  # nothing looser: not a float,
+        (True, False),  # not a boolean (an int in Python),
+        (" 9300000000001", False),  # not text that only resembles the ref,
+        ("09300000000001", False),
+        (["9300000000001"], False),  # not a container,
+        (None, False),  # and not nothing
+    ],
+)
+def test_reconcile_matches_a_ref_by_its_text_or_a_whole_numbers_digits_and_nothing_else(
+    ref: Any, matched: bool
+) -> None:
+    entries = [{"ref": "9300000000001", "os_ticket_id": "A", "hubspot_ticket_id": "9300000000001"}]
+    tickets, counts = os_pass.reconcile(entries, {"tickets": [{"ref": ref, "outcome": "completed"}]})
+    assert (tickets[0]["outcome"] == "completed") is matched
+    if matched:
+        assert counts == {}
+    else:
+        assert counts.get("agent_no_result") == 1
+
+
+def test_a_number_and_its_digits_are_one_ref_so_the_second_entry_is_a_duplicate() -> None:
+    entries = [{"ref": "9300000000001", "os_ticket_id": "A", "hubspot_ticket_id": "9300000000001"}]
+    result = {
+        "tickets": [
+            {"ref": 9300000000001, "outcome": "completed", "draft_body": "first"},
+            {"ref": "9300000000001", "outcome": "failed", "failure_reason_code": "other"},
+            {"ref": 9300000000999, "outcome": "completed"},  # a number the bundle does not hold
+        ]
+    }
+    tickets, counts = os_pass.reconcile(entries, result)
+    assert tickets[0]["outcome"] == "completed" and tickets[0]["result"]["draft_body"] == "first"
+    assert counts == {"result_unknown_refs": 1, "result_duplicate_refs": 1}
+
+
 # ------------------------------------------- a ticket the bundle cannot hold
 
 
