@@ -451,6 +451,18 @@ def test_the_readme_names_the_secret_file_and_never_a_value() -> None:
     assert "`os_ingest_url`" in section
 
 
+def test_the_readme_states_the_origin_rule_with_the_codes_hosts_and_detail() -> None:
+    """Review WR-54. The loopback hosts and the detail code come from the code."""
+    section = _phase_93()
+    line = next(text for text in section.split("\n") if text.startswith("The Pack'N OS origin the signed client talks to"))
+    assert "It must be `https://`" in line
+    assert "accepted only for a loopback host" in line
+    for host in tickets_api.LOOPBACK_HOSTS:
+        assert f"`{host}`" in line, host
+    assert f"`{tickets_api.ORIGIN_INSECURE}`" in line and "`list_error`" in line
+    assert "no request is made" in line
+
+
 def test_the_readme_names_the_runtime_state_files_and_git_ignores_them() -> None:
     section = _phase_93()
     seen = forward_action_items.SEEN_PATH.relative_to(PACKAGE_ROOT).as_posix()

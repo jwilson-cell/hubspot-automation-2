@@ -369,6 +369,16 @@ def _list_payloads(answer: Any) -> tuple[list, Optional[str]]:
     return tickets, None
 
 
+_DETAIL_RE = re.compile(r"[a-z][a-z0-9_]{0,63}")
+
+
+def _error_detail(error: Any) -> Optional[str]:
+    """The second code a client error carries (why, e.g. `os_origin_insecure`),
+    when it has the shape of a code. Never a message, never a configured value."""
+    detail = getattr(error, "detail", None)
+    return detail if isinstance(detail, str) and _DETAIL_RE.fullmatch(detail) else None
+
+
 def _fetch_list(api: Any, limit: int) -> tuple[list, Optional[OsRunOutcome]]:
     """(the picks, None), or ([], the failure outcome). Never a fallback."""
     code: Optional[str] = None
@@ -379,7 +389,7 @@ def _fetch_list(api: Any, limit: int) -> tuple[list, Optional[OsRunOutcome]]:
     except Exception as e:  # noqa: BLE001 — whatever stopped the list, the run stops
         raised = getattr(e, "code", None)
         if raised in LIST_FAILURE_CODES:
-            code = raised
+            code, detail = raised, _error_detail(e)
         else:
             code, detail = LIST_ERROR, type(e).__name__
     payloads: list = []
@@ -1696,14 +1706,16 @@ def collect(ctx: RunContext, deps: Deps, carry: Optional[dict] = None) -> OsRunO
 
     origin: Any = None
     code: Optional[str] = None
+    why = "os_origin_unreadable"
     try:
         origin = (deps.read_os_origin or _real_api().read_os_origin)()
     except Exception as e:  # noqa: BLE001 — no origin, no ticket link: stop before any request
         raised = getattr(e, "code", None)
         code = raised if raised in LIST_FAILURE_CODES else LIST_ERROR
+        why = _error_detail(e) or why
     if code is not None:
-        _log(f"os origin not readable: code={code}")
-        return _failed(f"{code}:os_origin_unreadable", code)
+        _log(f"os origin not readable: code={code} detail={why}")
+        return _failed(f"{code}:{why}", code)
 
     slots = _build_entries(
         deps, picks, settings, origin, notes, carry["token_box"], carry["unbundled"]

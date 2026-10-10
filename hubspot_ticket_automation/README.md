@@ -275,7 +275,7 @@ Both skills begin with a source guard, `py -m ticket_pipeline.source --require <
 
 The secret file holds the same value as `TICKETS_API_SECRET` in the Pack'N OS environment. When it is missing or too short, every `os` run is a `secret_missing` failure record and every `shadow` run skips its comparison.
 
-The Pack'N OS origin the signed client talks to is `os_ingest_url` in `config/settings.yaml` (scheme and host only).
+The Pack'N OS origin the signed client talks to is `os_ingest_url` in `config/settings.yaml` (scheme and host only). It must be `https://`. Plain `http://` is accepted only for a loopback host (`127.0.0.1`, `::1`, `localhost`), for a local test server; with any other `http://` origin no request is made, every `os` run is a `list_error` failure record whose summary says `os_origin_insecure`, and every `shadow` run skips its comparison.
 
 ### Database grants
 

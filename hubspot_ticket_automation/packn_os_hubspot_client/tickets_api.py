@@ -27,6 +27,12 @@ buffer that was hashed is the buffer that is sent.
 Rules this module keeps (they differ from scripts/post_action_items.py):
     - Fail closed. A failure raises TicketsApiError with a code; nothing here
       falls back to another source, and nothing returns None for a failure.
+    - HTTPS. A request is signed, but an ANSWER is authenticated by TLS alone,
+      and it carries end-consumer text the cron then acts on. The origin must
+      be `https://`; plain `http://` is taken only for a loopback host
+      (127.0.0.1, ::1, localhost), so a local test server still works. Any
+      other origin is refused before a request is built: `list_error`, with
+      the detail `os_origin_insecure`.
     - Five seconds. TIMEOUT_S is the budget handed to the transport.
     - No body in any output. A request body and a response body carry
       end-consumer text. Log lines name the route, the status and a count.
@@ -71,6 +77,13 @@ MAX_LIST_LIMIT = 100
 # The body error the OS answers with a 503 when its own secret is absent or short.
 SECRET_NOT_CONFIGURED_ERROR = "tickets_secret_not_configured"
 
+# The only hosts plain http is accepted for: this machine.
+LOOPBACK_HOSTS = ("127.0.0.1", "::1", "localhost")
+# The detail of the `list_error` raised for an origin that is not https and not
+# a loopback host. It reaches the run record's summary; the failure reason code
+# stays `list_error`, one of the four the Pack'N OS card knows.
+ORIGIN_INSECURE = "os_origin_insecure"
+
 # The OS's verdict on one write, by status. The client keys on the status and
 # reports the fixed name; it does not read the body of these answers.
 _CLASSIFICATION_VERDICTS = {
@@ -102,12 +115,16 @@ class TicketsApiError(Exception):
                             the OS answered 503 naming its own unset secret
 
     `http_status` is the status when there was one. The message is the code.
+    `detail` is a second code that says WHY, when there is one worth telling
+    apart (`os_origin_insecure`), else None. A code, never a configured value
+    and never response text.
     """
 
-    def __init__(self, code: str, http_status: Optional[int] = None) -> None:
+    def __init__(self, code: str, http_status: Optional[int] = None, detail: Optional[str] = None) -> None:
         super().__init__(code)
         self.code = code
         self.http_status = http_status
+        self.detail = detail
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -200,13 +217,41 @@ def read_secret(path: Path = SECRET_PATH) -> str:
     return _usable_secret(text)
 
 
+def checked_origin(value: Any) -> str:
+    """`scheme://host[:port]` of `value`, when it is an origin this client may
+    talk to; TicketsApiError("list_error") otherwise. Any path is dropped.
+
+        https://<any host>                         accepted
+        http://127.0.0.1 | http://[::1] |
+        http://localhost   (any port)              accepted: this machine
+        http://<any other host>                    refused, detail os_origin_insecure
+        another scheme, no host, not text          refused, no detail
+
+    The host is the one the URL really names: `http://localhost@os.host` and
+    `http://localhost.os.host` are other hosts, and are refused. Raised before
+    anything is signed or sent, and it carries no part of the value."""
+    parts = urllib.parse.urlsplit(value) if isinstance(value, str) else None
+    scheme = parts.scheme if parts is not None else ""
+    if parts is None or not parts.netloc or scheme not in ("http", "https"):
+        raise TicketsApiError("list_error")
+    try:
+        host = parts.hostname
+    except ValueError:  # a malformed bracketed host
+        host = None
+    if scheme == "http" and host not in LOOPBACK_HOSTS:
+        _log("the OS origin is plain http to a host that is not this machine; no request made")
+        raise TicketsApiError("list_error", detail=ORIGIN_INSECURE)
+    return f"{scheme}://{parts.netloc}"
+
+
 def read_os_origin() -> str:
     """The OS origin (scheme and host) from `os_ingest_url` in config/settings.yaml.
 
     Same line scan as scripts/post_action_items.py (the cron venv ships no YAML
     parser), reduced to scheme and host: any path on the configured value is
     dropped. An absent, blank or placeholder value raises
-    TicketsApiError("list_error") — there is no default origin.
+    TicketsApiError("list_error") — there is no default origin. The value must
+    pass `checked_origin`: https, or plain http to a loopback host only.
     """
     try:
         text = SETTINGS_PATH.read_text(encoding="utf-8")
@@ -222,9 +267,14 @@ def read_os_origin() -> str:
             continue
         value = rest.split("#", 1)[0].strip().strip('"').strip("'")
         if value and "REPLACE" not in value and "example.com" not in value:
-            parts = urllib.parse.urlsplit(value)
-            if parts.scheme in ("http", "https") and parts.netloc:
-                origin = f"{parts.scheme}://{parts.netloc}"
+            detail: Optional[str] = None
+            try:
+                origin = checked_origin(value)
+            except TicketsApiError as refused:
+                detail = refused.detail
+            if detail is not None:
+                # raised here, outside the handler, and with nothing of the value
+                raise TicketsApiError("list_error", detail=detail)
         break
     if origin is None:
         _log("os_ingest_url is unset or unusable in settings.yaml; no request made")
@@ -290,7 +340,8 @@ def _send(
     classify; the body of a non-2xx answer is dropped here and goes no further.
     """
     key = _usable_secret(secret) if secret is not None else read_secret(SECRET_PATH)
-    origin = base_url.rstrip("/") if base_url is not None else read_os_origin()
+    # The same rule whichever way the origin arrives: the keyword seam is not a way round it.
+    origin = checked_origin(base_url) if base_url is not None else read_os_origin()
     timestamp = str(int((now if now is not None else time.time)()))
 
     query = canonical_query(pairs)
