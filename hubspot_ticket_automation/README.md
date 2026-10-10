@@ -333,7 +333,13 @@ Order matters. Deploy the whole of Phase 93 in one pull: all three sources ship 
 
 ### Rolling back
 
-Set the source back to HubSpot on the Ticket flow card. That is the whole rollback: no code change, no pull, no restart. The next run reads the setting and works from HubSpot. Do it at a quiet time, after an `os` run has finished, and start any hand-run through `scripts/run_tickets.sh`.
+Set the source back to HubSpot on the Ticket flow card. That is all the owner does: no code change, no pull, no restart. The next run reads the setting and works from HubSpot. Do it at a quiet time, after an `os` run has finished, and start any hand-run through `scripts/run_tickets.sh`.
+
+What the HubSpot runs do after a rollback:
+
+- **The HubSpot search starts where the last HubSpot-source run left it.** An `os` run records the tickets it completed in `config/state.json` as fingerprints and never moves `last_run_at`, the start of the HubSpot search. So the first HubSpot runs after a rollback search a wider stretch of time than usual. Expect them to be longer.
+- **A ticket an `os` run completed is not drafted again.** Its fingerprint keeps it out, until HubSpot reports a change later than the moment that pass finished.
+- **A ticket no `os` run completed is selected again.** That includes a ticket Pack'N OS had parked after two failed passes, one beyond the per-run cap, and one Pack'N OS had not mirrored yet. Parked tickets are the ones a rollback is usually for; they are worked from HubSpot as if `os` had never been on.
 
 ### Tests
 

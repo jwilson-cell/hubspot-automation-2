@@ -48,6 +48,15 @@ A ticket with no HubSpot id is not recorded: HubSpot can never select it. A
 state write that fails is a code in the summary and nothing else: in this mode
 the OS's marker is the authority, the file only protects a rollback.
 
+FINGERPRINTS ONLY. The file's `last_run_at` (where the HubSpot search starts)
+is never moved from this mode. A pass knows only the tickets it listed; a
+ticket it did not list (parked after two failed passes, beyond the per-run
+cap, not mirrored yet) has no fingerprint, and a search window moved past its
+modified time would hide it from the HubSpot path for good. So after a switch
+back the HubSpot search starts where the last HubSpot-source run left it: the
+completed tickets are deduped by their fingerprints and every other ticket is
+still inside the window.
+
 WHAT THE TOOL RESTRICTION DOES AND DOES NOT DO (runbook tag D-10-RESIDUAL)
 --------------------------------------------------------------------------
 `--disallowedTools "mcp__hubspot"` removes the HubSpot MCP server's tools from
@@ -1372,39 +1381,7 @@ def _finalize_ticket(run: _Pass, entry: dict, record: dict, ticket: dict) -> Non
     _backfill(run, entry, ticket)
 
 
-def _window_start(done: list, held: list, blind: bool) -> Optional[str]:
-    """Where the HubSpot search window may start after this pass, or None for
-    "leave it where it is".
-
-    `done`: the HubSpot modified times (the OS's copies) of the linked tickets
-    this pass completed. `held`: those of the linked tickets it listed and did
-    NOT complete. `blind`: a ticket was listed of which no HubSpot time is known.
-
-    The answer is the latest `done` time that is still BEFORE every `held`
-    time. The HubSpot search only returns tickets modified after the window's
-    start, and a ticket left uncompleted has no fingerprint: a start at or past
-    its time would hide it from the HubSpot path for good. With an uncompleted
-    ticket whose time is unknown, the start does not move at all."""
-    if blind:
-        return None
-    floor: Optional[int] = None
-    for value in held:
-        ms = source.iso_to_ms(value)
-        if ms is None:
-            return None
-        floor = ms if floor is None else min(floor, ms)
-    best: Optional[str] = None
-    best_ms: Optional[int] = None
-    for value in done:
-        ms = source.iso_to_ms(value)
-        if ms is None or (floor is not None and ms >= floor):
-            continue
-        if best_ms is None or ms > best_ms:
-            best, best_ms = value, ms
-    return best
-
-
-def _keep_rollback_state(run: _Pass, bundle_entries: list, unbundled: Any) -> None:
+def _keep_rollback_state(run: _Pass, bundle_entries: list) -> None:
     """The finalizer's last step: record the completed HubSpot-linked tickets in
     the HubSpot path's state file, so a switch back to `hubspot` processes none
     of them again (SPEC R15).
@@ -1414,8 +1391,13 @@ def _keep_rollback_state(run: _Pass, bundle_entries: list, unbundled: Any) -> No
     fingerprint's `processed_at` is ONE instant for the whole pass, read from
     the run's clock here, after every ticket's last step: the pass's own
     HubSpot write (the number backfill) is then never later than it. A ticket
-    with no HubSpot id is skipped. Any other linked ticket only holds the
-    search window open (`_window_start`).
+    with no HubSpot id is skipped, and so is a linked ticket this pass did not
+    complete: with no fingerprint it stays a HubSpot candidate.
+
+    FINGERPRINTS ONLY: the writer is handed no search window, so `last_run_at`
+    is exactly what the HubSpot path last wrote. This pass cannot know which
+    HubSpot tickets it was never shown, so it has no safe value to move the
+    window to (see the module docstring, ROLLBACK).
 
     Nothing is written in a dry run, or when no ticket qualifies. The file is
     written, never read for a decision. A failure here is a code in the summary
@@ -1429,7 +1411,6 @@ def _keep_rollback_state(run: _Pass, bundle_entries: list, unbundled: Any) -> No
     count = 0
     try:
         completed: list = []
-        held: list = []
         for entry, ticket in zip(bundle_entries, summary.tickets):
             hubspot_id = _id_text(entry.get("hubspot_ticket_id"))
             if hubspot_id is None or not (hubspot_id.isascii() and hubspot_id.isdigit()):
@@ -1438,8 +1419,6 @@ def _keep_rollback_state(run: _Pass, bundle_entries: list, unbundled: Any) -> No
             updated = context.get("hs_lastmodifieddate") if isinstance(context, dict) else None
             if ticket.get("drafted") and ticket.get("writeback") == WB_PROCESSED:
                 completed.append((hubspot_id, updated))
-            else:
-                held.append(updated)
         if not completed:
             return
         finished = _iso_ms(run.deps.now())
@@ -1447,21 +1426,14 @@ def _keep_rollback_state(run: _Pass, bundle_entries: list, unbundled: Any) -> No
             hubspot_id: source.fingerprint_entry(finished, updated) for hubspot_id, updated in completed
         }
         count = len(entries)
-        answer = source.merge_fingerprints(
-            run.deps.state_path,
-            entries,
-            _window_start([updated for _id, updated in completed], held, bool(unbundled)),
-        )
+        answer = source.merge_fingerprints(run.deps.state_path, entries)  # no window: fingerprints only
     except Exception as e:  # noqa: BLE001 — the state file only protects a rollback
         failure = type(e).__name__
     if failure is not None:
         summary.note(ROLLBACK_STATE_UNWRITABLE)
         _log(f"{ROLLBACK_STATE_UNWRITABLE}:{failure} tickets={count}")
         return
-    _log(
-        f"rollback state kept: tickets={count} written={answer.get('written')} "
-        f"window_moved={answer.get('last_run_at_moved')}"
-    )
+    _log(f"rollback state kept: tickets={count} written={answer.get('written')}")
 
 
 def finalize_os_run(
@@ -1573,7 +1545,7 @@ def finalize_os_run(
 
     # Last, once: the HubSpot path's state, for a rollback (Plan 93-23). Not
     # reached by the two early returns above, which persisted no ticket.
-    _keep_rollback_state(run, bundle_entries, unbundled)
+    _keep_rollback_state(run, bundle_entries)
 
     _log(
         f"finalized: tickets={len(summary.tickets)} processed={summary.tickets_processed} "

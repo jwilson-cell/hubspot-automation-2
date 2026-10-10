@@ -679,7 +679,8 @@ def test_a_finalised_run_fingerprints_each_completed_hubspot_linked_ticket(world
         osm.T3_HS_ID: code_written(STAMP, T3_UPDATED),
     }
     assert osm.T2_OS_ID not in json.dumps(state)
-    assert state["last_run_at"] == T3_UPDATED  # the latest among the completed, later than the stored one
+    # fingerprints only (review CR-41): the search window is the HubSpot path's and does not move
+    assert state["last_run_at"] == osm.STATE["last_run_at"]
 
 
 def test_processed_at_is_read_once_after_the_last_step_of_the_last_ticket(world: OsWorld) -> None:
@@ -706,32 +707,39 @@ def test_a_failed_ticket_gets_no_fingerprint_and_stays_inside_the_search_window(
 
     state = read(world.state_path)
     assert state["ticket_fingerprints"] == {osm.T3_HS_ID: code_written(STAMP, T3_UPDATED)}
-    # ticket 3 was modified later than the failed ticket 1: moving the window's start
-    # to it would hide ticket 1 from the HubSpot search for good. It does not move.
+    # ticket 3 was modified later than the failed ticket 1: a window moved to it
+    # would hide ticket 1 from the HubSpot search for good. The window never moves.
     assert state["last_run_at"] == STORED_LAST_RUN
     decision, window_start = flip_to_hubspot(world, [(osm.T1_HS_ID, T1_UPDATED), (osm.T3_HS_ID, T3_UPDATED)])
     assert window_start < source.iso_to_ms(T1_UPDATED)
     assert decision["candidates"] == [osm.T1_HS_ID]
 
 
-def test_last_run_at_stops_short_of_a_linked_ticket_the_run_did_not_complete(world: OsWorld) -> None:
+# The four tests below pinned plan 93-23's moving window (runbook tag
+# WINDOW-STOP): "the latest completed time that is still before every listed,
+# uncompleted ticket's time". That rule protected only the tickets a pass
+# LISTED, and a ticket it never listed fell out of the window (review CR-41).
+# They now pin its replacement: whatever a pass completed, failed or could not
+# bundle, `last_run_at` is not moved at all.
+
+
+def test_last_run_at_does_not_move_when_an_older_ticket_completed_and_a_newer_one_failed(world: OsWorld) -> None:
     empty_state(world)
     entries = [make_entry(0), make_entry(2)]
 
     finalize(world, entries, result_of(completed(entries[0]), failed(entries[1])))
 
-    # ticket 1 (older) completed, ticket 3 (newer) failed: the start may move to
-    # ticket 1's time, which is still before ticket 3's
+    # ticket 1 (older) completed, ticket 3 (newer) failed. The old rule moved the
+    # start to ticket 1's time, "still before ticket 3's": true of ticket 3, and
+    # of no ticket the pass was not shown.
     state = read(world.state_path)
-    assert state["last_run_at"] == T1_UPDATED
+    assert state["last_run_at"] == STORED_LAST_RUN
     assert set(state["ticket_fingerprints"]) == {osm.T1_HS_ID}
     decision, window_start = flip_to_hubspot(world, [(osm.T3_HS_ID, T3_UPDATED)])
-    assert window_start < source.iso_to_ms(T3_UPDATED) and decision["candidates"] == [osm.T3_HS_ID]
+    assert window_start == source.iso_to_ms(STORED_LAST_RUN) and decision["candidates"] == [osm.T3_HS_ID]
 
 
-def test_last_run_at_does_not_move_onto_the_time_of_an_uncompleted_ticket(world: OsWorld) -> None:
-    # The HubSpot search asks for tickets modified AFTER the start: a start exactly
-    # at an uncompleted ticket's time would hide it as surely as one past it.
+def test_last_run_at_does_not_move_when_a_completed_and_a_failed_ticket_share_a_time(world: OsWorld) -> None:
     empty_state(world)
     same_time = make_entry(0, payload_edit=lambda payload: payload.update(hubspot_updated_at=T3_UPDATED))
     entries = [same_time, make_entry(2)]
@@ -752,7 +760,7 @@ def test_last_run_at_does_not_move_back_or_without_a_readable_time(world: OsWorl
     assert read(world.state_path)["last_run_at"] == "2026-10-09T09:00:00Z"
 
 
-def test_an_uncompleted_linked_ticket_with_no_known_time_holds_last_run_at(world: OsWorld) -> None:
+def test_last_run_at_does_not_move_with_an_uncompleted_ticket_of_no_known_time(world: OsWorld) -> None:
     empty_state(world)
     unknown = make_entry(2, payload_edit=lambda payload: payload.update(hubspot_updated_at=None))
     entries = [make_entry(0), unknown]
@@ -764,7 +772,7 @@ def test_an_uncompleted_linked_ticket_with_no_known_time_holds_last_run_at(world
     assert state["last_run_at"] == STORED_LAST_RUN
 
 
-def test_a_ticket_no_bundle_entry_could_be_built_for_holds_last_run_at(world: OsWorld) -> None:
+def test_last_run_at_does_not_move_with_a_ticket_no_bundle_entry_could_be_built_for(world: OsWorld) -> None:
     empty_state(world)
     entry = make_entry(0)
 
@@ -772,7 +780,7 @@ def test_a_ticket_no_bundle_entry_could_be_built_for_holds_last_run_at(world: Os
 
     state = read(world.state_path)
     assert set(state["ticket_fingerprints"]) == {osm.T1_HS_ID}
-    assert state["last_run_at"] == STORED_LAST_RUN  # nothing is known of that ticket's HubSpot time
+    assert state["last_run_at"] == STORED_LAST_RUN
 
 
 def test_a_ticket_whose_write_back_answered_409_is_fingerprinted(world: OsWorld) -> None:
@@ -832,7 +840,7 @@ def test_the_state_step_itself_refuses_a_dry_run(world: OsWorld) -> None:
     def step(dry_run: bool) -> None:
         summary = os_pass.FinalizeSummary(dry_run=dry_run, tickets=[dict(claimed)])
         run = os_pass._Pass(run_context(world), world.deps(), world.os_api, summary, world.settings, {}, None)
-        os_pass._keep_rollback_state(run, [entry], ())
+        os_pass._keep_rollback_state(run, [entry])
         assert summary.codes == {}
 
     step(dry_run=True)
@@ -907,13 +915,14 @@ def test_after_three_os_runs_a_flip_to_hubspot_selects_none_of_the_completed_tic
     assert [fp["hs_lastmodifieddate"] for fp in written.values()] == [T1_UPDATED, T3_UPDATED]
     done_1, done_3 = (written[key]["processed_at"] for key in (osm.T1_HS_ID, osm.T3_HS_ID))
     assert source.iso_to_ms(done_1) < source.iso_to_ms(done_3)  # each run's own finishing instant
-    assert state["last_run_at"] == T3_UPDATED
+    # three `os` runs later the search window is where the HubSpot path left it (review CR-41)
+    assert state["last_run_at"] == osm.STATE["last_run_at"]
 
     # 1. HubSpot reports every completed ticket, unchanged since the mirror saw it: none is a candidate
     decision, window_start = flip_to_hubspot(world, [(osm.T1_HS_ID, T1_UPDATED), (osm.T3_HS_ID, T3_UPDATED)])
     assert decision["candidates"] == [] and decision["decision"] == "no_work"
     assert [hit["deduped"] for hit in decision["matched"]] == [True, True]
-    assert window_start == source.iso_to_ms(T3_UPDATED)
+    assert window_start == source.iso_to_ms(osm.STATE["last_run_at"])
 
     # 2. modified up to the very instant each pass finished (ticket 3's own
     #    backfill write is such a change): still none

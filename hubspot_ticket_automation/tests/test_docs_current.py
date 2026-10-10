@@ -501,6 +501,19 @@ def test_the_readme_says_a_rollback_is_the_setting_and_no_code_change() -> None:
     assert "scripts/run_tickets.sh" in section
 
 
+def test_the_readme_says_what_a_rollback_does_to_the_search_window_and_to_parked_tickets() -> None:
+    """Review CR-41. An `os` run writes fingerprints and never moves the HubSpot
+    search window, so the section must not promise more than the setting change
+    and must say which tickets the HubSpot path picks up again."""
+    section = _section(_phase_93(), "### Rolling back")
+    assert "That is the whole rollback" not in section
+    assert "never moves `last_run_at`" in section
+    assert "is not drafted again" in section
+    assert "parked after two failed passes" in section
+    assert "beyond the per-run cap" in section
+    assert "is selected again" in section
+
+
 def test_the_readme_gives_the_cron_gate_and_the_local_database_rule() -> None:
     section = _section(_phase_93(), "### Tests")
     assert CRON_GATE in section

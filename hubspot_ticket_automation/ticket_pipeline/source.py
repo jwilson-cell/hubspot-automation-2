@@ -56,6 +56,14 @@ the file: a ticket completed from the OS is not a HubSpot candidate after a
 switch back, and becomes one again as soon as HubSpot reports a change later
 than the moment its pass finished.
 
+`last_run_at` IS THE HUBSPOT PATH'S ALONE. The `os` finalizer writes
+fingerprints and never a search window. A pass that takes its list from the
+OS cannot know which HubSpot tickets it was not shown (parked, beyond the
+per-run cap, not mirrored yet); such a ticket has no fingerprint, and a window
+moved past its modified time would hide it from the HubSpot search for good.
+`merge_fingerprints` still accepts a window, for a caller that selected from
+HubSpot itself; no code passes one today, and a test holds that.
+
 This module imports the standard library only. The database client is imported
 inside `resolve_mode` and inside the guard's record write, so the pure
 functions stay usable without a driver.
@@ -598,7 +606,9 @@ def merge_fingerprints(state_path: Any, entries: Any, last_run_at: Any = None) -
     the tracked file by leaving an argument out.
     `entries` is {HubSpot ticket id: fingerprint_entry(...)}.
     `last_run_at`, when given, is an ISO instant the search window may start
-    from; it only ever moves the stored value forward.
+    from; it only ever moves the stored value forward. A caller whose list did
+    NOT come from the HubSpot search must not give one (the `os` finalizer
+    gives none): it cannot know what the window would skip.
 
     Read the file (missing or unparseable = empty), merge (`_merge_state`),
     and, when that changed anything, replace the file through a temp file and
