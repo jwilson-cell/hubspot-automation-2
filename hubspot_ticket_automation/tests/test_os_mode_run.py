@@ -31,7 +31,9 @@ import copy
 import io
 import json
 import logging
+import os
 import re
+import stat
 import subprocess
 import sys
 import urllib.error
@@ -1854,6 +1856,62 @@ def test_after_the_run_the_scratch_directory_and_the_bundle_do_not_exist(world: 
     assert not seen["path"].exists()
     assert not seen["path"].parent.exists()
     assert world.scratch_left() == []
+
+
+def test_the_bundle_is_created_owner_only_and_never_narrowed_afterwards(
+    world: OsWorld, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Review WR-50. The bundle holds the full text of up to `per_run_cap`
+    tickets. It used to be written with the default mode and `chmod`-ed after
+    the write; it is now created 0600 and exclusively, in a directory created
+    0700, so there is no moment at which another account can read it."""
+    opened: list[tuple[str, int, int]] = []
+    real_open = os.open
+
+    def spy_open(path: Any, flags: int, mode: int = 0o777, *args: Any, **kwargs: Any) -> int:
+        if flags & os.O_CREAT and Path(path).name.startswith(("bundle.json", "context.json")):
+            opened.append((Path(path).name, flags, mode))
+        return real_open(path, flags, mode, *args, **kwargs)
+
+    chmods: list[str] = []
+    monkeypatch.setattr(os, "open", spy_open)
+    monkeypatch.setattr(os, "chmod", lambda path, *_a, **_k: chmods.append(Path(path).name))
+    seen: dict[str, Any] = {}
+    real_agent = world.agent
+
+    def launch(command: Any, env: Any) -> int:
+        bundle_path = Path(env[os_pass.BUNDLE_PATH_ENV])
+        seen["modes"] = {
+            name: stat.S_IMODE(os.stat(bundle_path.parent / name).st_mode) for name in ("bundle.json", "context.json")
+        }
+        seen["dir"] = stat.S_IMODE(os.stat(bundle_path.parent).st_mode)
+        return real_agent(command, env)
+
+    world.agent = launch
+    world.run()
+
+    by_name = {name.split(".json")[0]: (flags, mode) for name, flags, mode in opened}
+    assert sorted(by_name) == ["bundle", "context"]
+    for flags, mode in by_name.values():
+        assert flags & os.O_EXCL and flags & os.O_WRONLY
+        assert mode == 0o600
+    assert chmods == []  # no write-then-chmod
+    if os.name == "posix":
+        assert seen["modes"] == {"bundle.json": 0o600, "context.json": 0o600} and seen["dir"] == 0o700
+    assert world.record["status"] == "success"
+
+
+def test_write_bundle_cleans_up_a_stale_partial_file_and_leaves_none(tmp_path: Path) -> None:
+    target = tmp_path / "run" / "bundle.json"
+    target.parent.mkdir()
+    (target.parent / "bundle.json.partial").write_text("left by a write that died", encoding="utf-8")
+
+    os_bundle.write_bundle(target, "run-1", [{"ref": "a"}])
+
+    assert json.loads(target.read_text(encoding="utf-8"))["tickets"] == [{"ref": "a"}]
+    assert sorted(p.name for p in target.parent.iterdir()) == ["bundle.json"]
+    if os.name == "posix":
+        assert stat.S_IMODE(os.stat(target).st_mode) == 0o600
 
 
 # ------------------------------------------------------------ the engine shadow

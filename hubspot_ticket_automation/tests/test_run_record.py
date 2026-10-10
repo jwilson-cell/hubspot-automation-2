@@ -21,7 +21,10 @@ import builtins
 import inspect
 import json
 import logging
+import os
 import re
+import shutil
+import stat
 import subprocess
 import sys
 from datetime import datetime, timedelta, timezone
@@ -865,6 +868,283 @@ def test_the_scratch_directory_is_gone_after_the_run(world: World, configure) ->
     assert world.scratch_left() == []
     if isinstance(world.agent, Agent) and world.agent.calls:
         assert world.agent.scratch_existed == [True]  # it was there while the agent ran
+
+
+# The scratch directory holds ticket text: the bundle (full threads, names and
+# addresses) and the agent's result (draft bodies). Review WR-50: it was made
+# with default modes, its files were made readable and narrowed afterwards, it
+# was removed only on an orderly exit, and nothing ever swept an older one.
+
+RUN_STARTED = datetime(2026, 10, 9, 12, 0, 5, tzinfo=timezone.utc)  # the world's first clock reading
+POSIX = os.name == "posix"
+
+
+def _mode(path: Path) -> int:
+    return stat.S_IMODE(os.stat(path).st_mode)
+
+
+def _spy_mkdir(monkeypatch: pytest.MonkeyPatch) -> list[tuple[Path, int]]:
+    """Every directory that was really created, as (path, the mode asked for).
+    pathlib's own `mkdir` goes through `os.mkdir`, so both ways of creating one
+    are seen; an attempt on a directory that is already there creates nothing
+    and is not recorded."""
+    made: list[tuple[Path, int]] = []
+    real = os.mkdir
+
+    def spy(path: Any, mode: int = 0o777, *args: Any, **kwargs: Any) -> None:
+        real(path, mode, *args, **kwargs)
+        made.append((Path(path), mode))
+
+    monkeypatch.setattr(os, "mkdir", spy)
+    return made
+
+
+def _spy_open(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, int, int]]:
+    """Every `os.open` that creates a file, as (file name, flags, mode)."""
+    opened: list[tuple[str, int, int]] = []
+    real = os.open
+
+    def spy(path: Any, flags: int, mode: int = 0o777, *args: Any, **kwargs: Any) -> int:
+        if flags & os.O_CREAT:
+            opened.append((Path(path).name, flags, mode))
+        return real(path, flags, mode, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", spy)
+    return opened
+
+
+def test_the_scratch_directory_is_created_owner_only_in_one_step(world: World, monkeypatch: pytest.MonkeyPatch) -> None:
+    made = _spy_mkdir(monkeypatch)
+    modes: list[int] = []
+    real_agent = world.agent
+
+    def launch(command: Any, env: Any) -> int:
+        modes.append(_mode(Path(env[run_types.RESULT_PATH_ENV]).parent))
+        return real_agent(command, env)
+
+    world.agent = launch
+    world.run()
+
+    scratch = world.scratch_root / world.run_ids[0]
+    # asked for at creation: there is no moment at which the directory exists with a wider mode
+    assert [mode for path, mode in made if path == scratch] == [0o700]
+    assert run_types.SCRATCH_DIR_MODE == 0o700
+    if POSIX:
+        assert modes == [0o700]  # and that is the mode it had while the agent ran
+
+
+def test_a_scratch_directory_that_already_exists_is_not_adopted(world: World) -> None:
+    """A run id is new. A directory already at that path was not made by this
+    run, so its mode and its contents are not this run's: the run fails closed
+    with its one record, and it does not remove what it did not create."""
+    planted = rt.new_run_id()
+    deps = world.deps()
+    deps.new_run_id = lambda: planted
+    (world.scratch_root / planted).mkdir(parents=True)
+    (world.scratch_root / planted / "not-ours.txt").write_text("kept", encoding="utf-8")
+
+    assert rt.run(deps) == 0
+    assert world.record["status"] == "failure"
+    assert world.record["error_summary"] == "runner_exception:FileExistsError"
+    assert world.launch_attempts == 0
+    assert (world.scratch_root / planted / "not-ours.txt").read_text(encoding="utf-8") == "kept"
+
+
+def test_the_run_context_file_is_created_owner_only_and_never_narrowed_afterwards(
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    opened = _spy_open(monkeypatch)
+    chmods: list[str] = []
+    monkeypatch.setattr(os, "chmod", lambda path, *_a, **_k: chmods.append(Path(path).name))
+    modes: list[int] = []
+    real_agent = world.agent
+
+    def launch(command: Any, env: Any) -> int:
+        modes.append(_mode(Path(env[run_types.RUN_CONTEXT_ENV])))
+        return real_agent(command, env)
+
+    world.agent = launch
+    world.run()
+
+    (created,) = [entry for entry in opened if entry[0].startswith("context.json")]
+    assert created[1] & os.O_EXCL and created[1] & os.O_WRONLY  # a new file, never one that was already there
+    assert created[2] == 0o600 == run_types.SCRATCH_FILE_MODE
+    assert chmods == []  # owner-only at creation, not write-then-chmod
+    if POSIX:
+        assert modes == [0o600]
+
+
+@pytest.mark.parametrize(
+    "error",
+    [RuntimeError("boom"), SystemExit(3), KeyboardInterrupt()],
+    ids=["exception", "SystemExit", "KeyboardInterrupt"],
+)
+def test_the_scratch_directory_is_removed_whatever_ends_the_runner(world: World, error: BaseException) -> None:
+    def runner(ctx: Any, deps: Any) -> Any:
+        (ctx.scratch_dir / "bundle.json").write_text("ticket text", encoding="utf-8")
+        raise error
+
+    world.monkeypatch.setitem(rt.MODE_RUNNERS, "hubspot", runner)
+    assert world.run() == 0  # the record is still written
+    assert world.record["error_summary"] == f"runner_exception:{type(error).__name__}"
+    assert world.scratch_left() == []
+
+
+def test_the_scratch_directory_is_removed_when_the_crash_handler_itself_fails(
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """stderr can be gone (a closed pipe). The line the crash handler logs then
+    raises from INSIDE the handler, and the run leaves `run()` as an exception."""
+
+    def runner(ctx: Any, deps: Any) -> Any:
+        (ctx.scratch_dir / "bundle.json").write_text("ticket text", encoding="utf-8")
+        raise RuntimeError("boom")
+
+    real_log = rt._log
+
+    def log(message: str) -> None:
+        if message.startswith("runner_exception"):
+            raise BrokenPipeError("stderr is closed")
+        real_log(message)
+
+    world.monkeypatch.setitem(rt.MODE_RUNNERS, "hubspot", runner)
+    monkeypatch.setattr(rt, "_log", log)
+    with pytest.raises(BrokenPipeError):
+        world.run()
+    assert world.scratch_left() == []
+
+
+def test_a_removal_that_is_interrupted_is_tried_again_before_the_process_leaves(
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real_rmtree = shutil.rmtree
+    attempts: list[str] = []
+
+    def rmtree(path: Any, *args: Any, **kwargs: Any) -> None:
+        attempts.append(Path(path).name)
+        if len(attempts) == 1:
+            raise KeyboardInterrupt()  # the first attempt is cut short
+        real_rmtree(path, *args, **kwargs)
+
+    monkeypatch.setattr(shutil, "rmtree", rmtree)
+    with pytest.raises(KeyboardInterrupt):
+        world.run()
+    assert attempts == [world.run_ids[0]] * 2
+    assert world.scratch_left() == []
+
+
+# --- the sweep at run start
+
+
+def _old_run_dir(world: World, hours: float, name: Optional[str] = None) -> Path:
+    """A leftover run directory whose last change was `hours` before this run started."""
+    path = world.scratch_root / (name or rt.new_run_id())
+    path.mkdir(parents=True)
+    (path / "bundle.json").write_text("ticket text of a run that died", encoding="utf-8")
+    moment = RUN_STARTED.timestamp() - hours * 3600
+    os.utime(path, (moment, moment))
+    return path
+
+
+def test_a_run_removes_run_directories_older_than_a_day_and_nothing_younger(world: World) -> None:
+    stale = _old_run_dir(world, 25)
+    week_old = _old_run_dir(world, 24 * 7)
+    young = _old_run_dir(world, 23)
+
+    world.run()
+
+    assert not stale.exists() and not week_old.exists()
+    assert young.is_dir() and (young / "bundle.json").is_file()  # could be a run that is still going
+    assert world.record["status"] == "success" and world.record["error_summary"] is None
+
+
+def test_the_sweep_touches_only_run_directories_directly_under_the_scratch_root(world: World) -> None:
+    stale = _old_run_dir(world, 48)
+    not_a_run = _old_run_dir(world, 48, name="keep-me")  # not a run id: not ours to judge
+    a_file = world.scratch_root / rt.new_run_id()  # a run id, but a file
+    a_file.write_text("x", encoding="utf-8")
+    sibling = world.root / "outputs" / "runs" / "cron-tickets.log"
+    sibling.write_text("log", encoding="utf-8")
+    elsewhere = world.root / "outputs" / "runs" / "other" / rt.new_run_id()
+    elsewhere.mkdir(parents=True)
+    for path in (a_file, sibling, elsewhere):
+        moment = RUN_STARTED.timestamp() - 48 * 3600
+        os.utime(path, (moment, moment))
+
+    world.run()
+
+    assert not stale.exists()
+    assert not_a_run.is_dir() and a_file.is_file() and sibling.is_file() and elsewhere.is_dir()
+
+
+def test_the_sweep_never_follows_a_symlink(world: World, tmp_path: Path) -> None:
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "precious.txt").write_text("not the cron's", encoding="utf-8")
+    moment = RUN_STARTED.timestamp() - 48 * 3600
+    os.utime(outside, (moment, moment))
+    stale = _old_run_dir(world, 48)
+    link = world.scratch_root / rt.new_run_id()  # a run-id-named LINK to a directory outside
+    inner = stale / "inner-link"
+    try:
+        os.symlink(outside, link, target_is_directory=True)
+        os.symlink(outside, inner, target_is_directory=True)
+    except (OSError, NotImplementedError):
+        pytest.skip("this account cannot create a symlink")
+    os.utime(stale, (moment, moment))
+
+    world.run()
+
+    assert not stale.exists()  # the stale run went, the link inside it with it
+    assert (outside / "precious.txt").read_text(encoding="utf-8") == "not the cron's"
+    assert os.path.islink(link)  # a link is never removed and never entered
+
+
+def test_a_scratch_root_that_is_a_symlink_is_not_swept(world: World, tmp_path: Path) -> None:
+    real_root = tmp_path / "somewhere-else"
+    real_root.mkdir()
+    victim = real_root / rt.new_run_id()
+    victim.mkdir()
+    moment = RUN_STARTED.timestamp() - 48 * 3600
+    os.utime(victim, (moment, moment))
+    world.scratch_root.parent.mkdir(parents=True)
+    try:
+        os.symlink(real_root, world.scratch_root, target_is_directory=True)
+    except (OSError, NotImplementedError):
+        pytest.skip("this account cannot create a symlink")
+
+    assert rt.sweep_stale_scratch(world.root, RUN_STARTED) == 0
+    assert victim.is_dir()
+
+
+def test_the_sweep_is_bounded_per_run(world: World) -> None:
+    for _ in range(rt.SCRATCH_SWEEP_LIMIT + 3):
+        _old_run_dir(world, 48)
+
+    assert rt.sweep_stale_scratch(world.root, RUN_STARTED) == rt.SCRATCH_SWEEP_LIMIT
+    assert len(world.scratch_left()) == 3  # the next runs take the rest
+    assert rt.sweep_stale_scratch(world.root, RUN_STARTED) == 3
+    assert 1 <= rt.SCRATCH_SWEEP_LIMIT <= 100 and rt.SCRATCH_MAX_AGE_S == 24 * 60 * 60
+
+
+def test_a_sweep_that_fails_never_fails_the_run(world: World, monkeypatch: pytest.MonkeyPatch) -> None:
+    _old_run_dir(world, 48)
+
+    def refuse(*_args: Any, **_kwargs: Any) -> Any:
+        raise PermissionError(f"cannot list {EXC_MARKER}")
+
+    monkeypatch.setattr(os, "scandir", refuse)
+    assert world.run() == 0
+    assert world.record["status"] == "success"
+    assert EXC_MARKER not in json.dumps(world.record, default=str)
+
+
+def test_the_sweep_runs_even_when_the_run_fails_closed_before_any_runner(world: World) -> None:
+    stale = _old_run_dir(world, 48)
+    world.mode_reader = _raiser(RuntimeError("database down"))
+    world.run()
+    assert world.record["status"] == "failure" and world.launch_attempts == 0
+    assert not stale.exists()
 
 
 # --------------------------------------------- fail-open, one branch per test
