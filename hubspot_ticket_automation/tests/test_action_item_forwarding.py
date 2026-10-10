@@ -809,6 +809,147 @@ def test_no_action_item_text_reaches_a_log_stdout_or_stderr_live_or_dry(
     fakes.assert_marker_absent(MARKER, caplog, capfd)
 
 
+# ------------------------------------------- a dry run posts nothing (review WR-47)
+#
+# `dry_run: true` in config/settings.yaml: the finalizer takes the poster's
+# dry-run path and reports `would_action_item_posts`. But the `os` skill queues
+# a record for every drafted ticket whatever `dry_run` says, and the wrapper
+# then ALWAYS runs the forwarder, which posted live. So a dry run created real
+# /tasks rows. The forwarder now reads `dry_run` itself, with the parser and
+# the truthiness the finalizer uses, and posts only when it has read `false`.
+
+REAL_POSTER_SETTINGS_PATH = poster.SETTINGS_PATH  # taken at import, before any fixture moves it
+
+
+def settings_say(world: OsWorld, text: Optional[str]) -> Path:
+    """Point the forwarder's settings read at a temp settings file holding `text`
+    (None: a path where no file is)."""
+    path = world.base / "settings-for-the-forwarder.yaml"
+    if text is not None:
+        path.write_text(text, encoding="utf-8")
+    world.monkeypatch.setattr(poster, "SETTINGS_PATH", path)
+    return path
+
+
+def live_posts(world: OsWorld) -> list[dict]:
+    """Every envelope that was handed to the poster as a LIVE post."""
+    return [post for post, dry in zip(world.ingest.posts, world.ingest.dry_runs) if dry is False]
+
+
+def test_a_dry_os_run_then_the_wrappers_forwarder_step_posts_nothing_live(world: OsWorld) -> None:
+    """The whole sequence of one tick, as scripts/run_tickets.sh runs it: the
+    orchestrator in `os` mode with `dry_run: true`, then the forwarder over the
+    queue the agent wrote (the skill queues a record whatever `dry_run` says)."""
+    world.settings["dry_run"] = True
+    settings_say(world, "dry_run: true\nper_run_cap: 25\n")
+
+    def with_action_items(result: dict) -> None:
+        result["tickets"][0]["action_items"] = [dict(ITEM_A), dict(ITEM_B)]
+
+    world.agent = osm.OsAgent(edit=with_action_items)
+    assert world.run() == 0
+    assert "would_action_item_posts=1" in world.record["error_summary"]
+    assert world.ingest.dry_runs == [True]  # the finalizer's own post: the dry-run path
+
+    queue = write_queue(world, {"ticket_id": osm.T1_HS_ID, "action_items": [dict(ITEM_A), dict(ITEM_B)]})
+    queue_before = queue.read_bytes()
+    assert fwd.main(queue_path=queue, seen_path=world.seen_path) == 0
+
+    assert live_posts(world) == []  # `would_action_item_posts` was the truth: nothing was posted
+    assert not world.seen_path.exists() and not retry_file(world).exists()
+    assert queue.read_bytes() == queue_before  # the records stay queued for the first live run
+
+
+def test_the_forwarder_in_a_dry_run_posts_nothing_marks_nothing_and_says_so(
+    world: OsWorld, capfd: pytest.CaptureFixture
+) -> None:
+    settings_say(world, "dry_run: true   # inspect a pass first\n")
+    held = {T1_KEY_B: {"os_ticket_id": osm.T1_OS_ID, "pass_id": osm.T1_SIGNAL_ID}}
+    fwd.remember_retry(held, seen_path=world.seen_path)
+    queue = write_queue(
+        world,
+        {"ticket_id": osm.T1_HS_ID, "action_items": [dict(ITEM_A), dict(ITEM_B, description=f"about {MARKER}")]},
+        {"ticket_id": osm.T2_OS_ID, "action_items": [dict(ITEM_A)]},
+    )
+    capfd.readouterr()
+    assert fwd.main(queue_path=queue, seen_path=world.seen_path) == 0
+
+    assert world.ingest.posts == []  # not even the poster's dry-run path: nothing leaves this script
+    assert seen_of(world) == [] and retry_of(world) == held  # an owed retry stays owed
+    err = capfd.readouterr().err
+    assert "dry_run: nothing posted" in err
+    assert "would_forward=3" in err and "would_envelopes=3" in err
+    assert MARKER not in err
+
+    settings_say(world, "dry_run: false\n")  # the first live run posts what is still queued
+    fwd.main(queue_path=queue, seen_path=world.seen_path)
+    assert len(live_posts(world)) == 3
+    assert seen_of(world) == sorted([T1_KEY_A, T1_KEY_B, T2_KEY_A]) and retry_of(world) == {}
+
+
+@pytest.mark.parametrize(
+    "text",
+    [None, "", "dry_run: [unclosed", "- a\n- list\n", "just text", "\x00\x01"],
+    ids=["no-file", "empty-file", "not-yaml", "a-list", "a-scalar", "binary"],
+)
+def test_the_forwarder_posts_nothing_when_it_cannot_tell_whether_this_is_a_dry_run(
+    world: OsWorld, capfd: pytest.CaptureFixture, text: Optional[str]
+) -> None:
+    """Fail closed: a settings file that cannot be read as a mapping gives no
+    answer, and no answer is not "live". (An EMPTY file is a mapping with no
+    `dry_run` key for the finalizer too, which reads it as live; see below.)"""
+    settings_say(world, text)
+    queue = write_queue(world, {"ticket_id": osm.T1_HS_ID, "action_items": [dict(ITEM_A)]})
+    capfd.readouterr()
+    assert fwd.main(queue_path=queue, seen_path=world.seen_path) == 0
+    err = capfd.readouterr().err
+    if text == "":
+        assert len(live_posts(world)) == 1  # `{}`: no key, so not a dry run, exactly as the finalizer reads it
+        return
+    assert world.ingest.posts == [] and seen_of(world) == []
+    assert "dry_run_unknown: nothing posted" in err
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["true", "True", "TRUE", "yes", "on", '"false"', "1", "false", "False", "no", "off", "0", "", "~", "null", '""'],
+)
+def test_the_forwarder_reads_dry_run_exactly_as_the_finaliser_does(world: OsWorld, value: str) -> None:
+    """One truth for both: the same YAML parser, then `bool()`. A hand-rolled
+    scan would disagree on `yes`, `on` or a quoted "false" (a non-empty string,
+    so a dry run), and the two halves of one tick would then differ."""
+    import yaml
+
+    text = f"per_run_cap: 25\ndry_run: {value}\n"
+    settings_say(world, text)
+    loaded = yaml.safe_load(text)
+
+    entry = make_entry(0)
+    summary = finalize(world, [entry], result_of(with_items(entry, ITEM_A)), settings=dict(osm.SETTINGS, **loaded))
+    assert fwd.read_dry_run() is summary.dry_run
+
+
+def test_a_settings_file_with_no_dry_run_key_is_live_for_both(world: OsWorld) -> None:
+    settings_say(world, "per_run_cap: 25\n")
+    assert fwd.read_dry_run() is False
+    entry = make_entry(0)
+    assert finalize(world, [entry], result_of(completed(entry))).dry_run is False
+
+
+def test_the_forwarder_reads_the_one_settings_file_every_other_reader_reads() -> None:
+    assert REAL_POSTER_SETTINGS_PATH == osm.pg.SETTINGS_PATH  # the finalizer's loader
+    assert REAL_POSTER_SETTINGS_PATH.name == "settings.yaml" and REAL_POSTER_SETTINGS_PATH.parent.name == "config"
+    assert list(inspect.signature(fwd.read_dry_run).parameters) == []  # no path to get wrong
+
+
+def test_the_forwarders_post_call_is_behind_the_dry_run_answer() -> None:
+    """Structural: the forwarder has ONE call of the poster, and no literal
+    `dry_run=False` hands it a fixed answer any more."""
+    text = Path(fwd.__file__).read_text(encoding="utf-8")
+    assert text.count("poster.post_action_items(") == 1
+    assert "dry_run=False" not in text
+
+
 # ------------------------------------------------------------ the number backfill
 
 
