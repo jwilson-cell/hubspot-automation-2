@@ -430,6 +430,9 @@ def test_the_readme_states_the_limit_of_removing_the_hubspot_tools() -> None:
         "A dry run posts no action items",
         "`would_action_item_posts`",
         "posts nothing when it cannot read `dry_run`",
+        # hubspot, shadow: a tick that finds no ticket, and an agent that leaves no result file (review WR-51)
+        "a tick that finds no ticket is a `success` record",
+        "is a `failure` record (`agent_exited_abnormally`, `result_missing`) even when it exited cleanly",
         # counts
         "show no HubSpot call counts",
     ],
