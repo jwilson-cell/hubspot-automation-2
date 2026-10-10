@@ -1106,6 +1106,41 @@ def test_the_engine_shadow_names_are_untouched() -> None:
     assert 'SHADOW_DIR = ROOT / "outputs" / "shadow"' in text
 
 
+# ------------------------------------------ every mode has a runner (plan 18, D-03)
+
+
+def test_every_source_mode_has_a_registered_runner() -> None:
+    """SPEC R8 / D-03: one code deploy ships all three paths. The registry's
+    keys are the mode list, so no value the setting can hold ends a run as
+    `runner_not_registered`; `load_runners()` is called first because the
+    registry is filled lazily (checker N-CRON-1)."""
+    import run_tickets
+
+    from ticket_pipeline import os_pass, source_shadow
+
+    assert set(run_tickets.RUNNER_SPECS) == set(source.MODES)
+    registry = run_tickets.load_runners()
+    assert set(registry) == set(source.MODES)
+    assert len(source.MODES) == 3
+    assert registry[source.MODE_HUBSPOT] is run_tickets.run_hubspot
+    assert registry[source.MODE_OS] is os_pass.run_os
+    assert registry[source.MODE_SHADOW] is source_shadow.run_source_shadow
+    assert run_tickets._RUNNER_LOAD_FAILURES == {}  # each runner module imported cleanly
+
+
+def test_the_source_shadow_runner_is_named_for_what_it_is_not_for_the_engine_shadow() -> None:
+    """D-08: the setting's VALUE is `shadow` (locked by D-01); the runner it
+    selects says `source_shadow`, in its module and in its function."""
+    import run_tickets
+
+    module_name, function_name = run_tickets.RUNNER_SPECS[source.MODE_SHADOW]
+    assert module_name == "ticket_pipeline.source_shadow"
+    assert function_name == "run_source_shadow"
+    assert source.MODE_SHADOW == "shadow"
+    # the engine shadow's module is not a mode runner, and never was
+    assert all(spec[0] != "ticket_pipeline.run" for spec in run_tickets.RUNNER_SPECS.values())
+
+
 # ----------------------------------------------------------- static: one home
 
 

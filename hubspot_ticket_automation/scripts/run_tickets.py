@@ -99,11 +99,14 @@ EXIT_RECORD_UNWRITABLE = 1
 # (module name, attribute); a module name of None means this module.
 #   hubspot   here
 #   os        ticket_pipeline/os_pass.py (Plan 93-16), imported by load_runners()
-#   shadow    Plan 93-18 adds its line
+#   shadow    ticket_pipeline/source_shadow.py (Plan 93-18), imported the same way.
+#             The setting's VALUE is `shadow`; what it selects is the SOURCE shadow
+#             (HubSpot against Pack'N OS), not the engine shadow of run_pipeline.py.
 MODE_RUNNERS: dict[str, Callable[..., Any]] = {}
 RUNNER_SPECS: dict[str, tuple[Optional[str], str]] = {
     "hubspot": (None, "run_hubspot"),
     "os": ("ticket_pipeline.os_pass", "run_os"),
+    "shadow": ("ticket_pipeline.source_shadow", "run_source_shadow"),
 }
 _RUNNER_LOAD_FAILURES: dict[str, str] = {}
 

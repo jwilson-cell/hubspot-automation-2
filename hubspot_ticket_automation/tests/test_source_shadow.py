@@ -1581,3 +1581,1247 @@ def test_the_observation_limits_are_the_os_routes() -> None:
     assert source_shadow.OBSERVATION_MAX_PER_RUN_CAP == 1000
     assert source_shadow.COMPARISON_LIMIT <= tickets_api.MAX_LIST_LIMIT
     assert hydrate.latest_customer_message([]) == ""
+
+
+# =========================================================================
+# PART 2 — the runner, through run_tickets.run(deps)
+# =========================================================================
+
+import forward_action_items as forwarder  # noqa: E402
+import pregate_tickets as pg  # noqa: E402
+import run_tickets as rt  # noqa: E402
+from tests.test_run_record import FakeClient  # noqa: E402 - the signature-checked fake
+from ticket_pipeline import hubspot_api, llm, run_types  # noqa: E402
+
+SEARCH_PATH = "/crm/v3/objects/tickets/search"
+RUN_ID_FORM = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$")
+H_OS_ID = "4a5b6c7d-8e9f-4a0b-9c1d-2e3f4a5b6c7d"  # the OS holds H; its list does not offer it
+H_SIGNAL = {"kind": "client_reply", "id": "5b6c7d8e-9f0a-4b1c-8d2e-3f4a5b6c7d8e", "at": "2026-10-08T12:00:00.000Z"}
+G_HS_ID = "9300000000777"  # a HubSpot candidate the mirror has not seen (404)
+RERUN_ID = osm.RERUN_A
+CLAIM = {"action_type": "file_carrier_claim", "severity": "normal", "description": f"File the claim {TEXT_MARKER}"}
+AGENT_SUMMARY_ONE_FAILED = "failed_tickets=1; codes=image_error:1"
+
+# The real factories, taken before any world replaces them.
+REAL_BUILD_CLASSIFY = source_shadow._build_classify
+REAL_BUILD_HUBSPOT_HYDRATE = source_shadow._build_hubspot_hydrate
+REAL_BUILD_THREAD_FETCH = source_shadow._build_thread_fetch
+
+
+def hit(ticket_id: str) -> dict:
+    return {"id": ticket_id, "properties": {"hs_lastmodifieddate": "2026-10-08T10:00:00.500Z"}}
+
+
+def os_listing(*indexes: int) -> dict:
+    return {
+        "contract_version": "1",
+        "generated_at": "2026-10-09T12:00:00.000Z",
+        "tickets": [payload(index) for index in indexes],
+    }
+
+
+def h_answer() -> dict:
+    ticket = payload(2)
+    ticket.update(id=H_OS_ID, hubspot_ticket_id=H_HS_ID, signal=dict(H_SIGNAL))
+    return {"contract_version": "1", "ticket": ticket, "unprocessed": False}
+
+
+def done(ref: str, draft_id: Any = "draft-1", items: tuple = (), **over: Any) -> dict:
+    """A result entry the agent marks completed, as the hubspot skill writes it."""
+    entry = {
+        "ref": ref,
+        "outcome": "completed",
+        "classification": {
+            "category": "wismo_tracking",
+            "form_topic": None,
+            "priority": "normal",
+            "confidence": 0.9,
+            "reason": f"asks where the order is {TEXT_MARKER}",
+        },
+        "action_items": [dict(item) for item in items],
+    }
+    if draft_id is not None:
+        entry["draft_id"] = draft_id
+    entry.update(over)
+    return entry
+
+
+def broke(ref: str, code: str = "image_error") -> dict:
+    return {"ref": ref, "outcome": "failed", "failure_reason_code": code}
+
+
+def agent_result(*entries: dict) -> dict:
+    completed = [entry for entry in entries if entry["outcome"] == "completed"]
+    return {
+        "status": "success" if len(completed) == len(entries) else "partial",
+        "tickets_processed": len(completed),
+        "drafts_created": len([entry for entry in completed if entry.get("draft_id")]),
+        "error_summary": None,
+        "tickets": list(entries),
+    }
+
+
+class LoggedOsApi(osm.ScriptedOsApi):
+    """The scripted OS fake, with its reads and the observation post on the shared call log."""
+
+    def fetch_unprocessed(self, limit):
+        self.timeline.append(("os_list", limit))
+        return super().fetch_unprocessed(limit)
+
+    def fetch_ticket(self, ticket_ref):
+        self.timeline.append(("os_ticket", str(ticket_ref)))
+        return super().fetch_ticket(ticket_ref)
+
+    def post_source_shadow_observations(self, payload):
+        self.timeline.append(("observation", payload.get("run_id") if isinstance(payload, dict) else None))
+        return super().post_source_shadow_observations(payload)
+
+
+class LoggedTransport(fakes.FakeHubSpotTransport):
+    def __init__(self, timeline: list, responses: dict) -> None:
+        super().__init__(responses)
+        self.timeline = timeline
+
+    def __call__(self, method: str, path: str, token: Any = None, body: Any = None) -> Any:
+        if path.startswith(SEARCH_PATH):
+            self.timeline.append(("hubspot_search",))
+        return super().__call__(method, path, token, body)
+
+
+class LoggedClassifier(Classifier):
+    def __init__(self, timeline: list) -> None:
+        super().__init__()
+        self.timeline = timeline
+
+    def __call__(self, context: dict) -> dict:
+        self.timeline.append(("classify", context.get("ticket_id")))
+        return super().__call__(context)
+
+
+class ShadowAgent(fakes.FakeLauncher):
+    """The agent, without an agent. It reads the run context the runner prepared,
+    at launch time (the scratch directory is gone once the run is over)."""
+
+    def __init__(self, timeline: list, exit_code: int = 0, result: Any = None) -> None:
+        super().__init__(exit_code, result)
+        self.timeline = timeline
+        self.contexts: list[Any] = []
+
+    def __call__(self, command, env):
+        self.timeline.append(("agent",))
+        self.contexts.append(json.loads(Path(env[run_types.RUN_CONTEXT_ENV]).read_text(encoding="utf-8")))
+        return super().__call__(command, env)
+
+
+class ShadowWorld:
+    """One orchestrator with the source set to `shadow` and every collaborator
+    replaced. The default is SPEC R9's acceptance fixture: HubSpot's search hits
+    B and H, the OS lists B and O, the OS knows H but does not list it, and the
+    agent completes B with a draft and reports H as failed."""
+
+    def __init__(self, base: Path, monkeypatch: pytest.MonkeyPatch, mode: str = "shadow") -> None:
+        base.mkdir(parents=True, exist_ok=True)
+        self.mode = mode
+        self.root = base / "root"
+        self.root.mkdir()
+        self.client = FakeClient()
+        self.timeline: list[tuple] = []  # every outside call, in the order made
+        self.os_api: Any = LoggedOsApi(
+            self.timeline, unprocessed=os_listing(0, 1), tickets={B_HS_ID: ticket_answer(0), H_HS_ID: h_answer()}
+        )
+        self.transport = LoggedTransport(self.timeline, {SEARCH_PATH: {"results": [hit(B_HS_ID), hit(H_HS_ID)]}})
+        self.hubspot = osm.HubSpotOpener({L_HS_ID: list(osm.T3_EMAILS), B_HS_ID: list(osm.T1_EMAILS)})
+        monkeypatch.setattr(hubspot_api, "_default_opener", self.hubspot)
+        self.ingest = osm.IngestRecorder(self.timeline)  # every action-item post lands here
+        monkeypatch.setattr(poster, "_post", self.ingest)
+        self.classifier = LoggedClassifier(self.timeline)
+        self.hydrator = Hydrator({B_HS_ID: hubspot_context(B_HS_ID), H_HS_ID: hubspot_context(H_HS_ID, stage="3")})
+        monkeypatch.setattr(source_shadow, "_build_classify", lambda settings: self.classifier)
+        monkeypatch.setattr(source_shadow, "_build_hubspot_hydrate", lambda settings, read_token: self.hydrator)
+        # The runner never writes a draft: any draft writer fails the test.
+        self.draft_writes: list[str] = []
+        for name in ("write_draft", "write_cron_draft", "replace_pending_draft", "mark_rerun_processed"):
+            monkeypatch.setattr(client, name, self._draft_writer(name))
+        self.sleeps: list[float] = []
+        monkeypatch.setattr(os_pass, "_sleep", self.sleeps.append)
+        self.agent: Any = ShadowAgent(self.timeline, 0, agent_result(done(B_HS_ID, "draft-B"), broke(H_HS_ID)))
+        self.launch_attempts = 0
+        self.settings: Any = dict(copy.deepcopy(SETTINGS), dry_run=False)
+        self.token: Any = "test-token"
+        self.token_reads = 0
+        self.decide: Callable[..., Any] = pg.decide
+        self.engine_envs: list[dict] = []
+        self.engine_error: Optional[Exception] = None
+        self.engine_artifacts: dict[str, dict] = {}
+        self.state_path = fakes.temp_state_file(base, {"last_run_at": "2026-09-01T00:00:00Z", "ticket_fingerprints": {}})
+        self.seen_path = base / "seen.json"
+        self.environ = {"PATH": "kept-path", "PACKN_KEEP_ME": "1"}
+        # an aware instant with microseconds at a non-UTC offset (checker WIRE-W3)
+        self._tick = datetime(2026, 10, 9, 8, 0, 0, 120456, tzinfo=timezone(timedelta(hours=-4)))
+        self.started: Optional[datetime] = None
+        self.run_ids: list[str] = []
+        rt.load_runners()
+
+    # --- collaborators
+    def _draft_writer(self, name: str) -> Callable[..., Any]:
+        def record(*_args: Any, **_kwargs: Any) -> Any:
+            self.draft_writes.append(name)
+            raise AssertionError(f"the source-shadow runner never writes a draft, yet {name} was called")
+
+        return record
+
+    def _now(self) -> datetime:
+        self._tick += timedelta(seconds=5)
+        if self.started is None:
+            self.started = self._tick
+        return self._tick
+
+    def _new_run_id(self) -> str:
+        run_id = rt.new_run_id()
+        self.run_ids.append(run_id)
+        return run_id
+
+    def _decide(self, mode: str, deps: Any) -> Any:
+        return self.decide(mode, deps)
+
+    def _load_settings(self) -> dict:
+        if isinstance(self.settings, Exception):
+            raise self.settings
+        return self.settings
+
+    def _read_token(self) -> Any:
+        self.token_reads += 1
+        return self.token
+
+    def _engine(self, env: Any) -> None:
+        self.timeline.append(("engine_shadow",))
+        self.engine_envs.append(dict(env))
+        if self.engine_artifacts:
+            stamp = (self.started + timedelta(seconds=1)).astimezone(timezone.utc).strftime("%Y-%m-%dT%H-%M-%SZ")
+            directory = self.root / "outputs" / "shadow" / stamp
+            directory.mkdir(parents=True, exist_ok=True)
+            for ticket_id, content in self.engine_artifacts.items():
+                (directory / f"{ticket_id}.json").write_text(json.dumps(content), encoding="utf-8")
+        if self.engine_error is not None:
+            raise self.engine_error
+
+    def _launch(self, command: Any, env: Any) -> Any:
+        self.launch_attempts += 1
+        return self.agent(command, env)
+
+    def deps(self) -> Any:
+        return run_types.Deps(
+            root=self.root,
+            state_path=self.state_path,
+            seen_path=self.seen_path,
+            now=self._now,
+            new_run_id=self._new_run_id,
+            resolve_mode=lambda: self.mode,
+            decide=self._decide,
+            load_settings=self._load_settings,
+            read_hubspot_token=self._read_token,
+            engine_shadow_step=self._engine,
+            launch_agent=self._launch,
+            report_routine_schedule=self.client.report_routine_schedule,
+            read_routine_enabled=self.client.read_routine_enabled,
+            read_pending_rerun_requests=self.client.read_pending_rerun_requests,
+            rollback_cycle_entries=self.client.rollback_cycle_entries,
+            write_run_record=self.client.write_run_record,
+            mark_manual_run_completed=self.client.mark_manual_run_completed,
+            hubspot_transport=self.transport,
+            environ=self.environ,
+            os_api=self.os_api,
+            read_os_origin=lambda: OS_ORIGIN,
+        )
+
+    # --- driving and reading
+    def run(self) -> Any:
+        return rt.run(self.deps())
+
+    @property
+    def record(self) -> dict:
+        assert len(self.client.records) == 1, self.client.records
+        return self.client.records[0]
+
+    @property
+    def observations(self) -> list[dict]:
+        return [args[0] for args in self.os_api.calls_to("post_source_shadow_observations")]
+
+    @property
+    def writebacks(self) -> list[tuple]:
+        return [(args[0], args[1]) for args in self.os_api.calls_to("post_classification")]
+
+    def kinds(self) -> list[str]:
+        return [entry[0] for entry in self.timeline]
+
+    def first(self, kind: str) -> int:
+        return self.kinds().index(kind)
+
+    def last(self, kind: str) -> int:
+        return len(self.timeline) - 1 - self.kinds()[::-1].index(kind)
+
+    @property
+    def cache_path(self) -> Path:
+        return self.root / "outputs" / "runs" / "source_shadow_seen.json"
+
+
+@pytest.fixture
+def make_shadow_world(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Callable[..., ShadowWorld]:
+    def make(name: str = "w", mode: str = "shadow") -> ShadowWorld:
+        return ShadowWorld(tmp_path / name, monkeypatch, mode)
+
+    return make
+
+
+@pytest.fixture
+def shadow(make_shadow_world: Callable[..., ShadowWorld]) -> ShadowWorld:
+    return make_shadow_world()
+
+
+B_ENTRY = {"os_ticket_id": B_OS_ID, "cycle_key": osm.T1_SIGNAL_ID, "signal_at": "2026-10-08T10:00:00.123Z", "signal_id": osm.T1_SIGNAL_ID}
+H_ENTRY = {"os_ticket_id": H_OS_ID, "cycle_key": H_SIGNAL["id"], "signal_at": H_SIGNAL["at"], "signal_id": H_SIGNAL["id"]}
+
+
+# ----------------------------------------------------------------- the registry
+
+
+def test_the_runner_is_registered_under_the_settings_value_by_a_lazy_spec() -> None:
+    assert rt.RUNNER_SPECS["shadow"] == ("ticket_pipeline.source_shadow", "run_source_shadow")
+    rt.load_runners()
+    assert rt.MODE_RUNNERS["shadow"] is source_shadow.run_source_shadow
+    assert list(inspect.signature(source_shadow.run_source_shadow).parameters) == ["ctx", "deps"]
+
+
+def test_the_runner_takes_its_types_from_the_leaf_and_never_from_the_script() -> None:
+    """Checker N-CRON-1: no import statement for the orchestrator script, and
+    the run types come from ticket_pipeline.run_types."""
+    module = _module_tree()
+    imported: list[str] = []
+    for node in ast.walk(module):
+        if isinstance(node, ast.Import):
+            imported.extend(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            imported.append(node.module or "")
+    assert "run_tickets" not in imported
+    assert all(not name.startswith("scripts") for name in imported)
+    assert any(name in ("ticket_pipeline.run_types", "ticket_pipeline") for name in imported)
+    assert source_shadow.run_types is run_types
+    # the orchestrator script itself still imports no project module at load
+    script = ast.parse((PACKAGE_ROOT / "scripts" / "run_tickets.py").read_text(encoding="utf-8"))
+    top_level = [n for n in script.body if isinstance(n, (ast.Import, ast.ImportFrom))]
+    names = [alias.name for n in top_level if isinstance(n, ast.Import) for alias in n.names]
+    names += [n.module or "" for n in top_level if isinstance(n, ast.ImportFrom)]
+    assert [name for name in names if name.split(".")[0] in ("ticket_pipeline", "packn_os_hubspot_client")] == []
+
+
+# ------------------------------------------------- SPEC R9's acceptance, in one run
+
+
+def test_the_acceptance_fixture_one_observation_one_draft_two_write_backs_and_nothing_for_the_os_only_ticket(
+    shadow: ShadowWorld,
+) -> None:
+    state_before = shadow.state_path.read_bytes()
+    assert shadow.run() == 0
+    record = shadow.record
+
+    # one observation: B and H on the HubSpot side, B and O on the OS side
+    assert len(shadow.observations) == 1
+    (body,) = shadow.observations
+    assert body == {
+        "contract_version": "1",
+        "run_id": record["run_id"],
+        "started_at": "2026-10-09T12:00:05.120Z",
+        "per_run_cap": 25,
+        "active_stages": ["1", "3"],
+        "hubspot": {
+            "page_full": False,
+            "matched": [
+                {"hubspot_ticket_id": B_HS_ID, "stage": "1", "deduped": False},
+                {"hubspot_ticket_id": H_HS_ID, "stage": "3", "deduped": False},
+            ],
+            "selected": [
+                {"hubspot_ticket_id": B_HS_ID, "os_ticket_id": B_OS_ID, "signal": signal_of(0), "category": "wismo_tracking"},
+                {"hubspot_ticket_id": H_HS_ID, "os_ticket_id": H_OS_ID, "signal": H_SIGNAL, "category": "wismo_tracking"},
+            ],
+        },
+        "os": {
+            "selected": [
+                {"os_ticket_id": B_OS_ID, "hubspot_ticket_id": B_HS_ID, "signal": signal_of(0), "category": "wismo_tracking"},
+                {"os_ticket_id": O_OS_ID, "hubspot_ticket_id": None, "signal": signal_of(1), "category": "wismo_tracking"},
+            ],
+        },
+    }
+
+    # exactly one draft, and it is the HubSpot path's (the agent's own count)
+    assert record["drafts_created"] == 1
+    assert record["tickets_processed"] == 1
+    assert record["status"] == "partial"  # the HubSpot path's own status: one of its two tickets failed
+    assert record["error_summary"] == AGENT_SUMMARY_ONE_FAILED
+    assert shadow.draft_writes == []  # the runner wrote none itself
+
+    # one completed write-back for B and one failed one for H, both in the mode word `shadow`
+    (b_id, b_body), (h_id, h_body) = shadow.writebacks
+    assert (b_id, b_body["outcome"], b_body["source_mode"]) == (B_OS_ID, "completed", "shadow")
+    assert b_body["signal"] == {"id": osm.T1_SIGNAL_ID, "at": "2026-10-08T10:00:00.123Z"}
+    assert b_body["category"] == "wismo_tracking" and b_body["run_id"] == record["run_id"]
+    assert (h_id, h_body["outcome"], h_body["source_mode"]) == (H_OS_ID, "failed", "shadow")
+    assert h_body["failure_reason_code"] == "other"  # the agent's own code is not one of the OS's six
+    assert h_body["signal"] == {"id": H_SIGNAL["id"], "at": H_SIGNAL["at"]}
+
+    # nothing of any kind for O beyond its place in the OS list and the observation
+    assert O_OS_ID not in [ticket_id for ticket_id, _body in shadow.writebacks]
+    assert shadow.os_api.calls_to("fetch_ticket") == [(B_HS_ID,), (H_HS_ID,)]
+    assert shadow.ingest.posts == []
+    assert shadow.hubspot.requests == [] and shadow.hubspot.unexpected == []
+    naming_o = [entry for entry in shadow.timeline if O_OS_ID in entry]
+    assert naming_o == [("classify", O_OS_ID)]  # its one model call, and no write of any kind
+    assert len(osm._CHILD_LEDGER) == 0  # no child process: no sender, no agent, no lookup
+
+    # the run record
+    assert record["source_mode"] == "shadow"
+    assert record["hubspot_calls"] is None
+    assert record["failure_reason_code"] is None
+    assert len(shadow.client.records) == 1
+
+    # the HubSpot path's state file is the agent's: the runner did not touch it
+    assert shadow.state_path.read_bytes() == state_before
+    assert shadow.token_reads == 1  # the pre-gate's own read; the comparison needed none
+
+
+def test_both_hubspot_tickets_completing_is_two_drafts_and_still_nothing_from_the_os_half(shadow: ShadowWorld) -> None:
+    shadow.agent.result = agent_result(done(B_HS_ID, "draft-B"), done(H_HS_ID, "draft-H"))
+    shadow.run()
+    record = shadow.record
+    assert record["drafts_created"] == 2 and record["tickets_processed"] == 2
+    assert record["status"] == "success"
+    assert record["error_summary"] is None  # a clean run has no summary
+    assert [(ticket_id, body["outcome"]) for ticket_id, body in shadow.writebacks] == [
+        (B_OS_ID, "completed"),
+        (H_OS_ID, "completed"),
+    ]
+    assert shadow.draft_writes == [] and shadow.ingest.posts == []
+    assert O_OS_ID not in json.dumps([body for _id, body in shadow.writebacks])
+
+
+def test_the_order_of_one_run_starts_with_the_os_list_and_ends_with_the_write_backs(shadow: ShadowWorld) -> None:
+    shadow.run()
+    assert shadow.timeline[0] == ("os_list", 100)  # the first outside call of the run (Pitfall 7)
+    order = [
+        shadow.first("os_list"),
+        shadow.first("hubspot_search"),
+        shadow.first("os_ticket"),
+        shadow.last("os_ticket"),
+        shadow.first("classify"),
+        shadow.last("classify"),
+        shadow.first("observation"),
+        shadow.first("agent"),
+        shadow.first("writeback"),
+    ]
+    assert order == sorted(order)
+    assert len(set(order[:3])) == 3 and order[3] < order[4] and order[5] < order[6] < order[7] < order[8]
+    assert shadow.first("engine_shadow") < shadow.first("agent")  # the engine shadow before the agent, as in hubspot mode
+    assert shadow.kinds().count("os_list") == 1 and shadow.kinds().count("observation") == 1
+    assert shadow.kinds().count("hubspot_search") == 1 and shadow.kinds().count("agent") == 1
+
+
+def test_the_comparison_list_is_asked_with_limit_100_whatever_the_cap(shadow: ShadowWorld) -> None:
+    shadow.settings["per_run_cap"] = 7
+    shadow.run()
+    assert shadow.os_api.calls_to("fetch_unprocessed") == [(100,)]
+    assert source_shadow.COMPARISON_LIMIT == 100
+    assert shadow.observations[0]["per_run_cap"] == 7
+
+
+# ----------------------------------------------------- one run, one id, one instant
+
+
+def test_the_observations_run_id_is_the_run_records_id(shadow: ShadowWorld) -> None:
+    """Checker WIRE-W6: one id per run, so the OS can join the comparison to the run."""
+    shadow.run()
+    (body,) = shadow.observations
+    (run_id,) = shadow.run_ids
+    assert body["run_id"] == shadow.record["run_id"] == run_id
+    assert RUN_ID_FORM.match(body["run_id"]) and RUN_ID_FORM.match(shadow.record["run_id"])
+    assert {wb_body["run_id"] for _id, wb_body in shadow.writebacks} == {run_id}
+
+
+def test_the_observations_start_is_the_runs_start_in_the_three_digit_z_form(shadow: ShadowWorld) -> None:
+    shadow.run()
+    assert shadow.started.utcoffset() == timedelta(hours=-4) and shadow.started.microsecond == 120456
+    assert shadow.observations[0]["started_at"] == "2026-10-09T12:00:05.120Z"
+    assert INSTANT_FORM.match(shadow.observations[0]["started_at"])
+
+
+# ----------------------------------------------------------------- the run context
+
+
+def test_the_agent_is_handed_the_os_ticket_and_the_signal_as_the_cycle_key(shadow: ShadowWorld) -> None:
+    """So the agent's own draft step goes through the atomic replace, keyed by
+    the client signal, exactly as an os-mode pass would key it."""
+    shadow.run()
+    assert shadow.agent.contexts == [{B_HS_ID: B_ENTRY, H_HS_ID: H_ENTRY}]
+
+
+def test_a_candidate_the_mirror_has_not_seen_gets_no_cycle_key_and_no_write_back(shadow: ShadowWorld) -> None:
+    shadow.transport.respond(SEARCH_PATH, {"results": [hit(B_HS_ID), hit(G_HS_ID)]})
+    shadow.hydrator.contexts[G_HS_ID] = hubspot_context(G_HS_ID)
+    shadow.agent.result = agent_result(done(B_HS_ID, "draft-B"), done(G_HS_ID, "draft-G", items=(CLAIM,)))
+    shadow.run()
+    assert shadow.os_api.calls_to("fetch_ticket") == [(B_HS_ID,), (G_HS_ID,)]  # the OS answered 404 for G
+    assert shadow.agent.contexts == [{B_HS_ID: B_ENTRY}]  # G: no entry, so today's plain draft write
+    assert [ticket_id for ticket_id, _body in shadow.writebacks] == [B_OS_ID]  # nothing written back for G
+    assert shadow.ingest.posts == []  # G's action items are left to the forwarder, as today
+    g_row = shadow.observations[0]["hubspot"]["selected"][1]
+    assert g_row == {"hubspot_ticket_id": G_HS_ID, "os_ticket_id": None, "signal": None, "category": "wismo_tracking"}
+    assert shadow.record["status"] == "success" and shadow.record["error_summary"] is None
+
+
+def test_a_rollback_entry_replaces_the_draft_of_a_candidate_the_os_does_not_hold(shadow: ShadowWorld) -> None:
+    """Checker CRON-B2: the context starts from the rollback entries, so a
+    ticket with a live cycle-keyed draft is replaced, not doubled; a resolved
+    candidate's signal wins over its rollback entry."""
+    shadow.transport.respond(SEARCH_PATH, {"results": [hit(B_HS_ID), hit(G_HS_ID)]})
+    shadow.hydrator.contexts[G_HS_ID] = hubspot_context(G_HS_ID)
+    shadow.client.rollback_tickets = {G_HS_ID: None, B_HS_ID: B_OS_ID}
+    shadow.agent.result = agent_result(done(B_HS_ID, "draft-B"), done(G_HS_ID, "draft-G"))
+    shadow.run()
+    (run_id,) = shadow.run_ids
+    assert shadow.client.rollback_calls == [(run_id, "tickets-process")]
+    (context,) = shadow.agent.contexts
+    assert context[G_HS_ID] == {"os_ticket_id": None, "cycle_key": f"hubspot:{run_id}", "signal_at": None, "signal_id": None}
+    assert context[B_HS_ID] == B_ENTRY  # the signal entry wins over the rollback entry
+    assert [ticket_id for ticket_id, _body in shadow.writebacks] == [B_OS_ID]
+
+
+def test_a_reruns_entry_wins_over_the_signal_and_the_rollback_entry(shadow: ShadowWorld) -> None:
+    def decide(mode: str, deps: Any) -> dict:
+        return {
+            "decision": "run_agent",
+            "reason": "candidates",
+            "matched": [{"id": B_HS_ID, "hs_lastmodifieddate": None, "deduped": False}],
+            "candidates": [B_HS_ID, H_HS_ID],
+            "page_full": False,
+            "reruns": [{"id": RERUN_ID, "ticket_id": B_HS_ID}],
+        }
+
+    shadow.decide = decide
+    shadow.client.rollback_tickets = {B_HS_ID: B_OS_ID}
+    shadow.agent.result = agent_result(done(B_HS_ID, "draft-B", items=(CLAIM,)), done(H_HS_ID, "draft-H"))
+    shadow.run()
+    (context,) = shadow.agent.contexts
+    assert context[B_HS_ID] == {"os_ticket_id": B_OS_ID, "cycle_key": f"rerun:{RERUN_ID}", "signal_at": None, "signal_id": None}
+    assert context[H_HS_ID] == H_ENTRY
+    # the pass still consumed B's client signal, and its items carry the rerun's own pass id
+    assert [ticket_id for ticket_id, _body in shadow.writebacks] == [B_OS_ID, H_OS_ID]
+    (envelope,) = shadow.ingest.posts
+    assert envelope["pass_id"] == f"rerun:{RERUN_ID}"
+
+
+def test_an_unreadable_rollback_read_is_a_code_and_the_signal_entries_still_stand(shadow: ShadowWorld) -> None:
+    shadow.client.rollback_error = RuntimeError(f"database {EXC_MARKER}")
+    shadow.run()
+    assert shadow.agent.contexts == [{B_HS_ID: B_ENTRY, H_HS_ID: H_ENTRY}]
+    assert shadow.record["error_summary"] == f"{AGENT_SUMMARY_ONE_FAILED}; rollback_entries_unreadable"
+
+
+def test_a_resolved_ticket_with_no_client_signal_gets_no_cycle_key_and_no_write_back(shadow: ShadowWorld) -> None:
+    shadow.os_api.tickets[H_HS_ID]["ticket"]["signal"] = None
+    shadow.agent.result = agent_result(done(B_HS_ID, "draft-B"), done(H_HS_ID, "draft-H", items=(CLAIM,)))
+    shadow.run()
+    assert shadow.agent.contexts == [{B_HS_ID: B_ENTRY}]
+    assert [ticket_id for ticket_id, _body in shadow.writebacks] == [B_OS_ID]  # no signal to echo for H
+    assert shadow.ingest.posts == []  # no stable pass id: H's items are left to the forwarder
+    h_row = shadow.observations[0]["hubspot"]["selected"][1]
+    assert h_row["os_ticket_id"] == H_OS_ID and h_row["signal"] is None
+
+
+# ------------------------------------------------------------------- action items
+
+
+def test_a_completed_ticket_posts_its_items_once_with_both_ids_and_the_signal_as_pass_id(shadow: ShadowWorld) -> None:
+    second = dict(CLAIM, action_type="warehouse_investigation")
+    shadow.agent.result = agent_result(done(B_HS_ID, "draft-B", items=(CLAIM, second)), done(H_HS_ID, "draft-H", items=(CLAIM,)))
+    shadow.run()
+    b_envelope, h_envelope = shadow.ingest.posts
+    assert list(b_envelope) == ["type", "ticket_id", "os_ticket_id", "pass_id", "items"]
+    assert (b_envelope["ticket_id"], b_envelope["os_ticket_id"], b_envelope["pass_id"]) == (B_HS_ID, B_OS_ID, osm.T1_SIGNAL_ID)
+    assert [item["action_type"] for item in b_envelope["items"]] == ["file_carrier_claim", "warehouse_investigation"]
+    assert (h_envelope["ticket_id"], h_envelope["os_ticket_id"], h_envelope["pass_id"]) == (H_HS_ID, H_OS_ID, H_SIGNAL["id"])
+    assert shadow.ingest.dry_runs == [False, False]
+    # confirmed: the keys join the forwarder's seen-set and no retry entry is left
+    assert forwarder.load_seen(shadow.seen_path) == {
+        f"{B_HS_ID}:file_carrier_claim",
+        f"{B_HS_ID}:warehouse_investigation",
+        f"{H_HS_ID}:file_carrier_claim",
+    }
+    assert forwarder.load_retry(shadow.seen_path) == {}
+    assert shadow.record["error_summary"] is None
+    # each ticket: its write-back, then its items
+    kinds = [entry for entry in shadow.timeline if entry[0] in ("writeback", "action_items")]
+    assert kinds == [
+        ("writeback", B_OS_ID, "completed"),
+        ("action_items", B_HS_ID),
+        ("writeback", H_OS_ID, "completed"),
+        ("action_items", H_HS_ID),
+    ]
+
+
+def test_the_forwarder_after_the_run_sends_no_second_set_of_action_items(shadow: ShadowWorld, tmp_path: Path) -> None:
+    """In `shadow` mode the wrapper still runs the forwarder after the pass, over
+    the queue the agent wrote. For a ticket the runner already posted, it sends
+    nothing more; for a ticket the runner left alone, it sends today's envelope."""
+    shadow.transport.respond(SEARCH_PATH, {"results": [hit(B_HS_ID), hit(G_HS_ID)]})
+    shadow.hydrator.contexts[G_HS_ID] = hubspot_context(G_HS_ID)
+    shadow.agent.result = agent_result(done(B_HS_ID, "draft-B", items=(CLAIM,)), done(G_HS_ID, "draft-G", items=(CLAIM,)))
+    shadow.run()
+    assert len(shadow.ingest.posts) == 1  # the runner's one envelope, for B
+
+    queue = tmp_path / "pending_actions.json"
+    queue.write_text(
+        json.dumps(
+            [
+                {"ticket_id": B_HS_ID, "action_items": [dict(CLAIM)]},
+                {"ticket_id": G_HS_ID, "action_items": [dict(CLAIM)]},
+            ]
+        ),
+        encoding="utf-8",
+    )
+    assert forwarder.main(queue, shadow.seen_path) == 0
+    assert len(shadow.ingest.posts) == 2  # one more: G's, and none for B
+    assert [post.get("ticket_id") for post in shadow.ingest.posts] == [B_HS_ID, G_HS_ID]
+    assert list(shadow.ingest.posts[1]) == ["type", "ticket_id", "items"]  # today's envelope, no OS id, no pass id
+    assert forwarder.main(queue, shadow.seen_path) == 0
+    assert len(shadow.ingest.posts) == 2  # and nothing on a later tick either
+
+
+def test_an_unconfirmed_post_is_a_code_and_the_forwarder_resends_the_same_pass(shadow: ShadowWorld, tmp_path: Path) -> None:
+    shadow.agent.result = agent_result(done(B_HS_ID, "draft-B", items=(CLAIM,)), done(H_HS_ID, "draft-H"))
+    shadow.ingest.script = [{"ok": True, "mode": "sent", "status": 200, "response": {"ok": True, "emitted": 0, "errors": 1}}]
+    shadow.run()
+    assert shadow.record["status"] == "success"  # the HubSpot path's own status
+    assert shadow.record["error_summary"] == "action_items_unconfirmed=1"
+    assert forwarder.load_seen(shadow.seen_path) == set()
+    assert forwarder.load_retry(shadow.seen_path) == {
+        f"{B_HS_ID}:file_carrier_claim": {"os_ticket_id": B_OS_ID, "pass_id": osm.T1_SIGNAL_ID}
+    }
+    queue = tmp_path / "pending_actions.json"
+    queue.write_text(json.dumps([{"ticket_id": B_HS_ID, "action_items": [dict(CLAIM)]}]), encoding="utf-8")
+    forwarder.main(queue, shadow.seen_path)
+    first, resent = shadow.ingest.posts
+    assert resent == first  # the same envelope: the same OS id and the same pass id, so the OS creates nothing twice
+    assert forwarder.load_retry(shadow.seen_path) == {}
+
+
+# ------------------------------------------------------- what is written back, per entry
+
+
+def test_a_completed_entry_with_no_draft_id_is_a_failed_write_back_never_a_completed_one(shadow: ShadowWorld) -> None:
+    shadow.agent.result = agent_result(done(B_HS_ID, None, items=(CLAIM,)), done(H_HS_ID, "draft-H"))
+    shadow.run()
+    (b_id, b_body), (h_id, h_body) = shadow.writebacks
+    assert (b_id, b_body["outcome"], b_body["failure_reason_code"]) == (B_OS_ID, "failed", "draft_write_failed")
+    assert "category" not in b_body
+    assert (h_id, h_body["outcome"]) == (H_OS_ID, "completed")
+    assert shadow.ingest.posts == []  # no draft, so no action items from the runner
+
+
+@pytest.mark.parametrize("draft_id", ["", "   ", 17, {"id": "x"}])
+def test_a_draft_id_that_is_not_text_is_no_draft(shadow: ShadowWorld, draft_id: Any) -> None:
+    shadow.agent.result = agent_result(done(B_HS_ID, draft_id), done(H_HS_ID, "draft-H"))
+    shadow.run()
+    assert shadow.writebacks[0][1]["outcome"] == "failed"
+    assert shadow.writebacks[0][1]["failure_reason_code"] == "draft_write_failed"
+
+
+def test_a_completed_entry_whose_classification_cannot_be_used_gets_no_write_back(shadow: ShadowWorld) -> None:
+    """The draft is in place, so the ticket is not reported failed; and the
+    OS cannot be told a category it would refuse. A code, and the items still go."""
+    unusable = done(B_HS_ID, "draft-B", items=(CLAIM,), classification={"category": "Shipping question", "reason": TEXT_MARKER})
+    shadow.agent.result = agent_result(unusable, done(H_HS_ID, "draft-H"))
+    shadow.run()
+    assert [ticket_id for ticket_id, _body in shadow.writebacks] == [H_OS_ID]
+    assert shadow.record["error_summary"] == "classification_unusable=1"
+    assert len(shadow.ingest.posts) == 1
+
+
+def test_a_result_entry_for_a_ticket_the_run_never_resolved_is_left_alone(shadow: ShadowWorld) -> None:
+    extra = done("9300000000321", "draft-X", items=(CLAIM,))
+    twice = done(B_HS_ID, "draft-B-again")
+    shadow.agent.result = agent_result(done(B_HS_ID, "draft-B"), extra, twice, broke(H_HS_ID))
+    shadow.run()
+    assert [(ticket_id, body["outcome"]) for ticket_id, body in shadow.writebacks] == [
+        (B_OS_ID, "completed"),
+        (H_OS_ID, "failed"),
+    ]
+    assert shadow.ingest.posts == []
+
+
+def test_a_candidate_the_agent_wrote_no_entry_for_is_not_reported_failed(shadow: ShadowWorld) -> None:
+    """The agent applies its own dedupe to what it fetches. A candidate it chose
+    to skip is not a failed pass and must not count toward parking in the OS."""
+    shadow.agent.result = agent_result(done(B_HS_ID, "draft-B"))
+    shadow.run()
+    assert [ticket_id for ticket_id, _body in shadow.writebacks] == [B_OS_ID]
+
+
+def test_an_undelivered_write_back_is_a_code_and_the_status_is_still_the_hubspot_paths(shadow: ShadowWorld) -> None:
+    shadow.os_api.script = [TicketsApiError("list_timeout"), TicketsApiError("list_timeout")]
+    shadow.run()
+    assert shadow.sleeps == [os_pass.WRITEBACK_RETRY_PAUSE_S]  # one retry, then the next ticket goes on
+    assert [(ticket_id, body["outcome"]) for ticket_id, body in shadow.writebacks] == [
+        (B_OS_ID, "completed"),
+        (B_OS_ID, "completed"),
+        (H_OS_ID, "failed"),
+    ]
+    assert shadow.record["status"] == "partial" and shadow.record["drafts_created"] == 1
+    assert shadow.record["error_summary"] == f"{AGENT_SUMMARY_ONE_FAILED}; writeback_list_timeout=1"
+
+
+def test_a_dry_run_posts_the_observation_and_writes_nothing_back(shadow: ShadowWorld) -> None:
+    shadow.settings["dry_run"] = True
+    shadow.agent.result = agent_result(done(B_HS_ID, "draft-B", items=(CLAIM,)), broke(H_HS_ID))
+    shadow.run()
+    assert len(shadow.observations) == 1  # a measurement, not a side effect on a ticket
+    assert shadow.writebacks == []
+    assert shadow.ingest.posts == []
+    assert not shadow.seen_path.exists() and not forwarder.retry_path(shadow.seen_path).exists()
+    assert shadow.record["error_summary"] == AGENT_SUMMARY_ONE_FAILED
+
+
+def test_a_run_whose_agent_left_no_result_writes_nothing_back(shadow: ShadowWorld) -> None:
+    shadow.agent = ShadowAgent(shadow.timeline, 0)  # exits 0 and leaves no result file
+    shadow.run()
+    assert shadow.record["status"] == "failure"
+    assert shadow.record["failure_reason_code"] == "agent_exited_abnormally"
+    assert shadow.writebacks == [] and shadow.ingest.posts == []
+    assert len(shadow.observations) == 1  # it was posted before the agent was launched
+
+
+def test_an_agent_that_cannot_be_started_is_the_hubspot_paths_failure_record(shadow: ShadowWorld) -> None:
+    def cannot_start(command: Any, env: Any) -> int:
+        raise FileNotFoundError(f"no such command {EXC_MARKER}")
+
+    shadow.agent = cannot_start
+    shadow.run()
+    assert shadow.record["status"] == "failure"
+    assert shadow.record["failure_reason_code"] == "agent_launch_failed"
+    assert shadow.record["error_summary"] == "agent_launch_failed:FileNotFoundError"
+    assert shadow.writebacks == []
+    assert len(shadow.observations) == 1
+
+
+# ------------------------------------ the comparison half can never affect the run
+
+
+@pytest.mark.parametrize("code", ["signature_rejected", "secret_missing"])
+def test_an_os_that_refuses_the_list_leaves_a_plain_hubspot_run_and_one_code(shadow: ShadowWorld, code: str) -> None:
+    shadow.os_api.fail_next_list(code, 401 if code == "signature_rejected" else None)
+    shadow.run()
+    record = shadow.record
+    assert (record["status"], record["tickets_processed"], record["drafts_created"]) == ("partial", 1, 1)
+    assert record["failure_reason_code"] is None
+    assert record["error_summary"] == f"{AGENT_SUMMARY_ONE_FAILED}; source_shadow_skipped:{code}"
+    assert shadow.os_api.calls == [("fetch_unprocessed", (100,))]  # the OS is asked nothing more
+    assert shadow.classifier.calls == [] and shadow.hydrator.calls == []
+    assert shadow.agent.contexts == [{}]  # today's plain draft writes
+    assert shadow.launch_attempts == 1 and len(shadow.engine_envs) == 1
+
+
+def test_a_list_that_timed_out_skips_the_comparison_and_the_passes_are_still_written_back(shadow: ShadowWorld) -> None:
+    """No snapshot, so no observation. The OS answers again a moment later, so
+    the HubSpot path's passes are still reported: their tickets leave the OS's
+    list instead of turning up as differences the code cannot explain."""
+    shadow.os_api.fail_next_list("list_timeout")
+    shadow.run()
+    record = shadow.record
+    assert (record["status"], record["tickets_processed"], record["drafts_created"]) == ("partial", 1, 1)
+    assert record["error_summary"] == f"{AGENT_SUMMARY_ONE_FAILED}; source_shadow_skipped:list_timeout"
+    assert shadow.observations == [] and shadow.classifier.calls == []
+    assert shadow.agent.contexts == [{B_HS_ID: B_ENTRY, H_HS_ID: H_ENTRY}]
+    assert [ticket_id for ticket_id, _body in shadow.writebacks] == [B_OS_ID, H_OS_ID]
+
+
+def test_an_os_that_is_down_costs_one_more_refused_call_and_the_run_is_a_plain_hubspot_run(shadow: ShadowWorld) -> None:
+    shadow.os_api.fail_next_list("list_timeout")
+    shadow.os_api.fail_next("fetch_ticket", "list_timeout")
+    shadow.run()
+    assert [name for name, _args in shadow.os_api.calls] == ["fetch_unprocessed", "fetch_ticket"]
+    assert shadow.agent.contexts == [{}] and shadow.writebacks == []
+    assert shadow.record["error_summary"] == (
+        f"{AGENT_SUMMARY_ONE_FAILED}; source_shadow_skipped:list_timeout; source_shadow_resolve_failed:list_timeout=1"
+    )
+    assert (shadow.record["status"], shadow.record["drafts_created"]) == ("partial", 1)
+
+
+@pytest.mark.parametrize(
+    "answer, detail",
+    [
+        ("not an object", "list_not_an_object"),
+        ({"contract_version": "1", "tickets": "none"}, "tickets_not_a_list"),
+        ({"contract_version": "2", "tickets": []}, "contract_version"),
+        ({"contract_version": "1", "tickets": [{"subject": "no id"}]}, "ticket_without_an_id"),
+    ],
+)
+def test_a_list_the_contract_does_not_describe_skips_the_comparison(shadow: ShadowWorld, answer: Any, detail: str) -> None:
+    shadow.os_api.unprocessed = answer
+    shadow.run()
+    assert shadow.observations == []
+    assert shadow.record["error_summary"] == f"{AGENT_SUMMARY_ONE_FAILED}; source_shadow_skipped:list_error:{detail}"
+    assert shadow.launch_attempts == 1
+
+
+def test_a_list_fetch_that_raises_something_else_is_its_class_name_only(
+    shadow: ShadowWorld, caplog: pytest.LogCaptureFixture, capfd: pytest.CaptureFixture
+) -> None:
+    caplog.set_level(logging.DEBUG)
+
+    def explode(limit: int) -> dict:
+        raise RuntimeError(f"boom {EXC_MARKER}")
+
+    shadow.os_api.fetch_unprocessed = explode
+    shadow.run()
+    assert shadow.record["error_summary"] == f"{AGENT_SUMMARY_ONE_FAILED}; source_shadow_skipped:list_error:RuntimeError"
+    assert EXC_MARKER not in json.dumps(shadow.record)
+    fakes.assert_marker_absent(EXC_MARKER, caplog, capfd)
+
+
+@pytest.mark.parametrize(
+    "verdict, code",
+    [
+        ({"status": 400, "error": "bad_payload", "replayed": None}, "source_shadow_observation_refused:bad_payload"),
+        ({"status": 413, "error": "payload_too_large", "replayed": None}, "source_shadow_observation_refused:payload_too_large"),
+        ({"status": 418, "error": f"text {TEXT_MARKER}", "replayed": None}, "source_shadow_observation_refused:418"),
+        ("not a verdict", "source_shadow_observation_refused:unknown"),
+    ],
+)
+def test_a_refused_observation_is_a_code_and_the_hubspot_path_is_unchanged(shadow: ShadowWorld, verdict: Any, code: str) -> None:
+    shadow.os_api.source_shadow_result = verdict
+    shadow.run()
+    record = shadow.record
+    assert (record["status"], record["tickets_processed"], record["drafts_created"]) == ("partial", 1, 1)
+    assert record["error_summary"] == f"{AGENT_SUMMARY_ONE_FAILED}; {code}"
+    assert TEXT_MARKER not in json.dumps(record)
+    assert len(shadow.writebacks) == 2 and shadow.launch_attempts == 1
+
+
+@pytest.mark.parametrize("code", ["list_timeout", "list_error", "signature_rejected"])
+def test_an_observation_that_could_not_be_posted_is_a_code_and_the_hubspot_path_is_unchanged(
+    shadow: ShadowWorld, code: str
+) -> None:
+    shadow.os_api.fail_next("post_source_shadow_observations", code)
+    shadow.run()
+    record = shadow.record
+    assert (record["status"], record["tickets_processed"], record["drafts_created"]) == ("partial", 1, 1)
+    assert record["error_summary"] == f"{AGENT_SUMMARY_ONE_FAILED}; source_shadow_observation_failed:{code}"
+    assert len(shadow.writebacks) == 2
+
+
+def test_a_replayed_observation_is_not_a_code(shadow: ShadowWorld) -> None:
+    shadow.os_api.source_shadow_result = {"status": 200, "error": None, "replayed": True}
+    shadow.run()
+    assert shadow.record["error_summary"] == AGENT_SUMMARY_ONE_FAILED
+
+
+def test_a_classifier_that_is_down_posts_no_observation_and_the_hubspot_path_is_unchanged(shadow: ShadowWorld) -> None:
+    """The OS keeps the first category it is told for a selection, so a run of
+    nulls would never be corrected. Such a run reports nothing."""
+    shadow.classifier.failing = {"*"}
+    shadow.run()
+    record = shadow.record
+    assert shadow.observations == []
+    assert len(shadow.classifier.calls) == 3  # then the step was stopped
+    assert (record["status"], record["tickets_processed"], record["drafts_created"]) == ("partial", 1, 1)
+    assert record["error_summary"] == (
+        f"{AGENT_SUMMARY_ONE_FAILED}; source_shadow_classify_failed=3; source_shadow_skipped:classify_unavailable"
+    )
+    assert len(shadow.writebacks) == 2  # the HubSpot path's passes are still reported
+    assert not shadow.cache_path.exists()  # nothing was classified, so nothing was cached
+
+
+def test_one_failed_classify_call_among_others_is_a_null_category_in_a_posted_observation(shadow: ShadowWorld) -> None:
+    shadow.classifier.failing = {O_OS_ID}
+    shadow.run()
+    (body,) = shadow.observations
+    assert body["os"]["selected"][1] == {
+        "os_ticket_id": O_OS_ID, "hubspot_ticket_id": None, "signal": signal_of(1), "category": None,
+    }
+    assert shadow.record["error_summary"] == f"{AGENT_SUMMARY_ONE_FAILED}; source_shadow_classify_failed=1"
+
+
+def test_an_exception_anywhere_in_the_comparison_is_a_code_and_never_its_message(
+    shadow: ShadowWorld, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, capfd: pytest.CaptureFixture
+) -> None:
+    caplog.set_level(logging.DEBUG)
+
+    def explode(*_args: Any, **_kwargs: Any) -> dict:
+        raise RuntimeError(f"builder {EXC_MARKER}")
+
+    monkeypatch.setattr(source_shadow, "build_observation", explode)
+    shadow.run()
+    record = shadow.record
+    assert shadow.observations == []
+    assert (record["status"], record["tickets_processed"], record["drafts_created"]) == ("partial", 1, 1)
+    assert record["error_summary"] == f"{AGENT_SUMMARY_ONE_FAILED}; source_shadow_comparison_failed:RuntimeError"
+    assert len(shadow.writebacks) == 2
+    fakes.assert_marker_absent(EXC_MARKER, caplog, capfd)
+
+
+def test_an_observation_the_builder_refuses_is_never_posted(shadow: ShadowWorld) -> None:
+    shadow.settings["active_stages"] = ["1", "New ticket"]  # a display name is not a stage token
+    shadow.run()
+    assert shadow.observations == []
+    assert shadow.record["error_summary"] == f"{AGENT_SUMMARY_ONE_FAILED}; source_shadow_comparison_failed:ValueError"
+    assert shadow.launch_attempts == 1
+
+
+def test_an_os_origin_that_cannot_be_read_skips_the_comparison(shadow: ShadowWorld) -> None:
+    deps = shadow.deps()
+
+    def unreadable() -> str:
+        raise TicketsApiError("list_error")
+
+    deps.read_os_origin = unreadable
+    rt.run(deps)
+    assert shadow.observations == []
+    assert shadow.record["error_summary"] == f"{AGENT_SUMMARY_ONE_FAILED}; source_shadow_comparison_failed:TicketsApiError"
+    assert len(shadow.writebacks) == 2
+
+
+def test_a_finaliser_that_raises_is_a_code_and_the_agents_outcome_stands(
+    shadow: ShadowWorld, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def explode(*_args: Any, **_kwargs: Any) -> dict:
+        raise RuntimeError(f"write-back {EXC_MARKER}")
+
+    monkeypatch.setattr(os_pass, "post_ticket_writeback", explode)
+    shadow.run()
+    record = shadow.record
+    assert (record["status"], record["tickets_processed"], record["drafts_created"]) == ("partial", 1, 1)
+    assert record["error_summary"] == f"{AGENT_SUMMARY_ONE_FAILED}; source_shadow_finalise_ticket_error=2"
+    assert EXC_MARKER not in json.dumps(record)
+
+
+# -------------------------------------------------- the HubSpot side, when it is not known
+
+
+def _no_token(world: ShadowWorld) -> None:
+    world.token = None
+
+
+def _settings_unreadable(world: ShadowWorld) -> None:
+    world.settings = RuntimeError(f"yaml {EXC_MARKER}")
+
+
+def _no_active_stages(world: ShadowWorld) -> None:
+    world.settings["active_stages"] = []
+
+
+def _search_failed(world: ShadowWorld) -> None:
+    world.transport.respond(SEARCH_PATH, None)
+
+
+def _pending_rerun(world: ShadowWorld) -> None:
+    world.client.reruns = [{"id": RERUN_ID, "ticket_id": B_HS_ID}]
+
+
+@pytest.mark.parametrize(
+    "arrange, reason",
+    [
+        (_no_token, "token_missing"),
+        (_settings_unreadable, "settings_unreadable"),
+        (_no_active_stages, "active_stages_empty"),
+        (_search_failed, "search_failed"),
+        (_pending_rerun, "pending_reruns"),
+    ],
+)
+def test_a_pregate_that_failed_open_launches_the_agent_and_reports_no_observation(
+    shadow: ShadowWorld, arrange: Callable[[ShadowWorld], None], reason: str
+) -> None:
+    """Code does not know what the agent will select, so there is nothing to
+    compare and nothing to write back: the run is a plain hubspot-mode run."""
+    arrange(shadow)
+    shadow.run()
+    record = shadow.record
+    assert shadow.launch_attempts == 1  # fail-open, exactly as hubspot mode
+    assert shadow.observations == [] and shadow.classifier.calls == []
+    assert shadow.os_api.calls_to("fetch_ticket") == [] and shadow.writebacks == []
+    assert record["error_summary"] == f"{AGENT_SUMMARY_ONE_FAILED}; source_shadow_skipped:pregate_{reason}"
+    assert (record["status"], record["drafts_created"]) == ("partial", 1)
+    assert EXC_MARKER not in json.dumps(record)
+
+
+def test_a_full_deduped_page_is_compared_with_nothing_selected(shadow: ShadowWorld) -> None:
+    """The pre-gate launches the agent on a full page of deduped hits (fail-open),
+    and what it knows is still a fact worth reporting: every hit, deduped."""
+    shadow.settings["per_run_cap"] = 2
+    state = {
+        "last_run_at": "2026-09-01T00:00:00Z",
+        "ticket_fingerprints": {
+            ticket_id: {"processed_at": "2026-10-09T00:00:00Z", "hs_lastmodifieddate": "2026-10-08T10:00:00.500Z", "num_notes": 1}
+            for ticket_id in (B_HS_ID, H_HS_ID)
+        },
+    }
+    shadow.state_path.write_text(json.dumps(state), encoding="utf-8")
+    shadow.agent.result = agent_result()
+    shadow.run()
+    (body,) = shadow.observations
+    assert body["hubspot"] == {
+        "page_full": True,
+        "matched": [
+            {"hubspot_ticket_id": B_HS_ID, "stage": None, "deduped": True},
+            {"hubspot_ticket_id": H_HS_ID, "stage": None, "deduped": True},
+        ],
+        "selected": [],
+    }
+    assert [row["os_ticket_id"] for row in body["os"]["selected"]] == [B_OS_ID, O_OS_ID]
+    assert shadow.launch_attempts == 1 and shadow.writebacks == []
+
+
+def test_no_hubspot_candidate_and_an_os_list_is_an_observation_and_a_zero_ticket_success(shadow: ShadowWorld) -> None:
+    shadow.transport.respond(SEARCH_PATH, {"results": []})
+    shadow.run()
+    record = shadow.record
+    (body,) = shadow.observations
+    assert body["hubspot"] == {"page_full": False, "matched": [], "selected": []}
+    assert [row["os_ticket_id"] for row in body["os"]["selected"]] == [B_OS_ID, O_OS_ID]  # OS-only, for this run
+    assert (record["status"], record["tickets_processed"], record["drafts_created"]) == ("success", 0, 0)
+    assert record["error_summary"] is None and record["source_mode"] == "shadow"
+    assert shadow.launch_attempts == 0 and shadow.engine_envs == []
+    assert shadow.writebacks == [] and shadow.os_api.calls_to("fetch_ticket") == []
+    # B is HubSpot-linked and only the OS selected it: its thread costs one fetch (two requests)
+    assert [method for method, _path in shadow.hubspot.requests] == ["GET", "POST"]
+    assert shadow.hubspot.unexpected == []
+    assert shadow.token_reads == 2  # the pre-gate's, and one for the comparison's thread fetch
+
+
+def test_nothing_on_either_side_is_still_one_observation(shadow: ShadowWorld) -> None:
+    """A run that compared and found nothing is a run of that business day."""
+    shadow.transport.respond(SEARCH_PATH, {"results": []})
+    shadow.os_api.unprocessed = os_listing()
+    shadow.run()
+    (body,) = shadow.observations
+    assert body["hubspot"]["selected"] == [] and body["os"]["selected"] == []
+    assert shadow.classifier.calls == [] and shadow.record["status"] == "success"
+    assert not shadow.cache_path.exists()
+
+
+def test_a_paused_routine_is_one_skipped_record_and_asks_nothing(shadow: ShadowWorld) -> None:
+    shadow.client.enabled = False
+    shadow.run()
+    assert shadow.record["status"] == "skipped" and shadow.record["error_summary"] == "routine_paused"
+    assert shadow.record["source_mode"] == "shadow"
+    assert shadow.timeline == [] and shadow.os_api.calls == []
+    assert shadow.launch_attempts == 0 and shadow.token_reads == 0
+
+
+# ----------------------------------------------- the HubSpot path is hubspot mode's
+
+
+def test_with_an_os_that_knows_nothing_the_run_is_hubspot_modes_run(make_shadow_world: Callable[..., ShadowWorld]) -> None:
+    """The proof that `shadow` adds to the HubSpot path and changes none of it:
+    with the same search hits, state and agent, the agent is launched with the
+    same command, the same environment (but for the run's own four variables)
+    and the same run context, and the record has the same status and counts."""
+    plain = make_shadow_world("plain", mode="hubspot")
+    plain.run()
+    plain_command, plain_env = plain.agent.calls[0]
+    plain_context, plain_record = plain.agent.contexts[0], plain.record
+    assert plain.os_api.calls == []  # hubspot mode asks the OS nothing
+
+    world = make_shadow_world("compared", mode="shadow")
+    world.os_api.tickets = {}  # the mirror has seen neither candidate
+    world.os_api.unprocessed = os_listing()
+    world.run()
+    command, env = world.agent.calls[0]
+
+    assert command == plain_command == rt.agent_command()  # no tool restriction, the pinned model
+    own = set(run_types.RUN_ENV_NAMES)
+    assert {k: v for k, v in env.items() if k not in own} == {k: v for k, v in plain_env.items() if k not in own}
+    assert env[run_types.SOURCE_MODE_ENV] == "shadow" and plain_env[run_types.SOURCE_MODE_ENV] == "hubspot"
+    assert world.agent.contexts[0] == plain_context == {}
+    for key in ("status", "tickets_processed", "drafts_created", "error_summary", "failure_reason_code", "hubspot_calls"):
+        assert world.record[key] == plain_record[key], key
+    assert len(world.engine_envs) == len(plain.engine_envs) == 1
+    assert world.writebacks == [] and world.ingest.posts == [] and world.draft_writes == []
+    assert world.transport.bodies == plain.transport.bodies  # the same one search, byte for byte
+
+
+def test_the_engine_shadow_step_failing_never_stops_the_run(shadow: ShadowWorld) -> None:
+    shadow.engine_error = RuntimeError(f"engine {EXC_MARKER}")
+    shadow.run()
+    assert shadow.launch_attempts == 1 and len(shadow.observations) == 1
+    assert shadow.record["error_summary"] == AGENT_SUMMARY_ONE_FAILED
+
+
+def test_an_engine_artifact_of_this_run_saves_the_hubspot_sides_calls(shadow: ShadowWorld) -> None:
+    shadow.engine_artifacts = {B_HS_ID: artifact("billing_invoice")}
+    shadow.run()
+    assert shadow.hydrator.calls == [H_HS_ID]  # B was not hydrated again
+    assert shadow.classifier.ticket_ids() == [H_HS_ID, B_HS_ID, O_OS_ID]  # H; then the OS side's B and O
+    (body,) = shadow.observations
+    assert body["hubspot"]["selected"][0]["category"] == "billing_invoice"
+    assert body["os"]["selected"][0]["category"] == "wismo_tracking"  # a disagreement, reported as it is
+    written = sorted(p.name for p in (shadow.root / "outputs" / "shadow").rglob("*") if p.is_file())
+    assert written == [f"{B_HS_ID}.json"]  # only what the engine shadow itself wrote
+
+
+def test_the_runner_writes_nothing_under_the_engine_shadows_directory(shadow: ShadowWorld) -> None:
+    shadow.run()
+    assert not (shadow.root / "outputs" / "shadow").exists()
+    assert sorted(p.name for p in (shadow.root / "outputs" / "runs").iterdir()) == ["os", "source_shadow_seen.json"]
+    assert list((shadow.root / "outputs" / "runs" / "os").iterdir()) == []  # the scratch directory is gone
+
+
+# ------------------------------------------------------------------------ the cache
+
+
+def test_the_cache_is_kept_between_runs_so_a_ticket_that_stays_os_only_costs_one_call(shadow: ShadowWorld) -> None:
+    shadow.run()
+    stored = json.loads(shadow.cache_path.read_text(encoding="utf-8"))
+    assert stored == {
+        f"{B_OS_ID}:{osm.T1_SIGNAL_ID}": "wismo_tracking",
+        f"{O_OS_ID}:{osm.T2_SIGNAL_ID}": "wismo_tracking",
+    }
+    first_calls = shadow.classifier.ticket_ids()
+    assert first_calls == [B_HS_ID, H_HS_ID, B_HS_ID, O_OS_ID]
+
+    shadow.run()  # the next tick: the OS still lists B and O
+    assert shadow.classifier.ticket_ids()[len(first_calls):] == [B_HS_ID, H_HS_ID]  # the HubSpot side only
+    second = shadow.observations[1]
+    assert [row["category"] for row in second["os"]["selected"]] == ["wismo_tracking", "wismo_tracking"]
+    assert second["run_id"] != shadow.observations[0]["run_id"]
+    assert len(shadow.client.records) == 2
+
+
+def test_a_cache_that_cannot_be_saved_is_a_code_and_the_observation_is_still_posted(
+    shadow: ShadowWorld, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def refuse(path: Any, cache: Any) -> None:
+        raise PermissionError(f"disk {EXC_MARKER}")
+
+    monkeypatch.setattr(source_shadow, "save_seen_cache", refuse)
+    shadow.run()
+    assert len(shadow.observations) == 1
+    assert shadow.record["error_summary"] == f"{AGENT_SUMMARY_ONE_FAILED}; source_shadow_cache_unwritable"
+
+
+# ------------------------------------------------------------- no text, end to end
+
+
+def test_a_whole_run_puts_no_ticket_text_in_the_record_the_cache_or_a_log(
+    shadow: ShadowWorld, caplog: pytest.LogCaptureFixture, capfd: pytest.CaptureFixture
+) -> None:
+    caplog.set_level(logging.DEBUG)
+    shadow.os_api.unprocessed = {"contract_version": "1", "generated_at": "x", "tickets": [marked(0), marked(1)]}
+    shadow.agent.result = agent_result(done(B_HS_ID, "draft-B", items=(CLAIM,)), broke(H_HS_ID))
+    shadow.run()
+    assert TEXT_MARKER in json.dumps(shadow.ingest.posts)  # the marker was in what the run handled
+    assert TEXT_MARKER not in json.dumps(shadow.record)
+    assert TEXT_MARKER not in json.dumps(shadow.observations)
+    assert TEXT_MARKER not in shadow.cache_path.read_text(encoding="utf-8")
+    assert TEXT_MARKER not in shadow.seen_path.read_text(encoding="utf-8")  # the seen-set holds keys only
+    fakes.assert_marker_absent(TEXT_MARKER, caplog, capfd)
+
+
+# ------------------------------------------------------------ the real collaborators
+
+
+def test_the_real_classifier_is_the_engines_own_classify_step(monkeypatch: pytest.MonkeyPatch) -> None:
+    """D-05: `llm.classify`, the small model, with the real categories config."""
+    seen: list = []
+
+    def spy(ticket_context: dict, settings: dict, categories_cfg: dict, usages: list) -> dict:
+        seen.append((ticket_context, settings, categories_cfg, usages))
+        return {"category": "wismo_tracking", "reason": TEXT_MARKER}
+
+    monkeypatch.setattr(llm, "classify", spy)
+    classify = REAL_BUILD_CLASSIFY(SETTINGS)
+    context = hubspot_context(B_HS_ID)
+    other = hubspot_context(H_HS_ID)
+    assert classify(context)["category"] == "wismo_tracking"
+    classify(other)
+    assert seen[0][0] is context and seen[1][0] is other
+    assert seen[0][1] is SETTINGS
+    assert "form_topic_mapping" in seen[0][2] and seen[0][2] is seen[1][2]  # the real file, read once
+    assert seen[0][3] == [] and isinstance(seen[0][3], list)
+    assert llm.CLASSIFY_MODEL != llm.DRAFT_MODEL  # the classify step's own, smaller model
+
+
+def test_the_real_hubspot_hydration_is_one_single_ticket_search_and_hydrations_own_function(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    transport = fakes.FakeHubSpotTransport({SEARCH_PATH: {"results": [hit(B_HS_ID)]}})
+    monkeypatch.setattr(hubspot_api, "_request", transport)
+    hydrated: list = []
+
+    def spy(ticket: dict, settings: dict, token: str) -> dict:
+        hydrated.append((ticket, settings, token))
+        return hubspot_context(B_HS_ID)
+
+    monkeypatch.setattr(hydrate, "hydrate_ticket", spy)
+    settings = dict(SETTINGS, ticket_custom_properties=["order_number"])
+    reads: list = []
+
+    def read_token() -> str:
+        reads.append(1)
+        return "test-token"
+
+    hydrate_one = REAL_BUILD_HUBSPOT_HYDRATE(settings, read_token)
+    assert reads == []  # no token is read until a ticket needs hydrating
+    assert hydrate_one(B_HS_ID) == hubspot_context(B_HS_ID)
+    assert transport.calls == [("POST", SEARCH_PATH)]
+    (body,) = transport.bodies
+    assert body["filterGroups"] == [
+        {"filters": [{"propertyName": "hs_object_id", "operator": "EQ", "value": B_HS_ID}]}
+    ]
+    assert body["limit"] == 1
+    assert body["properties"] == hubspot_api.TICKET_BASE_PROPERTIES + ["order_number"]
+    assert hydrated == [(hit(B_HS_ID), settings, "test-token")]
+    assert hubspot_api.snapshot_calls()["kinds"]["search"] == 1
+
+
+def test_the_real_hubspot_hydration_raises_when_there_is_no_token_or_no_ticket(monkeypatch: pytest.MonkeyPatch) -> None:
+    transport = fakes.FakeHubSpotTransport({SEARCH_PATH: {"results": []}})
+    monkeypatch.setattr(hubspot_api, "_request", transport)
+    with pytest.raises(LookupError):
+        REAL_BUILD_HUBSPOT_HYDRATE(SETTINGS, lambda: None)(B_HS_ID)
+    assert transport.calls == []  # nothing is asked of HubSpot without a token
+    with pytest.raises(LookupError):
+        REAL_BUILD_HUBSPOT_HYDRATE(SETTINGS, lambda: "test-token")(B_HS_ID)
+    with pytest.raises(LookupError):
+        REAL_BUILD_HUBSPOT_HYDRATE(SETTINGS, lambda: "test-token")("../not-digits")
+    assert len(transport.calls) == 1
+
+
+def test_the_real_thread_fetch_is_the_os_modes_own(monkeypatch: pytest.MonkeyPatch) -> None:
+    seen: list = []
+
+    def spy(hubspot_ticket_id: Any, settings: dict, token: Any) -> list:
+        seen.append((hubspot_ticket_id, settings, token))
+        return list(osm.T3_EMAILS)
+
+    monkeypatch.setattr(os_bundle, "fetch_thread", spy)
+    fetch = REAL_BUILD_THREAD_FETCH(SETTINGS, lambda: "test-token")
+    assert fetch(L_HS_ID) == osm.T3_EMAILS
+    assert seen == [(L_HS_ID, SETTINGS, "test-token")]
+
+
+# ------------------------------------------------------------------ the rollback state
+
+
+def test_the_runner_never_writes_the_hubspot_paths_state_file() -> None:
+    """Plan 93-23: in `shadow` mode the AGENT keeps that file. A code write for
+    a ticket the agent processed would replace its fingerprint with a
+    null-count one, so this module holds no call of the state writer at all."""
+    module = _module_tree()
+    called = {
+        node.func.attr if isinstance(node.func, ast.Attribute) else getattr(node.func, "id", "")
+        for node in ast.walk(module)
+        if isinstance(node, ast.Call)
+    }
+    assert "merge_" + "fingerprints" not in called and "fingerprint_entry" not in called
+    attributes = {node.attr for node in ast.walk(module) if isinstance(node, ast.Attribute)}
+    assert "state_path" not in attributes  # the path is never even named
+    # and the os finaliser still holds exactly its one call (two tests of plan 93-23 pin it)
+    os_pass_source = (PACKAGE_ROOT / "ticket_pipeline" / "os_pass.py").read_text(encoding="utf-8")
+    assert os_pass_source.count("merge_" + "fingerprints(") == 1

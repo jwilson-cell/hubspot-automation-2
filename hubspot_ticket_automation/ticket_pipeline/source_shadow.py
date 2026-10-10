@@ -110,7 +110,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Optional
 
-from ticket_pipeline import os_bundle, os_pass
+from ticket_pipeline import os_bundle, os_pass, run_types
 
 _ROOT = Path(__file__).resolve().parent.parent
 
@@ -812,6 +812,21 @@ def build_observation(run_id: Any, started_at: Any, settings: Any, hubspot_side:
     }
 
 
+def _build_classify(settings: Any) -> Callable[[dict], Any]:
+    """RED skeleton (task 2)."""
+    return lambda context: None
+
+
+def _build_hubspot_hydrate(settings: Any, read_token: Callable[[], Any]) -> Callable[[str], Any]:
+    """RED skeleton (task 2)."""
+    return lambda hubspot_ticket_id: None
+
+
+def _build_thread_fetch(settings: Any, read_token: Callable[[], Any]) -> Callable[[str], Any]:
+    """RED skeleton (task 2)."""
+    return lambda hubspot_ticket_id: None
+
+
 def run_source_shadow(ctx: Any, deps: Any) -> Any:
-    """The `shadow` mode runner. Built by this plan's second task."""
+    """The `shadow` mode runner. RED skeleton (task 2): no behaviour yet."""
     return None
