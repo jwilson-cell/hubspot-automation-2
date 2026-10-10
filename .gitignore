@@ -2,6 +2,9 @@
 # token, Gmail OAuth token, action-ingest HMAC secret all live here.
 hubspot_ticket_automation/config/.secrets/
 
+# The action-item forwarder's seen-set: "<ticket key>:<action type>" keys only; runtime state of the droplet, never tracked.
+hubspot_ticket_automation/config/.action_items_forwarded.json
+
 # The action-item retry file (Phase 93): ids only; written on the droplet beside the seen-set.
 hubspot_ticket_automation/config/.action_items_retry.json
 
