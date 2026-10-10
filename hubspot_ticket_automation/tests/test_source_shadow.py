@@ -342,7 +342,7 @@ def test_one_both_one_hubspot_only_and_one_os_only_build_the_contract_fixture(be
 
 def test_the_observation_holds_both_sides_and_the_runs_four_facts(bench: Bench) -> None:
     bench.hydrator.contexts[H_HS_ID] = hubspot_context(H_HS_ID, stage="3")
-    bench.classifier.by_ticket = {H_HS_ID: "billing", O_OS_ID: "other_unclassified"}
+    bench.classifier.by_ticket = {H_HS_ID: "billing_invoice", O_OS_ID: "other_unclassified"}
     matched = [
         {"id": B_HS_ID, "hs_lastmodifieddate": "2026-10-08T10:00:00.500Z", "deduped": False},
         {"id": H_HS_ID, "hs_lastmodifieddate": None, "deduped": False},
@@ -367,7 +367,7 @@ def test_the_observation_holds_both_sides_and_the_runs_four_facts(bench: Bench) 
     ]
     assert body["hubspot"]["selected"] == [
         {"hubspot_ticket_id": B_HS_ID, "os_ticket_id": B_OS_ID, "signal": signal_of(0), "category": "wismo_tracking"},
-        {"hubspot_ticket_id": H_HS_ID, "os_ticket_id": None, "signal": None, "category": "billing"},
+        {"hubspot_ticket_id": H_HS_ID, "os_ticket_id": None, "signal": None, "category": "billing_invoice"},
     ]
     assert body["os"]["selected"] == [
         {"os_ticket_id": B_OS_ID, "hubspot_ticket_id": B_HS_ID, "signal": signal_of(0), "category": "wismo_tracking"},
@@ -736,12 +736,12 @@ def test_an_exceptions_message_is_never_logged_only_its_class(
 
 def test_an_engine_artifact_of_this_run_is_reused_and_costs_no_call(bench: Bench) -> None:
     engine_context = hubspot_context(B_HS_ID)
-    bench.engine.artifacts = {B_HS_ID: {"category": "billing", "ticket_context": engine_context}}
+    bench.engine.artifacts = {B_HS_ID: {"category": "billing_invoice", "ticket_context": engine_context}}
     result = bench.compare(side(candidates=(B_HS_ID,)), [])
     assert bench.engine.calls == [B_HS_ID]
     assert bench.hydrator.calls == []
     assert bench.classifier.calls == []
-    assert result.hubspot_side["selected"][0]["category"] == "billing"
+    assert result.hubspot_side["selected"][0]["category"] == "billing_invoice"
     assert result.hubspot_side["matched"][0]["stage"] == "1"  # read from the engine's own context
     assert result.classify_calls == 0
 
@@ -784,12 +784,12 @@ def test_the_os_side_costs_one_classify_call_per_listed_ticket_not_in_the_cache(
 
 
 def test_a_ticket_and_signal_already_in_the_cache_costs_no_call_and_reports_its_category(bench: Bench) -> None:
-    bench.cache[f"{O_OS_ID}:{osm.T2_SIGNAL_ID}"] = "billing"
+    bench.cache[f"{O_OS_ID}:{osm.T2_SIGNAL_ID}"] = "billing_invoice"
     result = bench.compare(side(candidates=(), resolved={}), [payload(1)])
     assert bench.classifier.calls == []
     assert bench.fetcher.calls == []
     assert result.os_side["selected"] == [
-        {"os_ticket_id": O_OS_ID, "hubspot_ticket_id": None, "signal": signal_of(1), "category": "billing"}
+        {"os_ticket_id": O_OS_ID, "hubspot_ticket_id": None, "signal": signal_of(1), "category": "billing_invoice"}
     ]
     assert result.classify_calls == 0
 
@@ -806,7 +806,7 @@ def test_a_second_run_over_the_same_list_makes_no_call_at_all(bench: Bench) -> N
 
 
 def test_a_newer_signal_on_a_cached_ticket_is_classified_again(bench: Bench) -> None:
-    bench.cache[f"{O_OS_ID}:{osm.T2_SIGNAL_ID}"] = "billing"
+    bench.cache[f"{O_OS_ID}:{osm.T2_SIGNAL_ID}"] = "billing_invoice"
     listed = payload(1)
     listed["signal"] = {"kind": "client_reply", "id": "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee", "at": "2026-10-09T09:00:00.000Z"}
     result = bench.compare(side(candidates=(), resolved={}), [listed])
@@ -876,7 +876,7 @@ def test_the_reused_thread_is_a_copy_the_comparison_cannot_change(bench: Bench) 
 
 def test_a_both_sides_ticket_reuses_the_thread_of_a_reused_engine_context(bench: Bench) -> None:
     engine_context = hubspot_context(B_HS_ID, last_message="From the engine's own context")
-    bench.engine.artifacts = {B_HS_ID: {"category": "billing", "ticket_context": engine_context}}
+    bench.engine.artifacts = {B_HS_ID: {"category": "billing_invoice", "ticket_context": engine_context}}
     bench.compare(side(candidates=(B_HS_ID,)), [payload(0)])
     assert bench.fetcher.calls == [] and bench.hydrator.calls == []
     (os_built,) = bench.classifier.calls
@@ -959,12 +959,12 @@ def test_one_classify_function_object_serves_both_sides(bench: Bench) -> None:
 @pytest.mark.parametrize(
     "answer, category",
     [
-        ({"category": "billing", "reason": TEXT_MARKER}, "billing"),
-        ("billing", "billing"),
+        ({"category": "billing_invoice", "reason": TEXT_MARKER}, "billing_invoice"),
+        ("billing_invoice", "billing_invoice"),
         ({"category": "Billing"}, None),
         ({"reason": "no category"}, None),
         (None, None),
-        (["billing"], None),
+        (["billing_invoice"], None),
     ],
 )
 def test_only_a_contract_slug_is_kept_of_what_the_classifier_answers(bench: Bench, answer: Any, category: Any) -> None:
@@ -1040,11 +1040,24 @@ def test_three_classify_failures_in_a_row_stop_the_step_for_the_rest_of_the_comp
 
 
 def test_a_success_between_failures_keeps_the_step_going(bench: Bench) -> None:
-    bench.classifier.failing = {B_HS_ID, L_HS_ID}
-    result = bench.compare(side(candidates=(), resolved={}), [payload(0), payload(1), payload(2)])
-    assert len(bench.classifier.calls) == 3
+    """Three failures, but never three IN A ROW: fail, fail, answer, fail, answer."""
+    failing_twin = payload(1)
+    failing_twin["id"] = "5b1f0c2a-9d3e-4f4a-8b6c-7d8e9f0a1b2c"
+    answered_twin = payload(1)
+    answered_twin["id"] = "6c2a1d3b-0e4f-4a5b-9c7d-8e9f0a1b2c3d"
+    bench.classifier.failing = {B_HS_ID, failing_twin["id"], L_HS_ID}
+    listed = [payload(0), failing_twin, payload(1), payload(2), answered_twin]
+    result = bench.compare(side(candidates=(), resolved={}), listed)
+    assert len(bench.classifier.calls) == 5  # the step was never stopped
+    assert result.classify_failures == 3
     assert result.classifier_unavailable is False
-    assert [row["category"] for row in result.os_side["selected"]] == [None, "wismo_tracking", None]
+    assert [row["category"] for row in result.os_side["selected"]] == [
+        None,
+        None,
+        "wismo_tracking",
+        None,
+        "wismo_tracking",
+    ]
 
 
 def test_every_call_failing_is_reported_as_an_unavailable_classifier(bench: Bench) -> None:
@@ -1157,7 +1170,7 @@ def test_the_cache_is_saved_through_a_temp_file_beside_it_and_a_rename(
         return real_replace(src, dst, *args, **kwargs)
 
     monkeypatch.setattr(os, "replace", spy)
-    cache = {f"{O_OS_ID}:{osm.T2_SIGNAL_ID}": "billing"}
+    cache = {f"{O_OS_ID}:{osm.T2_SIGNAL_ID}": "billing_invoice"}
     source_shadow.save_seen_cache(target, cache)
 
     assert len(renames) == 1
@@ -1171,7 +1184,7 @@ def test_the_cache_is_saved_through_a_temp_file_beside_it_and_a_rename(
 
 def test_a_failed_rename_leaves_the_old_cache_and_no_temp_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     target = tmp_path / "source_shadow_seen.json"
-    before = json.dumps({f"{B_OS_ID}:{osm.T1_SIGNAL_ID}": "billing"})
+    before = json.dumps({f"{B_OS_ID}:{osm.T1_SIGNAL_ID}": "billing_invoice"})
     target.write_text(before, encoding="utf-8")
 
     def refuse(*_args: Any, **_kwargs: Any) -> Any:
@@ -1179,7 +1192,7 @@ def test_a_failed_rename_leaves_the_old_cache_and_no_temp_file(tmp_path: Path, m
 
     monkeypatch.setattr(os, "replace", refuse)
     with pytest.raises(OSError):
-        source_shadow.save_seen_cache(target, {f"{O_OS_ID}:{osm.T2_SIGNAL_ID}": "billing"})
+        source_shadow.save_seen_cache(target, {f"{O_OS_ID}:{osm.T2_SIGNAL_ID}": "billing_invoice"})
     assert target.read_text(encoding="utf-8") == before
     assert sorted(p.name for p in tmp_path.iterdir()) == ["source_shadow_seen.json"]
 
@@ -1187,19 +1200,19 @@ def test_a_failed_rename_leaves_the_old_cache_and_no_temp_file(tmp_path: Path, m
 def test_the_cache_file_holds_only_id_keys_and_category_slugs(tmp_path: Path) -> None:
     target = tmp_path / "source_shadow_seen.json"
     dirty = {
-        f"{O_OS_ID}:{osm.T2_SIGNAL_ID}": "billing",
+        f"{O_OS_ID}:{osm.T2_SIGNAL_ID}": "billing_invoice",
         f"{B_OS_ID}:{osm.T1_SIGNAL_ID}": f"the client said {TEXT_MARKER}",  # not a slug
-        f"Subject {TEXT_MARKER}": "billing",  # not an id key
+        f"Subject {TEXT_MARKER}": "billing_invoice",  # not an id key
         f"{L_OS_ID}:{osm.T3_SIGNAL_ID}": None,
-        O_OS_ID: "billing",  # no signal id
-        7: "billing",
+        O_OS_ID: "billing_invoice",  # no signal id
+        7: "billing_invoice",
         f"{L_OS_ID}:rerun:{osm.RERUN_A}": "wismo_tracking",
     }
     source_shadow.save_seen_cache(target, dirty)
     text = target.read_text(encoding="utf-8")
     stored = json.loads(text)
     assert stored == {
-        f"{O_OS_ID}:{osm.T2_SIGNAL_ID}": "billing",
+        f"{O_OS_ID}:{osm.T2_SIGNAL_ID}": "billing_invoice",
         f"{L_OS_ID}:rerun:{osm.RERUN_A}": "wismo_tracking",
     }
     assert TEXT_MARKER not in text
@@ -1211,7 +1224,7 @@ def test_the_cache_file_holds_only_id_keys_and_category_slugs(tmp_path: Path) ->
 def test_the_cache_is_capped_at_its_newest_5000_entries(tmp_path: Path) -> None:
     target = tmp_path / "source_shadow_seen.json"
     assert source_shadow.SEEN_CACHE_MAX_ENTRIES == 5000
-    cache = {f"{O_OS_ID}:signal-{n:05d}": "billing" for n in range(5003)}
+    cache = {f"{O_OS_ID}:signal-{n:05d}": "billing_invoice" for n in range(5003)}
     source_shadow.save_seen_cache(target, cache)
     stored = json.loads(target.read_text(encoding="utf-8"))
     assert len(stored) == 5000
@@ -1222,7 +1235,7 @@ def test_the_cache_is_capped_at_its_newest_5000_entries(tmp_path: Path) -> None:
 
 def test_a_saved_cache_is_what_a_later_run_loads(tmp_path: Path) -> None:
     target = tmp_path / "nested" / "runs" / "source_shadow_seen.json"
-    cache = {f"{O_OS_ID}:{osm.T2_SIGNAL_ID}": "billing", f"{B_OS_ID}:{osm.T1_SIGNAL_ID}": "wismo_tracking"}
+    cache = {f"{O_OS_ID}:{osm.T2_SIGNAL_ID}": "billing_invoice", f"{B_OS_ID}:{osm.T1_SIGNAL_ID}": "wismo_tracking"}
     source_shadow.save_seen_cache(target, cache)  # the directory is created
     loaded = source_shadow.load_seen_cache(target)
     assert loaded == cache and list(loaded) == list(cache)
@@ -1231,7 +1244,7 @@ def test_a_saved_cache_is_what_a_later_run_loads(tmp_path: Path) -> None:
 
 @pytest.mark.parametrize(
     "content",
-    [None, b"", b"{", b"[]", b'"billing"', b"\xff\xfe\x00", b"null", b'{"a": {"b": 1}}'],
+    [None, b"", b"{", b"[]", b'"billing_invoice"', b"\xff\xfe\x00", b"null", b'{"a": {"b": 1}}'],
 )
 def test_a_cache_file_that_is_missing_or_unusable_loads_as_empty(tmp_path: Path, content: Any) -> None:
     target = tmp_path / "source_shadow_seen.json"
@@ -1245,14 +1258,14 @@ def test_loading_drops_an_entry_that_is_not_an_id_key_and_a_slug(tmp_path: Path)
     target.write_text(
         json.dumps(
             {
-                f"{O_OS_ID}:{osm.T2_SIGNAL_ID}": "billing",
+                f"{O_OS_ID}:{osm.T2_SIGNAL_ID}": "billing_invoice",
                 f"{B_OS_ID}:{osm.T1_SIGNAL_ID}": f"text {TEXT_MARKER}",
-                f"text {TEXT_MARKER}": "billing",
+                f"text {TEXT_MARKER}": "billing_invoice",
             }
         ),
         encoding="utf-8",
     )
-    assert source_shadow.load_seen_cache(target) == {f"{O_OS_ID}:{osm.T2_SIGNAL_ID}": "billing"}
+    assert source_shadow.load_seen_cache(target) == {f"{O_OS_ID}:{osm.T2_SIGNAL_ID}": "billing_invoice"}
 
 
 # ------------------------------------------- the engine shadow's artifacts (read only)
@@ -1264,7 +1277,7 @@ def engine_dir(root: Path, stamp: str) -> Path:
     return directory
 
 
-def artifact(category: Any = "billing", context: Any = "default") -> dict:
+def artifact(category: Any = "billing_invoice", context: Any = "default") -> dict:
     return {
         "ticket_id": B_HS_ID,
         "classification": {"category": category, "confidence": 0.9, "reason": f"because {TEXT_MARKER}"},
@@ -1284,7 +1297,7 @@ def test_an_engine_artifact_written_during_this_run_gives_its_category_and_conte
     directory = engine_dir(tmp_path, "2026-10-09T14-07-05Z")
     (directory / f"{B_HS_ID}.json").write_text(json.dumps(artifact()), encoding="utf-8")
     found = source_shadow._engine_classification(tmp_path, B_HS_ID, SINCE)
-    assert found == {"category": "billing", "ticket_context": hubspot_context(B_HS_ID)}
+    assert found == {"category": "billing_invoice", "ticket_context": hubspot_context(B_HS_ID)}
     assert set(found) == {"category", "ticket_context"}  # never the draft body, never the reason
 
 
@@ -1301,7 +1314,7 @@ def test_an_engine_artifact_of_an_earlier_run_is_not_reused(tmp_path: Path) -> N
 
 
 def test_the_newest_engine_run_wins(tmp_path: Path) -> None:
-    for stamp, category in (("2026-10-09T14-07-05Z", "billing"), ("2026-10-09T14-09-00Z", "returns_rma")):
+    for stamp, category in (("2026-10-09T14-07-05Z", "billing_invoice"), ("2026-10-09T14-09-00Z", "returns_rma")):
         (engine_dir(tmp_path, stamp) / f"{B_HS_ID}.json").write_text(json.dumps(artifact(category)), encoding="utf-8")
     assert "returns_rma" in os_pass.CATEGORY_SLUGS
     assert source_shadow._engine_classification(tmp_path, B_HS_ID, SINCE)["category"] == "returns_rma"
@@ -1313,7 +1326,7 @@ def test_the_newest_engine_run_wins(tmp_path: Path) -> None:
         b"{",
         b"[]",
         json.dumps({"classification": {"category": "Shipping question"}}).encode(),
-        json.dumps({"classification": "billing"}).encode(),
+        json.dumps({"classification": "billing_invoice"}).encode(),
         json.dumps({"ticket_context": {}}).encode(),
         b"\xff\xfe",
     ],
@@ -1328,7 +1341,13 @@ def test_an_engine_artifact_that_cannot_be_used_is_no_artifact(tmp_path: Path, c
 def test_the_artifact_reader_only_looks_for_a_numeric_ticket_id(tmp_path: Path, ticket_id: Any) -> None:
     directory = engine_dir(tmp_path, "2026-10-09T14-07-05Z")
     (directory / f"{B_HS_ID}.json").write_text(json.dumps(artifact()), encoding="utf-8")
-    (tmp_path / "escape.json").write_text(json.dumps(artifact()), encoding="utf-8")
+    # a usable artifact exactly where each traversal would land, were the id put in a path
+    (tmp_path / "outputs" / "escape.json").write_text(json.dumps(artifact()), encoding="utf-8")
+    (directory / "x.json").write_text(json.dumps(artifact()), encoding="utf-8")
+    (directory / "93").mkdir()
+    (directory / "93" / "1.json").write_text(json.dumps(artifact()), encoding="utf-8")
+    (directory / ".json").write_text(json.dumps(artifact()), encoding="utf-8")
+    (directory / ("a" * 80 + ".json")).write_text(json.dumps(artifact()), encoding="utf-8")
     assert source_shadow._engine_classification(tmp_path, ticket_id, SINCE) is None
 
 
@@ -1403,7 +1422,7 @@ def test_the_comparison_writes_nothing_under_the_engine_shadows_directory(bench:
     deps.engine_classification = lambda hid: source_shadow._engine_classification(tmp_path, hid, SINCE)
     result = source_shadow.compare_sources(side(), [payload(0), payload(1)], deps)
     source_shadow.save_seen_cache(source_shadow.seen_cache_path(tmp_path), bench.cache)
-    assert result.hubspot_side["selected"][0]["category"] == "billing"  # the artifact was used
+    assert result.hubspot_side["selected"][0]["category"] == "billing_invoice"  # the artifact was used
     assert tree(tmp_path / "outputs" / "shadow") == before
     assert sorted(p.name for p in (tmp_path / "outputs").iterdir()) == ["runs", "shadow"]
 

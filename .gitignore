@@ -11,6 +11,10 @@ hubspot_ticket_automation/config/.action_items_retry.json
 # Per-run OS bundles and context files — they hold ticket text and are deleted after each run.
 hubspot_ticket_automation/outputs/runs/os/
 
+# The source shadow's seen cache (Phase 93): OS ticket ids, signal ids and category slugs only. Its temp file lasts milliseconds.
+hubspot_ticket_automation/outputs/runs/source_shadow_seen.json
+hubspot_ticket_automation/outputs/runs/.source_shadow_seen.*.tmp
+
 # Python bytecode / test caches
 __pycache__/
 *.pyc
