@@ -788,13 +788,6 @@ skipped silently for the entire parallel-run window. A plain script draining
 `pending_actions.json` after the run guarantees delivery and surfaces real POST errors
 (secret/url/zod/network) in the cron log instead of swallowing them behind a false "posted" claim.
 
-**`ticket_closed` auto-resolve (D-15) — DEFERRED for the parallel run.** The OS route also accepts a
-`ticket_closed` signal that auto-resolves a ticket's open action-item tasks. This skill only processes
-active-stage tickets (stages 1 + 3; stage 4 = Closed is filtered out at fetch in Step 1), so it does not
-currently observe closes. Until a close-detection pass is added (follow-up), operators resolve completed
-action-item tasks directly in `/tasks`. The `post_ticket_closed(...)` helper + CLI already exist and are
-ready to wire when that pass lands.
-
 #### 2h. Emit structured row for Sheets export
 
 If `settings.sheets_export.enabled` is true AND the classifier's category matches a tracked rollup, append one row dict to the appropriate in-memory buffer. Use values from `ticket_context`, `classifier`, and the `posted_note_id` from step 2f (empty string on dry_run). **Do NOT** call any Sheets MCP or script here — buffer only; step 3.5 flushes in a single batch.

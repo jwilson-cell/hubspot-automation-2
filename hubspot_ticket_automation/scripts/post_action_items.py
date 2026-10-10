@@ -1,4 +1,4 @@
-"""POST extracted action items (and ticket-closed signals) to the Pack'N OS ingestion route.
+"""POST extracted action items to the Pack'N OS ingestion route.
 
 This is the cross-repo bridge for Phase 15.1: the hubspot-tickets skill extracts
 action items (see prompts/extract_actions.md), and this helper forwards each one to
@@ -44,8 +44,6 @@ Invariants (sibling CLAUDE.md):
 CLI (manual testing only — `py` is the venv python on the droplet; use `py -3` on a Windows laptop):
     py scripts/post_action_items.py action-items <ticket_id> <items.json>   # dry-run
     py scripts/post_action_items.py action-items <ticket_id> <items.json> --send
-    py scripts/post_action_items.py ticket-closed <hubspot_ticket_id>          # dry-run
-    py scripts/post_action_items.py ticket-closed <hubspot_ticket_id> --send
 """
 from __future__ import annotations
 
@@ -276,21 +274,6 @@ def post_action_items(
     return _post(envelope, dry_run)
 
 
-def post_ticket_closed(hubspot_ticket_id: str, dry_run: bool) -> dict:
-    """POST the ticket_closed signal for one observed-closed ticket. Never raises out.
-
-    envelope shape:
-        {"type": "ticket_closed", "hubspot_ticket_id": "<numeric>"}
-
-    The OS route auto-resolves that ticket's open hubspot_action_item tasks (D-15).
-    """
-    envelope = {
-        "type": "ticket_closed",
-        "hubspot_ticket_id": str(hubspot_ticket_id),
-    }
-    return _post(envelope, dry_run)
-
-
 def _cli() -> int:
     argv = sys.argv[1:]
     send_flag = "--send" in argv
@@ -298,7 +281,7 @@ def _cli() -> int:
     dry_run = not send_flag
 
     if not pos:
-        _log("usage: post_action_items.py {action-items|ticket-closed} ... [--send]")
+        _log("usage: post_action_items.py action-items <ticket_id> [items.json] [--send]")
         return 2
 
     mode = pos[0]
@@ -315,13 +298,8 @@ def _cli() -> int:
             if stdin:
                 items = json.loads(stdin)
         result = post_action_items(ticket_id, items, dry_run)
-    elif mode == "ticket-closed":
-        if len(pos) < 2:
-            _log("usage: post_action_items.py ticket-closed <hubspot_ticket_id> [--send]")
-            return 2
-        result = post_ticket_closed(pos[1], dry_run)
     else:
-        _log(f"unknown mode '{mode}' — expected action-items|ticket-closed")
+        _log(f"unknown mode '{mode}' — expected action-items")
         return 2
 
     print(json.dumps(result, indent=2, default=str))
