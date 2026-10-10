@@ -545,6 +545,175 @@ def test_the_forwarder_retries_an_unconfirmed_finaliser_post_with_the_os_id_and_
     assert seen_of(world) == sorted([T1_KEY_A, T1_KEY_B]) and retry_of(world) == {}
 
 
+# ---------------------------------------- a retry is resent from its own pass (review WR-46)
+#
+# The queue keeps one record per pass of a ticket, oldest first, and a queue
+# record carries no pass id. A retry entry names the pass whose post is owed.
+# The forwarder used to attach that pass id to the FIRST record of the ticket
+# that held the action type: the stale text of an earlier pass went out under
+# the new pass id, the entry was dropped, and the current item was never sent.
+
+SECOND_SIGNAL = {"kind": "client_reply", "id": "6a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d", "at": "2026-10-09T09:15:00.250Z"}
+D1 = dict(ITEM_A, description="D1 (pass 1, stale)")
+D2 = dict(ITEM_A, description="D2 (pass 2, current)")
+D3 = dict(ITEM_A, description="D3 (pass 3)")
+
+
+def second_pass_entry() -> dict:
+    """Ticket 1 again, after a newer client message: the same ref, a new cycle key."""
+    entry = make_entry(0, payload_edit=lambda payload: payload.update(signal=copy.deepcopy(SECOND_SIGNAL)))
+    assert entry["cycle_key"] == SECOND_SIGNAL["id"] != osm.T1_SIGNAL_ID
+    return entry
+
+
+def two_passes_the_second_unconfirmed(world: OsWorld) -> tuple[dict, dict]:
+    """Pass 1 posts D1 and is confirmed. Pass 2 posts D2 and is NOT confirmed."""
+    first, second = make_entry(0), second_pass_entry()
+    assert first["ref"] == second["ref"] == osm.T1_HS_ID
+    finalize(world, [first], result_of(with_items(first, D1)))
+    world.ingest.script = [UNCONFIRMED]
+    finalize(world, [second], result_of(with_items(second, D2)), run_id=OTHER_RUN_ID)
+    assert [(post["pass_id"], post["items"]) for post in world.ingest.posts] == [
+        (osm.T1_SIGNAL_ID, [D1]),
+        (SECOND_SIGNAL["id"], [D2]),
+    ]
+    assert seen_of(world) == [T1_KEY_A]  # pass 1's delivery
+    assert retry_of(world) == {T1_KEY_A: {"os_ticket_id": osm.T1_OS_ID, "pass_id": SECOND_SIGNAL["id"]}}
+    return first, second
+
+
+def test_an_unconfirmed_second_pass_is_resent_from_its_own_queue_record_not_the_first_passes(
+    world: OsWorld,
+) -> None:
+    """The review's probe. Before the fix the forwarder made one post: D1, the
+    stale text, under pass 2's id; D2 was never sent."""
+    first, _second = two_passes_the_second_unconfirmed(world)
+    # what the agent queued: one record per pass, oldest first, keyed by the ref
+    queue = write_queue(
+        world,
+        {"ticket_id": first["ref"], "action_items": [dict(D1)]},
+        {"ticket_id": first["ref"], "action_items": [dict(D2)]},
+    )
+    run_forwarder(world, queue)
+
+    resent = world.ingest.posts[2:]
+    assert [(post["pass_id"], post["items"]) for post in resent] == [(SECOND_SIGNAL["id"], [D2])]
+    assert resent[0] == world.ingest.posts[1]  # the same envelope as the unconfirmed post
+    stale_under_the_new_pass = [
+        post for post in world.ingest.posts if post.get("pass_id") == SECOND_SIGNAL["id"] and D1 in post["items"]
+    ]
+    assert stale_under_the_new_pass == []
+    assert retry_of(world) == {} and seen_of(world) == [T1_KEY_A]
+
+    run_forwarder(world, queue)  # and nothing is left owed
+    assert len(world.ingest.posts) == 3
+
+
+def test_a_resend_that_fails_again_still_never_sends_the_earlier_passes_item(world: OsWorld) -> None:
+    first, _second = two_passes_the_second_unconfirmed(world)
+    queue = write_queue(
+        world,
+        {"ticket_id": first["ref"], "action_items": [dict(D1)]},
+        {"ticket_id": first["ref"], "action_items": [dict(D2)]},
+    )
+    world.ingest.script = [POST_FAILED]
+    run_forwarder(world, queue)
+
+    assert [post["items"] for post in world.ingest.posts[2:]] == [[D2]]
+    assert retry_of(world) == {T1_KEY_A: {"os_ticket_id": osm.T1_OS_ID, "pass_id": SECOND_SIGNAL["id"]}}
+    run_forwarder(world, queue)  # the next run: the same item, the same pass id, confirmed
+    assert [(post["pass_id"], post["items"]) for post in world.ingest.posts[2:]] == [
+        (SECOND_SIGNAL["id"], [D2]),
+        (SECOND_SIGNAL["id"], [D2]),
+    ]
+    assert retry_of(world) == {}
+
+
+def test_a_later_record_of_the_ticket_without_that_action_type_does_not_hide_the_owed_item(
+    world: OsWorld,
+) -> None:
+    first, _second = two_passes_the_second_unconfirmed(world)
+    fwd.mark_forwarded([T1_KEY_B], seen_path=world.seen_path)  # the third record's item is delivered already
+    queue = write_queue(
+        world,
+        {"ticket_id": first["ref"], "action_items": [dict(D1)]},
+        {"ticket_id": first["ref"], "action_items": [dict(D2)]},
+        {"ticket_id": first["ref"], "action_items": [dict(ITEM_B)]},
+        {"ticket_id": osm.T3_HS_ID, "action_items": [dict(D3)]},  # another ticket's record, later still
+    )
+    run_forwarder(world, queue)
+
+    resent = world.ingest.posts[2:]
+    assert [(post["ticket_id"], post.get("pass_id"), post["items"]) for post in resent] == [
+        (osm.T1_HS_ID, SECOND_SIGNAL["id"], [D2]),
+        (osm.T3_HS_ID, None, [D3]),  # no retry entry: exactly as before
+    ]
+
+
+def test_a_retry_entry_with_no_pass_id_is_matched_as_it_always_was(world: OsWorld) -> None:
+    """An entry that names no pass (the cycle key was not one the OS accepts)
+    keeps the earlier rule, unchanged by the fix: the first record of the
+    ticket that holds the action type is sent, with the OS ticket id and no
+    pass id, and its confirmation drops the entry."""
+    fwd.mark_forwarded([T1_KEY_A], seen_path=world.seen_path)
+    fwd.remember_retry({T1_KEY_A: {"os_ticket_id": osm.T1_OS_ID}}, seen_path=world.seen_path)
+    queue = write_queue(
+        world,
+        {"ticket_id": osm.T1_HS_ID, "action_items": [dict(D1)]},
+        {"ticket_id": osm.T1_HS_ID, "action_items": [dict(D2)]},
+    )
+    run_forwarder(world, queue)
+
+    assert [(post["os_ticket_id"], "pass_id" in post, post["items"]) for post in world.ingest.posts] == [
+        (osm.T1_OS_ID, False, [D1]),
+    ]
+    assert retry_of(world) == {}
+
+
+def test_a_confirmed_resend_does_not_drop_an_entry_a_newer_pass_wrote_meanwhile(world: OsWorld) -> None:
+    """The pass is part of a retry entry's identity. If, while the forwarder is
+    posting pass 2's item, another run records pass 3 as owed under the same
+    key, the confirmation of pass 2 must not erase pass 3's entry."""
+    first, _second = two_passes_the_second_unconfirmed(world)
+    queue = write_queue(
+        world,
+        {"ticket_id": first["ref"], "action_items": [dict(D1)]},
+        {"ticket_id": first["ref"], "action_items": [dict(D2)]},
+    )
+    third = {"os_ticket_id": osm.T1_OS_ID, "pass_id": "rerun:" + osm.RERUN_A}
+    world.ingest.before = lambda _envelope: fwd.remember_retry({T1_KEY_A: dict(third)}, seen_path=world.seen_path)
+    run_forwarder(world, queue)
+
+    assert world.ingest.posts[2]["pass_id"] == SECOND_SIGNAL["id"]
+    assert retry_of(world) == {T1_KEY_A: third}  # pass 3 is still owed
+
+
+def test_the_finaliser_drops_only_the_entry_of_the_pass_it_confirmed(world: OsWorld) -> None:
+    entry = make_entry(0)
+    newer = {"os_ticket_id": osm.T1_OS_ID, "pass_id": SECOND_SIGNAL["id"]}
+    # at the moment of pass 1's post another run records a newer pass under the same key
+    world.ingest.before = lambda _envelope: fwd.remember_retry({T1_KEY_A: dict(newer)}, seen_path=world.seen_path)
+    summary = finalize(world, [entry], result_of(with_items(entry, D1)))
+
+    assert summary.tickets[0]["action_items"] == "confirmed"
+    assert retry_of(world) == {T1_KEY_A: newer}
+
+
+def test_forget_retry_with_passes_drops_an_entry_only_when_it_still_names_that_pass(tmp_path: Path) -> None:
+    seen = tmp_path / "seen.json"
+    held = {
+        "1:a": {"os_ticket_id": osm.T1_OS_ID, "pass_id": "p1"},
+        "2:b": {"os_ticket_id": osm.T2_OS_ID, "pass_id": "p9"},
+        "3:c": {"os_ticket_id": osm.T3_OS_ID},  # held with no pass id
+    }
+    fwd.remember_retry(held, seen_path=seen)
+    assert fwd.forget_retry(["1:a", "2:b", "3:c"], seen_path=seen, passes={"1:a": "p1", "2:b": "p2", "3:c": None})
+    assert fwd.load_retry(seen) == {"2:b": held["2:b"]}  # p9 is not the pass that was confirmed
+    # with no `passes` the keys are dropped whatever they name, as before
+    assert fwd.forget_retry(["2:b"], seen_path=seen) is True
+    assert fwd.load_retry(seen) == {}
+
+
 def test_the_forwarder_forwards_nothing_the_finaliser_confirmed(
     world: OsWorld, capfd: pytest.CaptureFixture
 ) -> None:
