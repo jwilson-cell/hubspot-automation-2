@@ -675,6 +675,21 @@ def _read_result(path: Any) -> Optional[dict]:
     return loaded if isinstance(loaded, dict) else None
 
 
+def result_ref(item: Any) -> Optional[str]:
+    """The `ref` of one result entry, as the text a bundle ref is compared
+    with, or None when the entry names no ticket.
+
+    A bundle ref is text. A HubSpot id is all digits, and an agent writing JSON
+    by hand can emit it as a NUMBER: a whole number is therefore taken by its
+    canonical digits (`9300000000001` -> "9300000000001"). Nothing looser: a
+    float, a boolean, a container and text that merely resembles a ref (padded,
+    zero-led) match nothing, exactly as before."""
+    ref = item.get("ref") if isinstance(item, dict) else None
+    if isinstance(ref, int) and not isinstance(ref, bool):
+        return str(ref)
+    return ref if isinstance(ref, str) else None
+
+
 def reconcile(entries: list, result: Any) -> tuple[list, dict]:
     """One record per bundle entry, in bundle order, and the counts to note.
 
@@ -683,13 +698,14 @@ def reconcile(entries: list, result: Any) -> tuple[list, dict]:
     with the agent's code when it is one of AGENT_TICKET_CODES, else `other`.
     A result entry naming a ref the bundle does not hold is ignored (the agent
     cannot add a ticket), and a second entry for one ref is ignored; both are
-    counted."""
+    counted. An entry's ref is read by `result_ref`: text, or a whole number's
+    digits."""
     by_ref: dict[str, dict] = {}
     duplicates = 0
     items = result.get("tickets") if isinstance(result, dict) else None
     for item in items if isinstance(items, list) else []:
-        ref = item.get("ref") if isinstance(item, dict) else None
-        if not isinstance(ref, str):
+        ref = result_ref(item)
+        if ref is None:
             continue
         if ref in by_ref:
             duplicates += 1

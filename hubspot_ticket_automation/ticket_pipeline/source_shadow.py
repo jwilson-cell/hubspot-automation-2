@@ -1231,8 +1231,8 @@ def _finalise(
         return
     named: set = set()
     for item in _result_tickets(ctx.result_path):
-        hubspot_id = item.get("ref") if isinstance(item, dict) else None
-        if not isinstance(hubspot_id, str) or hubspot_id in named:
+        hubspot_id = os_pass.result_ref(item)  # text, or a whole number's digits
+        if hubspot_id is None or hubspot_id in named:
             continue
         named.add(hubspot_id)
         known = resolved.get(hubspot_id)
