@@ -31,6 +31,15 @@ the six failure codes, the two text limits, the prompt version and the model
 are named constants of `os_pass` that equal the fixture's values, and the
 request builder reproduces both fixture bodies key for key.
 
+A sixth is the SOURCE-shadow observation (the OS's plan 93-07), the body the
+cron posts once per run while the ticket source setting is `shadow`:
+
+    tickets-api-source-shadow.v1.json    POST /api/tickets/source-shadow
+
+It is pinned the same way, and the last part ties the cron's observation
+builder (`source_shadow.build_observation`, plan 18) to it: built from the
+fixture's own inputs, the body equals the fixture key for key.
+
 No network, no database, no model call.
 """
 from __future__ import annotations
@@ -38,12 +47,13 @@ from __future__ import annotations
 import hashlib
 import inspect
 import json
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
 import yaml
 
-from ticket_pipeline import llm, os_bundle, os_pass
+from ticket_pipeline import llm, os_bundle, os_pass, source_shadow
 
 PACKAGE_ROOT = Path(__file__).resolve().parent.parent  # hubspot_ticket_automation/
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
@@ -54,6 +64,7 @@ TICKET_FIXTURE = "tickets-api-ticket.v1.json"
 SLUGS_FIXTURE = "ticket-category-slugs.v1.json"
 CLASSIFICATION_FIXTURE = "tickets-api-classification.v1.json"
 ENVELOPE_FIXTURE = "action-items-envelope.v1.json"
+SOURCE_SHADOW_FIXTURE = "tickets-api-source-shadow.v1.json"
 
 # The literals of 93-04-SUMMARY ("Fixtures"). Pack'N OS asserts the same three in
 # tests/unit/tickets/cron-contract.test.ts.
@@ -65,6 +76,8 @@ PINNED_CHECKSUMS = {
     CLASSIFICATION_FIXTURE: "f585b19aef732d6e3bb07d93383e3b5dcc395948e242671cd96b341edbdf2aa1",
     # 93-06-SUMMARY ("Fixture"): 2895 bytes. The action-item envelope, with pass_id.
     ENVELOPE_FIXTURE: "3a69a7248dcc20e4695bc94900fb96a1621712896d2c43a4cf124f4f84677872",
+    # 93-07-SUMMARY ("Fixture"): 1637 bytes. One source-shadow observation body.
+    SOURCE_SHADOW_FIXTURE: "aaae17278097985cb9b5d98479e0df402b03d2229b937b58be6e23611bdb3abf",
 }
 
 # The four top-level keys of config/categories.yaml that are not categories.
@@ -371,3 +384,142 @@ def test_the_failed_builder_reproduces_the_fixture_body_key_for_key() -> None:
     built = os_pass.build_classification_payload(_fixture_entry(), ticket_result, FIXTURE_RUN_ID, "os")
     assert built == expected
     assert list(built) == list(expected)
+
+
+# ------------------------------------------------------- the source-shadow observation
+
+# The fixture's start instant as a real, timezone-aware datetime with
+# microseconds at a non-UTC offset (checker WIRE-W3): 10:07:03.120456 -04:00.
+OBSERVATION_STARTED_AT = datetime(2026, 10, 9, 10, 7, 3, 120456, tzinfo=timezone(timedelta(hours=-4)))
+OBSERVATION_SETTINGS = {"per_run_cap": 25, "active_stages": ["1", "3"]}
+
+# The six fields of the observation that may be null, as (side, list, key).
+OBSERVATION_NULLABLE = [
+    ("hubspot", "matched", "stage"),
+    ("hubspot", "selected", "os_ticket_id"),
+    ("hubspot", "selected", "signal"),
+    ("hubspot", "selected", "category"),
+    ("os", "selected", "hubspot_ticket_id"),
+    ("os", "selected", "category"),
+]
+
+
+def _observation_sides() -> tuple[dict, dict]:
+    body = load_fixture(SOURCE_SHADOW_FIXTURE)
+    return body["hubspot"], body["os"]
+
+
+def test_the_source_shadow_fixture_is_one_observation_of_1637_bytes() -> None:
+    body = load_fixture(SOURCE_SHADOW_FIXTURE)
+    assert len(read_fixture_text(SOURCE_SHADOW_FIXTURE).replace(CR + LF, LF).encode("utf-8")) == 1637
+    assert list(body) == [
+        "contract_version",
+        "run_id",
+        "started_at",
+        "per_run_cap",
+        "active_stages",
+        "hubspot",
+        "os",
+    ]
+    assert list(body["hubspot"]) == ["page_full", "matched", "selected"]
+    assert list(body["os"]) == ["selected"]
+    assert [list(row) for row in body["hubspot"]["matched"]] == [["hubspot_ticket_id", "stage", "deduped"]] * 2
+    assert [list(row) for row in body["hubspot"]["selected"]] == [
+        ["hubspot_ticket_id", "os_ticket_id", "signal", "category"]
+    ] * 2
+    assert [list(row) for row in body["os"]["selected"]] == [
+        ["os_ticket_id", "hubspot_ticket_id", "signal", "category"]
+    ] * 2
+
+
+def test_the_source_shadow_fixture_is_one_both_one_hubspot_only_and_one_os_only_ticket() -> None:
+    body = load_fixture(SOURCE_SHADOW_FIXTURE)
+    listed = load_fixture(LIST_FIXTURE)["tickets"]
+    both, os_only = listed[0], listed[1]
+    hubspot_selected, os_selected = body["hubspot"]["selected"], body["os"]["selected"]
+    assert hubspot_selected[0] == {
+        "hubspot_ticket_id": both["hubspot_ticket_id"],
+        "os_ticket_id": both["id"],
+        "signal": both["signal"],
+        "category": "wismo_tracking",
+    }
+    assert os_selected[0]["os_ticket_id"] == both["id"] and os_selected[0]["signal"] == both["signal"]
+    # the HubSpot-only ticket is one the list fixture does not hold
+    assert hubspot_selected[1]["hubspot_ticket_id"] not in {ticket["hubspot_ticket_id"] for ticket in listed}
+    assert os_selected[1]["os_ticket_id"] == os_only["id"] and os_only["hubspot_ticket_id"] is None
+    assert os_selected[1]["signal"] == os_only["signal"]
+
+
+def test_each_of_the_six_nullable_fields_is_null_exactly_once_in_the_fixture() -> None:
+    body = load_fixture(SOURCE_SHADOW_FIXTURE)
+    for side, name, key in OBSERVATION_NULLABLE:
+        values = [row[key] for row in body[side][name]]
+        assert values.count(None) == 1, (side, name, key)
+    assert read_fixture_text(SOURCE_SHADOW_FIXTURE).count("null") == 6
+
+
+def test_every_category_of_the_observation_fixture_is_a_contract_slug() -> None:
+    body = load_fixture(SOURCE_SHADOW_FIXTURE)
+    slugs = set(load_fixture(SLUGS_FIXTURE)["slugs"])
+    named = [row["category"] for side in ("hubspot", "os") for row in body[side]["selected"]]
+    assert {category for category in named if category is not None} <= slugs
+
+
+def test_the_observation_builder_takes_the_run_the_settings_and_the_two_sides() -> None:
+    assert list(inspect.signature(source_shadow.build_observation).parameters) == [
+        "run_id",
+        "started_at",
+        "settings",
+        "hubspot_side",
+        "os_side",
+    ]
+
+
+def test_the_observation_builder_reproduces_the_fixture_body_key_for_key() -> None:
+    """The cron's builder, given the fixture's inputs (the run's id, its start
+    as a real instant, the two settings and the two sides), writes the body the
+    OS pins: the same values, the same keys in the same order at every level,
+    and the same bytes when serialised the fixture's way."""
+    expected = load_fixture(SOURCE_SHADOW_FIXTURE)
+    hubspot_side, os_side = _observation_sides()
+    built = source_shadow.build_observation(
+        expected["run_id"], OBSERVATION_STARTED_AT, OBSERVATION_SETTINGS, hubspot_side, os_side
+    )
+    assert built == expected
+    assert list(built) == list(expected)
+    assert list(built["hubspot"]) == list(expected["hubspot"])
+    assert list(built["os"]) == list(expected["os"])
+    for side, name in (("hubspot", "matched"), ("hubspot", "selected"), ("os", "selected")):
+        assert [list(row) for row in built[side][name]] == [list(row) for row in expected[side][name]]
+    assert list(built["hubspot"]["selected"][0]["signal"]) == ["kind", "id", "at"]
+    text = read_fixture_text(SOURCE_SHADOW_FIXTURE).replace(CR + LF, LF)
+    rebuilt = json.dumps(built, indent=2, ensure_ascii=True) + LF
+    assert rebuilt == text
+    assert fixture_checksum(rebuilt) == PINNED_CHECKSUMS[SOURCE_SHADOW_FIXTURE]
+
+
+def test_the_observations_start_is_the_fixtures_literal_from_a_real_instant() -> None:
+    expected = load_fixture(SOURCE_SHADOW_FIXTURE)
+    assert OBSERVATION_STARTED_AT.utcoffset() == timedelta(hours=-4)
+    assert OBSERVATION_STARTED_AT.microsecond == 120456
+    hubspot_side, os_side = _observation_sides()
+    built = source_shadow.build_observation(
+        expected["run_id"], OBSERVATION_STARTED_AT, OBSERVATION_SETTINGS, hubspot_side, os_side
+    )
+    assert built["started_at"] == expected["started_at"] == "2026-10-09T14:07:03.120Z"
+
+
+def test_the_observations_limits_and_categories_are_the_contracts() -> None:
+    expected = load_fixture(SOURCE_SHADOW_FIXTURE)
+    assert source_shadow.OBSERVATION_CONTRACT_VERSION == expected["contract_version"] == "1"
+    assert source_shadow.OBSERVATION_MAX_TICKETS_PER_LIST == 200
+    assert source_shadow.OBSERVATION_MAX_ACTIVE_STAGES == 50
+    assert source_shadow.OBSERVATION_MAX_PER_RUN_CAP == 1000
+    # the builder accepts exactly the write-back's slug list, which is the contract's
+    for slug in load_fixture(SLUGS_FIXTURE)["slugs"]:
+        hubspot_side, os_side = _observation_sides()
+        hubspot_side["selected"][0]["category"] = slug
+        built = source_shadow.build_observation(
+            expected["run_id"], OBSERVATION_STARTED_AT, OBSERVATION_SETTINGS, hubspot_side, os_side
+        )
+        assert built["hubspot"]["selected"][0]["category"] == slug
