@@ -1117,6 +1117,47 @@ def test_a_scratch_root_that_is_a_symlink_is_not_swept(world: World, tmp_path: P
     assert victim.is_dir()
 
 
+def test_the_sweep_skips_an_entry_that_reports_itself_a_link_or_a_junction(
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The two symlink tests above need an account that may create a link (they
+    skip on a Windows development box). This one runs everywhere: the directory
+    listing is replaced by entries that SAY they are a link or a junction, over
+    directories that are really there and really stale. None is removed."""
+    as_link, as_junction, plain = (_old_run_dir(world, 48) for _ in range(3))
+
+    class Entry:
+        def __init__(self, path: Path, link: bool = False, junction: bool = False) -> None:
+            self.name, self.path, self._link, self._junction = path.name, str(path), link, junction
+
+        def is_symlink(self) -> bool:
+            return self._link
+
+        def is_junction(self) -> bool:
+            return self._junction
+
+        def is_dir(self, follow_symlinks: bool = True) -> bool:
+            assert follow_symlinks is False  # the sweep never asks through a link
+            return True
+
+        def stat(self, follow_symlinks: bool = True) -> Any:
+            assert follow_symlinks is False
+            return os.stat(self.path)
+
+    class Listing(list):
+        def __enter__(self) -> "Listing":
+            return self
+
+        def __exit__(self, *_exc: Any) -> bool:
+            return False
+
+    listing = Listing([Entry(as_link, link=True), Entry(as_junction, junction=True), Entry(plain)])
+    monkeypatch.setattr(os, "scandir", lambda _path: listing)
+
+    assert rt.sweep_stale_scratch(world.root, RUN_STARTED) == 1
+    assert as_link.is_dir() and as_junction.is_dir() and not plain.exists()
+
+
 def test_the_sweep_is_bounded_per_run(world: World) -> None:
     for _ in range(rt.SCRATCH_SWEEP_LIMIT + 3):
         _old_run_dir(world, 48)

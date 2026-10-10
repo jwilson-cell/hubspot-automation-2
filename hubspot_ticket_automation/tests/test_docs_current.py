@@ -457,6 +457,17 @@ def test_the_readme_names_the_runtime_state_files_and_git_ignores_them() -> None
     assert len(ignored.stdout.split()) == 4
 
 
+def test_the_readme_states_the_scratch_directorys_modes_and_the_sweep_as_the_code_has_them() -> None:
+    """Review WR-50. The numbers come from the code, so the doc cannot drift."""
+    section = _phase_93()
+    row = next(line for line in section.split("\n") if line.startswith("| `outputs/runs/os/<run id>/`"))
+    assert f"directory mode {run_types.SCRATCH_DIR_MODE:o}" in row
+    assert f"created with mode {run_types.SCRATCH_FILE_MODE:o}" in row
+    assert (run_types.SCRATCH_DIR_MODE, run_types.SCRATCH_FILE_MODE) == (0o700, 0o600)
+    assert "more than a day old" in row and run_tickets.SCRATCH_MAX_AGE_S == 24 * 60 * 60
+    assert "on every way out the process controls" in row
+
+
 def test_the_readme_names_both_grants_and_points_to_the_checks() -> None:
     section = _section(_phase_93(), "### Database grants")
     assert "`packn_os_existing_automation`" in section

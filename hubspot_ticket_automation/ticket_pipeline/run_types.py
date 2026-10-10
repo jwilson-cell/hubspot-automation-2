@@ -21,6 +21,7 @@ This module imports the standard library only, and nothing of the project.
 """
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -51,6 +52,76 @@ RUN_ENV_NAMES = (RUN_ID_ENV, SOURCE_MODE_ENV, RESULT_PATH_ENV, RUN_CONTEXT_ENV)
 SCRATCH_PARTS = ("outputs", "runs", "os")
 RESULT_FILE_NAME = "result.json"
 CONTEXT_FILE_NAME = "context.json"
+
+# It holds ticket text (the bundle: full threads, names and addresses; the
+# agent's result: draft bodies), so it is the owner's alone from the moment it
+# exists. The directory is created with its mode, and each file code writes
+# into it is created with its mode: never made wider and narrowed afterwards.
+# The agent's own result file is created by the agent, with the agent's mode;
+# what keeps it private is the directory, which no other account can enter.
+# A platform without modes (a Windows development box) ignores both values.
+SCRATCH_DIR_MODE = 0o700
+SCRATCH_FILE_MODE = 0o600
+
+
+def make_scratch_dir(scratch: Path) -> None:
+    """Create one run's scratch directory, owner-only, in one step.
+
+    The mode is given to the creating call, so the directory never exists with
+    a wider one. Its parents are created as needed, with the default mode: they
+    hold directory names only.
+
+    A directory that is ALREADY there raises FileExistsError. A run id is new,
+    so such a directory was not made by this run: neither its mode nor what is
+    in it can be vouched for, and the run does not adopt it."""
+    scratch = Path(scratch)
+    scratch.parent.mkdir(parents=True, exist_ok=True)
+    os.mkdir(scratch, SCRATCH_DIR_MODE)
+
+
+def ensure_scratch_dir(directory: Path) -> None:
+    """`directory`, created owner-only when it is not there yet. For a writer
+    that may be called outside a run (the orchestrator has already made the
+    directory for every real run, strictly, with `make_scratch_dir`)."""
+    directory = Path(directory)
+    if directory.is_dir():
+        return
+    directory.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        os.mkdir(directory, SCRATCH_DIR_MODE)
+    except FileExistsError:
+        pass
+
+
+def write_scratch_file(path: Path, data: bytes) -> Path:
+    """Write `data` to `path`, owner-only from its first byte, and return the path.
+
+    The bytes go to `<name>.partial` beside the target, opened with O_CREAT and
+    O_EXCL and SCRATCH_FILE_MODE (a NEW file with that mode: never an existing
+    file or link, and never a default mode narrowed after the write), and the
+    partial file is then renamed over the target, so a reader sees the old file
+    or the new one and never half of either. A partial file left by a write
+    that died is removed first. If anything fails, no partial file is left and
+    the error is raised."""
+    target = Path(path)
+    partial = target.with_name(target.name + ".partial")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        handle = os.open(partial, flags, SCRATCH_FILE_MODE)
+    except FileExistsError:
+        os.unlink(partial)  # the link or file itself, never what a link points at
+        handle = os.open(partial, flags, SCRATCH_FILE_MODE)
+    try:
+        with os.fdopen(handle, "wb") as out:
+            out.write(data)
+        os.replace(partial, target)
+    except BaseException:
+        try:
+            os.unlink(partial)
+        except OSError:
+            pass
+        raise
+    return target
 
 
 @dataclass(frozen=True)

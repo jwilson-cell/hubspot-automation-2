@@ -636,8 +636,8 @@ def _write_run_context(ctx: RunContext, entries: list) -> None:
             "signal_at": signal.get("at"),
             "signal_id": signal.get("id"),
         }
-    ctx.context_path.parent.mkdir(parents=True, exist_ok=True)
-    ctx.context_path.write_text(json.dumps(context, ensure_ascii=False), encoding="utf-8")
+    run_types.ensure_scratch_dir(ctx.context_path.parent)
+    run_types.write_scratch_file(ctx.context_path, json.dumps(context, ensure_ascii=False).encode("utf-8"))
 
 
 # ===========================================================================

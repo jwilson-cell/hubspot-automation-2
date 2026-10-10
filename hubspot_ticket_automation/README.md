@@ -268,7 +268,7 @@ Both skills begin with a source guard, `py -m ticket_pipeline.source --require <
 | `config/.secrets/tickets_api_secret.txt` | The shared secret that signs the automation's requests to the Pack'N OS tickets routes. Read only by `packn_os_hubspot_client/tickets_api.py`. The owner provisions it on the droplet; it is at least 32 characters, never committed and never pasted into a chat. |
 | `config/.action_items_forwarded.json` | The action-item forwarder's seen-set. Runtime state of the droplet, git-ignored. |
 | `config/.action_items_retry.json` | The ids the forwarder needs to resend an unconfirmed action-item post. Runtime state of the droplet, git-ignored. |
-| `outputs/runs/os/<run id>/` | One run's scratch directory (bundle, run context, result file). It holds ticket text and is removed at the end of the run. Git-ignored. |
+| `outputs/runs/os/<run id>/` | One run's scratch directory (bundle, run context, result file). It holds ticket text. It is created for the owner only (directory mode 700; the files code writes there are created with mode 600) and is removed at the end of the run, on every way out the process controls. A run that is killed outright cannot remove its own: each run first removes any run directory there that is more than a day old. Git-ignored. |
 | `outputs/runs/source_shadow_seen.json` | The `shadow` comparison's cache of categories it has already worked out. Ids and category slugs only. Git-ignored. |
 | `config/state.json`, `config/pending_actions.json` | Tracked in git AND rewritten on the droplet by every run. See the pull procedure below. |
 

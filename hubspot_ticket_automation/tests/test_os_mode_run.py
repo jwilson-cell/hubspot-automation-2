@@ -1875,7 +1875,14 @@ def test_the_bundle_is_created_owner_only_and_never_narrowed_afterwards(
 
     chmods: list[str] = []
     monkeypatch.setattr(os, "open", spy_open)
-    monkeypatch.setattr(os, "chmod", lambda path, *_a, **_k: chmods.append(Path(path).name))
+    real_chmod = os.chmod
+
+    def spy_chmod(path: Any, *args: Any, **kwargs: Any) -> None:
+        if world.scratch_root in Path(path).parents:  # a mode change of anything in a scratch directory
+            chmods.append(Path(path).name)
+        real_chmod(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "chmod", spy_chmod)
     seen: dict[str, Any] = {}
     real_agent = world.agent
 

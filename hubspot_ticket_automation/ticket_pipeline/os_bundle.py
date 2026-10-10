@@ -78,7 +78,6 @@ NON_CATEGORY_KEYS deliberately.
 from __future__ import annotations
 
 import json
-import os
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -86,7 +85,7 @@ from typing import Any, Optional
 from urllib.parse import quote
 
 from . import hubspot_api as hs
-from . import hydrate
+from . import hydrate, run_types
 
 # The top-level keys of config/categories.yaml that are not categories.
 NON_CATEGORY_KEYS = (
@@ -490,10 +489,12 @@ def write_bundle(
 
         {"run_id": ..., "mode": "os", "generated_at": <ISO, ms, Z>, "tickets": entries}
 
-    UTF-8 JSON with non-ASCII text kept as it is. The directory is created. The
-    bundle is serialised before anything is created, written beside the target
-    and moved over it, so a reader never sees half a file. It holds ticket text:
-    the file is made owner-only where the platform allows."""
+    UTF-8 JSON with non-ASCII text kept as it is. The directory is created
+    (owner-only) when it is not there. The bundle is serialised before anything
+    is created, written beside the target and moved over it, so a reader never
+    sees half a file. It holds ticket text: the file is CREATED owner-only
+    (`run_types.write_scratch_file`), never written with a default mode and
+    narrowed afterwards."""
     if not isinstance(entries, list):
         raise TypeError("a bundle's entries are a list")
     bundle = {
@@ -506,12 +507,5 @@ def write_bundle(
     # than failing the whole run on one ticket's text.
     data = json.dumps(bundle, ensure_ascii=False, indent=2).encode("utf-8", errors="replace")
     target = Path(path)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    partial = target.with_name(target.name + ".partial")
-    partial.write_bytes(data)
-    try:
-        os.chmod(partial, 0o600)
-    except OSError:
-        pass
-    os.replace(partial, target)
-    return target
+    run_types.ensure_scratch_dir(target.parent)
+    return run_types.write_scratch_file(target, data)

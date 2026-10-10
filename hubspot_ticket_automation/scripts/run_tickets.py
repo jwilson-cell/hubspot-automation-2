@@ -23,6 +23,17 @@ come through it, and it does four things in a fixed order:
     4. writes EXACTLY ONE run record, whatever happened to the agent: it never
        started, it died, it found nothing, it finished.
 
+THE SCRATCH DIRECTORY HOLDS TICKET TEXT
+---------------------------------------
+outputs/runs/os/<run id>/ holds the bundle and the agent's result. It is
+created owner-only, in one step, before anything is written into it, and the
+files code writes there are created owner-only (ticket_pipeline/run_types.py).
+It is removed before the record is written, and again, as a backstop, on every
+way out of run() this process controls: a return, an exception, SystemExit,
+KeyboardInterrupt. A process that is KILLED (SIGKILL, a reboot, an OOM kill)
+runs no code, so each run starts by sweeping run directories older than a day
+out of that one directory (sweep_stale_scratch).
+
 The agent no longer writes the record. It writes a result file at the path in
 PACKN_RESULT_PATH and this script turns that file into the record.
 
@@ -121,6 +132,11 @@ SUMMARY_MAX_CHARS = 500
 QUOTE_WINDOW = 24
 
 ROLLBACK_ENTRIES_UNREADABLE = "rollback_entries_unreadable"
+
+# The sweep of leftover scratch directories at the start of a run.
+SCRATCH_MAX_AGE_S = 24 * 60 * 60  # a run directory last changed longer ago than this is a dead run's
+SCRATCH_SWEEP_LIMIT = 20  # directories removed per run; the next runs take the rest
+SCRATCH_SWEEP_SCAN = 500  # directory entries looked at per run
 SUMMARY_ROUTINE_PAUSED = "routine_paused"
 
 _RE_EXPORTED = ("RunContext", "RunOutcome", "Deps")
@@ -422,8 +438,11 @@ def build_run_context(ctx: Any, deps: Any, reruns: Any) -> tuple[dict, Optional[
 
 
 def write_run_context(ctx: Any, context: dict) -> None:
-    ctx.context_path.parent.mkdir(parents=True, exist_ok=True)
-    ctx.context_path.write_text(json.dumps(context, ensure_ascii=False), encoding="utf-8")
+    """The run-context file, created owner-only like every file code writes
+    into the scratch directory."""
+    types = _types()
+    types.ensure_scratch_dir(ctx.context_path.parent)
+    types.write_scratch_file(ctx.context_path, json.dumps(context, ensure_ascii=False).encode("utf-8"))
 
 
 # ===========================================================================
@@ -624,7 +643,8 @@ def _run_context_for(deps: Any, run_id: str, mode: str, started_at: Any, manual_
 
 
 def _remove_scratch(scratch: Optional[Path]) -> Optional[str]:
-    """Remove the run's scratch directory. Returns a note code when it is still there."""
+    """Remove the run's scratch directory. Returns a note code when it is still
+    there. Safe to call again: a directory that is gone is nothing to do."""
     if scratch is None:
         return None
     failure: Optional[str] = None
@@ -637,6 +657,72 @@ def _remove_scratch(scratch: Optional[Path]) -> Optional[str]:
         return None
     _log(f"scratch_not_removed:{failure}")
     return "scratch_not_removed"
+
+
+def sweep_stale_scratch(root: Any, now: Any, limit: int = SCRATCH_SWEEP_LIMIT) -> int:
+    """Remove the scratch directories of runs that died without removing their
+    own: a run is KILLED (SIGKILL, a reboot, an OOM kill) with no chance to run
+    any code, and its directory holds ticket text. Returns how many were
+    removed. Never raises.
+
+    Narrow and bounded, on purpose:
+
+        where      only <root>/outputs/runs/os/, and only its DIRECT entries.
+                   Each path removed is built from that directory and an
+                   entry's own name, so it cannot lie outside it.
+        what       only a real directory whose name is a run id (a lower-case
+                   uuid4). A file, a directory of another name, a symbolic link
+                   and a junction are left alone. If the scratch root itself is
+                   a link, nothing is swept.
+        when       only when it was last changed more than SCRATCH_MAX_AGE_S
+                   before `now` (the run's start): a younger one may be a run
+                   that is still going.
+        how many   at most `limit` per run, after looking at no more than
+                   SCRATCH_SWEEP_SCAN entries.
+        how        shutil.rmtree, which removes a link found INSIDE a directory
+                   as a link and never enters it.
+
+    A directory that cannot be removed is one log line (a class name) and the
+    sweep goes on. Nothing here reaches the run record: a sweep is housekeeping,
+    not something a run did with a ticket."""
+    removed = 0
+    failure: Optional[str] = None
+    try:
+        base = Path(root).joinpath(*_types().SCRATCH_PARTS)
+        if base.is_symlink() or not base.is_dir():
+            return 0
+        cutoff = now.timestamp() - SCRATCH_MAX_AGE_S
+        stale: list[str] = []
+        with os.scandir(base) as entries:
+            for seen, entry in enumerate(entries):
+                if seen >= SCRATCH_SWEEP_SCAN or len(stale) >= limit:
+                    break
+                if not _RUN_ID_RE.match(entry.name):
+                    continue
+                is_junction = getattr(entry, "is_junction", None)
+                if entry.is_symlink() or (callable(is_junction) and is_junction()):
+                    continue
+                if not entry.is_dir(follow_symlinks=False):
+                    continue
+                if entry.stat(follow_symlinks=False).st_mtime > cutoff:
+                    continue
+                stale.append(entry.name)
+        for name in stale:
+            problem: Optional[str] = None
+            try:
+                shutil.rmtree(base / name)
+                removed += 1
+            except Exception as e:  # noqa: BLE001 — one directory never stops the next
+                problem = type(e).__name__
+            if problem is not None:
+                _log(f"stale_scratch_not_removed:{problem} run={name}")
+    except Exception as e:  # noqa: BLE001 — housekeeping never fails a run
+        failure = type(e).__name__
+    if failure is not None:
+        _log(f"stale_scratch_sweep_failed:{failure}")
+    if removed:
+        _log(f"stale_scratch_removed={removed}")
+    return removed
 
 
 def _link_manual_run(deps: Any, manual_request_id: Any, run_id: Optional[str]) -> None:
@@ -660,7 +746,24 @@ def run(deps: Any, manual_request_id: Optional[str] = None) -> int:
     Whatever is raised between the first line and the record — by the mode
     read, by the runner, by anything a runner calls — becomes a `failure`
     outcome that carries the exception's class name and nothing else of it.
+
+    The scratch directory is removed by `_run` itself, before the record, so a
+    failure to remove it reaches the record. The `finally` here is the
+    backstop for every other way out: whatever leaves `_run` (a return, an
+    exception raised where no handler is, SystemExit, KeyboardInterrupt), the
+    directory this run made is removed, or removal is tried once more.
     """
+    made: list[Path] = []
+    try:
+        return _run(deps, manual_request_id, made)
+    finally:
+        for scratch in made:
+            _remove_scratch(scratch)
+
+
+def _run(deps: Any, manual_request_id: Optional[str], made: list) -> int:
+    """`run`, without its backstop. `made` gains the scratch directory the
+    moment this run has created it."""
     types = _types()
     started_at: Any = None
     run_id: Optional[str] = None
@@ -678,14 +781,19 @@ def run(deps: Any, manual_request_id: Optional[str] = None) -> int:
             deps.report_routine_schedule(ROUTINE, CRON_MARKER)
         except Exception as e:  # noqa: BLE001 — fire and forget
             _log(f"schedule_report_failed:{type(e).__name__}")
+        # Leftovers of runs that were killed: before this run makes its own.
+        sweep_stale_scratch(deps.root, started_at)
         mode, outcome = _establish_mode(deps)
         runner: Any = None
         if outcome is None:
             runner, outcome = _runner_for(mode)
         if outcome is None:
             ctx = _run_context_for(deps, run_id, mode, started_at, manual_request_id)
+            # Owner-only, in one step, before anything is written into it. Only
+            # a directory this run created is ever removed by it.
+            types.make_scratch_dir(ctx.scratch_dir)
             scratch = ctx.scratch_dir
-            scratch.mkdir(parents=True, exist_ok=True)
+            made.append(scratch)
             outcome = runner(ctx, deps)
     except BaseException as e:  # noqa: BLE001 — a run always reaches its record
         crash = type(e).__name__
