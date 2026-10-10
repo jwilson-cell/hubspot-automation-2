@@ -467,6 +467,16 @@ def launch_and_collect(
         a complete result                           the result's own status and counts
 
     `notes` are codes the caller wants on the record's summary.
+
+    WHY "exit 0, no result file" IS A FAILURE. Deliberate (review WR-51), in
+    every mode and whatever the pre-gate's reason was. Each skill ends every
+    path with a result file, a zero-ticket run included (`status` success,
+    both counts 0, no ticket): that file is what makes an idle tick on the
+    pre-gate's fail-open branch a normal `success` record. A clean exit
+    WITHOUT the file therefore means the agent stopped before its last step:
+    the source guard stopped it, the model call failed, the CLI returned
+    early. It is never read as an idle success, because that would put a green
+    record on a dead agent: the silence this record exists to end.
     """
     types = _types()
     launch_failure: Optional[str] = None

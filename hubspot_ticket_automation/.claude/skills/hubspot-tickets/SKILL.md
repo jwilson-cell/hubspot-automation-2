@@ -69,6 +69,12 @@ itself, from the result file you write in Step 4.5. Under the wrapper this
 overrides every other instruction in this file about a run record: skip Steps
 0a and 0b, and never call `client.write_run_record`.
 
+Every run under the wrapper ends with that result file,
+a run that finds no ticket included:
+it says so with `status` `success`, both counts 0 and an empty `tickets` list.
+A run that exits without the file is recorded as a failure
+(`agent_exited_abnormally`), however cleanly it exited.
+
 ## HubSpot tool names on the droplet
 
 This file names HubSpot tools with the prefix `mcp__claude_ai_HubSpot__*`, the
@@ -153,8 +159,9 @@ install + env-var + Postgres GRANT setup.
 >   Steps 0a and 0b exactly as written below.
 >
 > In both cases still run the rerun-queue poll and Step 1 exactly as written
-> (the double-check is cheap); a zero-ticket result here remains a normal
-> clean exit.
+> (the double-check is cheap); a zero-ticket result here is still a normal run:
+> under the wrapper it ends with the result file of Step 4.5, like every other
+> run, and without that file the run is recorded as a failure.
 
 ### Step 0a: Report current crontab schedule to Pack'N OS
 
@@ -278,7 +285,7 @@ Then call `mcp__claude_ai_HubSpot__search_crm_objects`:
 - limit: `per_run_cap`
 - sorted by `hs_lastmodifieddate` ASCENDING (process oldest-unreplied first)
 
-If zero tickets, write a short run log saying "no new tickets" and exit cleanly.
+If zero tickets (and no rerun was processed above), write a short run log saying "no new tickets", then go to Step 4.5: under the wrapper write the result file with `status` `success`, both counts 0, no `error_summary` and an empty `tickets` list; on a hand-run write the run record with the same status and counts. Then Step 5. Do not exit before Step 4.5: under the wrapper a run that ends without its result file is recorded as a failure, even when there was nothing to do.
 
 ### 2. For each ticket
 
@@ -1031,6 +1038,14 @@ os.replace(path + '.tmp', path)
 "
 ```
 
+The zero-ticket result file: when Step 1 found no ticket and no rerun was
+processed, write the same file with zeros and an empty list. It is a normal
+run, not an error:
+
+```json
+{"run_id": "<the value of PACKN_RUN_ID>", "status": "success", "tickets_processed": 0, "drafts_created": 0, "error_summary": null, "tickets": []}
+```
+
 If writing the result file fails, log the failure to the run log with a
 `!! RESULT_FILE_WRITE_FAILED` marker and continue to Step 5; the wrapper
 records the run as a failure (`agent_exited_abnormally`). Do NOT fall back to
@@ -1081,3 +1096,4 @@ Everything this skill writes outside of HubSpot/Gmail MCP calls must land inside
 - MCP rate-limit or auth error → log in run log, stop processing remaining tickets this run, update `last_run_at` ONLY to the last successfully-processed ticket's modified date (so the next run retries the skipped ones), exit with a clear error message.
 - Gmail auth missing → skip emails for this run, leave items in queue, surface a message asking the user to run the Gmail auth flow.
 - Unknown category from classifier → force `other_unclassified` and still draft a reply (it'll be generic and flagged for review).
+- Whatever happens, under the wrapper (`PACKN_RESULT_PATH` set) write the result file (Step 4.5) before you exit: after an error that stops the loop, and after a run that found no ticket. A run that ends without one is recorded as a failure (`agent_exited_abnormally`).
