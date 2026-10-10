@@ -615,8 +615,10 @@ def merge_fingerprints(state_path: Any, entries: Any, last_run_at: Any = None) -
     tag STATE-FILE-RACE): the rename is atomic, it is not a lock, so two
     overlapping runs can each read, merge and replace, and the later replace
     drops the fingerprints the earlier run added. The bound: after a switch
-    back to HubSpot such a ticket can be drafted once more, and never as a
-    second pending draft, because that draft write replaces the pending one.
+    back to HubSpot such a ticket can be drafted once more. That draft write
+    replaces the pending one, so there is no second pending draft, as long as
+    the run was started through the wrapper and its one read of the rollback
+    entries succeeded (the two exceptions the rollback replace itself has).
 
     This is the only place code writes the state file, and nothing in `os`
     mode reads the file to decide what to process.
