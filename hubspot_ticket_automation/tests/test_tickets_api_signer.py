@@ -399,6 +399,104 @@ def test_read_os_origin_with_no_settings_file_is_list_error(
     assert caught.value.code == "list_error"
 
 
+# The requests are signed, but the ANSWERS are authenticated by TLS alone, and
+# they carry end-consumer text the cron then acts on (it writes drafts and fills
+# a HubSpot ticket's numbers from the payload). Review WR-54: the origin had to
+# be `http` or `https`. It is now `https`, with `http` allowed only for a
+# loopback host so a local test server still works.
+
+
+@pytest.mark.parametrize(
+    ("value", "origin"),
+    [
+        ("https://os.packn.test", "https://os.packn.test"),
+        ("https://os.packn.test:8443/api/ingest/action-items", "https://os.packn.test:8443"),
+        ("http://localhost:3000/api/ingest/action-items", "http://localhost:3000"),
+        ("http://127.0.0.1:3000", "http://127.0.0.1:3000"),
+        ("http://127.0.0.1", "http://127.0.0.1"),
+        ("http://[::1]:3000", "http://[::1]:3000"),
+    ],
+)
+def test_read_os_origin_takes_https_and_plain_http_only_for_a_loopback_host(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, value: str, origin: str
+) -> None:
+    _settings(tmp_path, monkeypatch, f'os_ingest_url: "{value}"\n')
+    assert tickets_api.read_os_origin() == origin
+
+
+INSECURE_ORIGINS = [
+    "http://os.packn.test",
+    "http://os.packn.test:443",
+    "HTTP://os.packn.test",
+    "http://10.0.0.5:3000",
+    "http://192.168.1.20",
+    "http://127.0.0.2:3000",  # only the three named loopback hosts
+    "http://[::2]:3000",
+    "http://localhost.packn.test",  # a name that merely starts like one
+    "http://127.0.0.1.packn.test",
+    "http://localhost@os.packn.test",  # `localhost` is the user here, not the host
+    "http://localhost:3000@os.packn.test",
+]
+
+
+@pytest.mark.parametrize("value", INSECURE_ORIGINS)
+def test_read_os_origin_refuses_plain_http_to_any_other_host_with_its_own_code(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, value: str
+) -> None:
+    _settings(tmp_path, monkeypatch, f'os_ingest_url: "{value}"\n')
+    with pytest.raises(TicketsApiError) as caught:
+        tickets_api.read_os_origin()
+    assert caught.value.code == "list_error"  # one of the four codes the run record knows
+    assert caught.value.detail == tickets_api.ORIGIN_INSECURE == "os_origin_insecure"
+    assert value not in str(caught.value)  # a code, never the configured value
+
+
+def test_an_unusable_origin_keeps_its_plain_code_and_no_detail(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _settings(tmp_path, monkeypatch, 'os_ingest_url: "ftp://os.packn.test"\n')
+    with pytest.raises(TicketsApiError) as caught:
+        tickets_api.read_os_origin()
+    assert (caught.value.code, caught.value.detail) == ("list_error", None)
+    assert TicketsApiError("list_timeout").detail is None  # every other error: unchanged
+
+
+def test_a_plain_http_origin_is_refused_before_any_request_by_each_of_the_four_calls(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _settings(tmp_path, monkeypatch, 'os_ingest_url: "http://os.packn.test"\n')
+    opener = answers({"contract_version": "1", "tickets": []})
+    given = {"secret": FIXTURE_SECRET, "now": lambda: FIXED_TS, "opener": opener}
+    calls = [
+        lambda **kw: tickets_api.fetch_unprocessed(25, **kw),
+        lambda **kw: tickets_api.fetch_ticket("9300000000001", **kw),
+        lambda **kw: tickets_api.post_classification("0f8fad5b-d9cb-469f-a165-70867728950e", {"a": 1}, **kw),
+        lambda **kw: tickets_api.post_source_shadow_observations({"a": 1}, **kw),
+    ]
+    for call in calls:
+        with pytest.raises(TicketsApiError) as caught:
+            call(**given)
+        assert (caught.value.code, caught.value.detail) == ("list_error", "os_origin_insecure")
+    assert opener.calls == []  # nothing was signed and nothing was sent
+
+
+def test_the_origin_rule_also_holds_for_an_origin_handed_over_directly() -> None:
+    """The keyword seam is not a way round the rule: an origin a caller passes
+    is checked exactly as the settings value is."""
+    opener = answers({"contract_version": "1", "tickets": []})
+    with pytest.raises(TicketsApiError) as caught:
+        tickets_api.fetch_unprocessed(
+            25, base_url="http://os.packn.test", secret=FIXTURE_SECRET, now=lambda: FIXED_TS, opener=opener
+        )
+    assert (caught.value.code, caught.value.detail) == ("list_error", "os_origin_insecure")
+    assert opener.calls == []
+
+    tickets_api.fetch_unprocessed(
+        25, base_url="http://127.0.0.1:3000/", secret=FIXTURE_SECRET, now=lambda: FIXED_TS, opener=opener
+    )
+    assert opener.request.full_url == "http://127.0.0.1:3000/api/tickets/unprocessed?contract_version=1&limit=25"
+
+
 def test_the_origin_defaults_to_the_settings_value(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

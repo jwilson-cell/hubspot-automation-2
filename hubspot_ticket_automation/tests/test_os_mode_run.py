@@ -1053,6 +1053,34 @@ def _use_the_real_client(world: OsWorld, answer: Callable[[Any], Any], secret: O
     return opener
 
 
+def test_a_plain_http_os_origin_ends_the_run_as_a_failure_record_before_any_request(world: OsWorld) -> None:
+    """Review WR-54, through the whole orchestrator with the real signed
+    client. The configured origin is plain http to a host that is not a
+    loopback one: nothing is signed, nothing is sent, HubSpot is not asked and
+    no agent is launched. One failure record, with a code that says why."""
+    opener = _use_the_real_client(world, lambda request: _Answer(_list()), FIXTURE_SECRET + "\n")
+    tickets_api.SETTINGS_PATH.write_text(
+        'os_ingest_url: "http://os.example.test/api/ingest/action-items"\n', encoding="utf-8"
+    )
+
+    assert world.run() == 0
+    record = world.record
+    assert (record["status"], record["source_mode"]) == ("failure", "os")
+    assert record["failure_reason_code"] == "list_error"
+    assert record["error_summary"] == "list_error:os_origin_insecure"
+    assert opener.requests == []
+    world.asked_nothing_of_anyone()
+
+
+def test_a_loopback_http_os_origin_still_runs(world: OsWorld) -> None:
+    opener = _use_the_real_client(world, lambda request: _Answer(_list()), FIXTURE_SECRET + "\n")
+    tickets_api.SETTINGS_PATH.write_text('os_ingest_url: "http://127.0.0.1:3000"\n', encoding="utf-8")
+
+    assert world.run() == 0
+    assert world.record["status"] == "success" and world.record["tickets_processed"] == 3
+    assert {sent.full_url.split("/api/")[0] for sent in opener.requests} == {"http://127.0.0.1:3000"}
+
+
 def test_with_no_injected_api_the_runner_uses_the_real_signed_client(world: OsWorld) -> None:
     opener = _use_the_real_client(world, lambda request: _Answer(_list()), FIXTURE_SECRET + "\n")
     assert world.run() == 0
