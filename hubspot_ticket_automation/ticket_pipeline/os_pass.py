@@ -96,6 +96,14 @@ that cannot be reached or refuses the signature: the draft stays, the run is
 `partial` with the code, and the next run's list fetch fails closed or lists
 the ticket again, where the draft write is a same-cycle replay.
 
+A write-back the OS ANSWERED with a refusal is not a delivered write-back
+either (review WR-48): a 404, a 400, a 413, or a second 422 on the resend.
+The pass this run reports is then not the pass the OS holds, so the run is
+`partial` as well, with the code it already carried (`writeback_ticket_gone`,
+`writeback_rejected`). Two answers are not refusals and leave the status
+alone: a 409 (the OS already holds a completed pass for the signal) and a 422
+whose re-read finds no signal left (there is nothing more to report).
+
 LOGGING
 -------
 Ids, codes, counts and exception class names. Never a subject, a body, a name,
@@ -791,7 +799,9 @@ class FinalizeSummary:
                          would have been drafted.
     `drafts_created`     new draft rows only; a replay is not one. 0 in a dry run.
     `codes`              code -> count, for the run record's summary
-    `partial`            a write-back could not be delivered at all: the run is
+    `partial`            a write-back was not delivered: the OS could not be
+                         asked, or it answered with a refusal (see
+                         `post_ticket_writeback`, "refused"). The run is
                          `partial` whatever else happened
     `dry_run`, `would`   settings said dry run; `would` counts what was not done
     `tickets`            one record per bundle ticket, in bundle order:
@@ -1040,7 +1050,15 @@ def post_ticket_writeback(
     `sleep`          the pause before the one retry (None = the module's)
 
     Returns {"end": one of the WB_* words, "codes": [codes to add to the run's
-    summary]}.
+    summary], "refused": the HTTP status of the answer that refused this
+    write-back, or None}.
+
+    `refused` is set when the OS answered and did not take the pass as it was
+    reported: 404, or the status that led to writeback_rejected (400, 413, a
+    second 422, or anything else the table sends that way, a 409 to a `failed`
+    write-back included). It is None for 200, for a completed write-back's 409
+    (the OS already holds the pass), for a 422 whose re-read finds no signal,
+    and when the OS could not be asked at all (that is `unrecorded`).
 
     A `completed` write-back:
         200                  -> processed
@@ -1072,11 +1090,11 @@ def post_ticket_writeback(
     os_ticket_id = entry.get("os_ticket_id")
     codes: list[str] = []
 
-    def ended(end: str, code: Optional[str] = None) -> dict:
+    def ended(end: str, code: Optional[str] = None, refused: Optional[int] = None) -> dict:
         if code is not None:
             codes.append(code)
             _log(f"write-back: ticket={os_ticket_id} end={end} code={code}")
-        return {"end": end, "codes": codes}
+        return {"end": end, "codes": codes, "refused": refused}
 
     if _echo_signal(entry) is None:
         return ended(WB_NO_SIGNAL)
@@ -1111,9 +1129,9 @@ def post_ticket_writeback(
     if completed and status == 409:
         return ended(WB_PROCESSED, WRITEBACK_CONFLICT)
     if status == 404 and not resent:
-        return ended(WB_GONE, WRITEBACK_TICKET_GONE)
+        return ended(WB_GONE, WRITEBACK_TICKET_GONE, refused=status)
     if not completed:
-        return ended(WB_REJECTED, WRITEBACK_REJECTED)
+        return ended(WB_REJECTED, WRITEBACK_REJECTED, refused=status)
 
     # A completed pass the OS refused. One failed pass, so the attempt counts
     # toward parking and the ticket cannot be re-drafted without limit.
@@ -1124,8 +1142,8 @@ def post_ticket_writeback(
     )
     verdict, failure = _send_pass(api, os_ticket_id, fallback, pause)
     if failure is not None:
-        return ended(WB_UNRECORDED, WRITEBACK_PREFIX + failure)
-    return ended(WB_COUNTED if 200 <= verdict["status"] < 300 else WB_REJECTED)
+        return ended(WB_UNRECORDED, WRITEBACK_PREFIX + failure, refused=status)
+    return ended(WB_COUNTED if 200 <= verdict["status"] < 300 else WB_REJECTED, refused=status)
 
 
 def _forwarder() -> Any:
@@ -1242,6 +1260,20 @@ class _Pass:
     sleep: Any
 
 
+# The one refusal that is not a failure to deliver: the OS already holds a
+# completed pass for the signal (a `failed` write-back answered 409).
+NOT_A_REFUSAL_STATUSES = (409,)
+
+
+def writeback_refused(ended: Any) -> bool:
+    """True when the OS ANSWERED a write-back and refused it: a 404, a 400, a
+    413, a second 422. Such a write-back was not delivered, and the run that
+    made it is `partial` exactly as for one the OS could not be asked
+    (review WR-48). A 409 is not one: the OS holds a completed pass already."""
+    status = ended.get("refused") if isinstance(ended, dict) else None
+    return isinstance(status, int) and not isinstance(status, bool) and status not in NOT_A_REFUSAL_STATUSES
+
+
 def _write_back(run: _Pass, entry: dict, ticket: Optional[dict], ticket_result: dict) -> None:
     """One ticket's write-back, folded into the summary. In a dry run: counted."""
     summary = run.summary
@@ -1256,7 +1288,7 @@ def _write_back(run: _Pass, entry: dict, ticket: Optional[dict], ticket_result: 
         ticket["writeback"] = ended["end"]
     for code in ended["codes"]:
         summary.note(code)
-    if ended["end"] == WB_UNRECORDED:
+    if ended["end"] == WB_UNRECORDED or writeback_refused(ended):
         summary.partial = True
 
 

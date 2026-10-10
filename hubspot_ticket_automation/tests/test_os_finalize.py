@@ -582,6 +582,7 @@ def test_completed_400_or_413_is_followed_by_exactly_one_failed_write_back_with_
     assert second[1]["signal"] == first[1]["signal"]
     assert summary.tickets[0]["writeback"] == "counted"
     assert summary.codes == {"writeback_rejected": 1}
+    assert summary.partial is True  # the completed pass was refused: not a clean run (review WR-48)
     assert len(world.drafts) == 1  # the draft stays; nothing supersedes it
 
 
@@ -648,11 +649,13 @@ def test_completed_422_with_a_reread_that_finds_no_signal_does_nothing_more(worl
     assert summary.tickets[0]["writeback"] == "gone"
 
 
-def test_completed_404_is_a_logged_code_and_nothing_more(world: OsWorld) -> None:
+def test_completed_404_is_a_logged_code_no_second_request_and_a_partial_run(world: OsWorld) -> None:
+    # was `..._and_nothing_more`, with `partial is False`: an answered 404 left the
+    # run a success although nothing was marked (review WR-48)
     summary, _entry = one_completed(world, [NOT_FOUND])
     assert len(posts(world)) == 1 and world.os_api.calls_to("fetch_ticket") == []
     assert summary.tickets[0]["writeback"] == "gone"
-    assert summary.codes == {"writeback_ticket_gone": 1} and summary.partial is False
+    assert summary.codes == {"writeback_ticket_gone": 1} and summary.partial is True
 
 
 def test_completed_401_is_collected_with_no_retry_and_the_run_is_partial(world: OsWorld) -> None:
@@ -758,7 +761,10 @@ def test_failed_400_409_or_413_is_logged_as_rejected_and_not_resent(world: OsWor
     summary, _entry = one_failed(world, [refusal, OK])
     assert len(posts(world)) == 1
     assert summary.tickets[0]["writeback"] == "rejected"
-    assert summary.codes == {"writeback_rejected": 1} and summary.partial is False
+    assert summary.codes == {"writeback_rejected": 1}
+    # 400 and 413 are refusals (review WR-48; this line said `partial is False`
+    # for all three); a 409 means the OS already holds a completed pass
+    assert summary.partial is (refusal is not CONFLICT)
 
 
 def test_failed_404_is_a_logged_code(world: OsWorld) -> None:

@@ -401,6 +401,10 @@ def test_the_readme_states_the_limit_of_removing_the_hubspot_tools() -> None:
         # os: an agent that leaves no result is retried, not parked
         "when the agent leaves no result at all, nothing is reported as failed",
         "retried on the next run rather than parked",
+        # os: a write-back the OS answered with a refusal is a partial run (review WR-48)
+        "a write-back Pack'N OS refuses makes the run `partial`",
+        "`writeback_ticket_gone` (404) or `writeback_rejected` (400, 413)",
+        "A 409 (`writeback_conflict`: Pack'N OS already holds that pass) does not change the status",
         # shadow: classifier outage
         "a classifier outage means no comparison is posted for that run",
         "`source_shadow_skipped:classify_unavailable`",
