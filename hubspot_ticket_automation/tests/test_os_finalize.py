@@ -965,6 +965,111 @@ def test_a_409_leaves_the_run_a_success_with_the_code_in_its_summary(world: OsWo
     assert "writeback_conflict=1" in world.record["error_summary"]
 
 
+# A write-back the OS ANSWERED with a refusal is not a delivered write-back
+# (review WR-48). The run's status used to look only at write-backs that could
+# not be asked at all: every write-back answering 404 was a `success`, and so
+# was every completed write-back answering 400.
+
+
+def test_every_write_back_answering_404_is_a_partial_run_and_not_a_success(world: OsWorld) -> None:
+    """The review's first probe. Nothing was marked: the same tickets are
+    listed and drafted again on the next run, and the card must not say success."""
+    world.os_api.classification_result = dict(NOT_FOUND)
+    assert world.run() == 0
+
+    record = world.record
+    assert record["status"] == "partial"
+    assert (record["tickets_processed"], record["drafts_created"]) == (3, 3)  # the drafts are in place
+    assert record["error_summary"] == "writeback_ticket_gone=3"
+    assert record["failure_reason_code"] is None
+    assert [p[1]["outcome"] for p in posts(world)] == ["completed"] * 3  # one write-back each, no fallback
+
+
+@pytest.mark.parametrize("refusal", [BAD_PAYLOAD, TOO_LARGE], ids=["400", "413"])
+def test_every_completed_write_back_answering_400_or_413_is_a_partial_run(world: OsWorld, refusal: dict) -> None:
+    """The review's second probe. Each ticket's pass was then counted as FAILED
+    by the OS (one run from parked), while the record said success."""
+    world.os_api.script = [dict(refusal), dict(OK)] * 3  # the refused completed pass, then its `failed` fallback
+    assert world.run() == 0
+
+    record = world.record
+    assert record["status"] == "partial"
+    assert (record["tickets_processed"], record["drafts_created"]) == (3, 3)
+    assert record["error_summary"] == "writeback_rejected=3"
+    assert [p[1]["outcome"] for p in posts(world)] == ["completed", "failed"] * 3
+
+
+def test_one_refused_write_back_among_three_is_a_partial_run(world: OsWorld) -> None:
+    world.os_api.script = [dict(OK), dict(NOT_FOUND)]  # ticket 2's answer
+    world.run()
+    assert world.record["status"] == "partial"
+    assert world.record["error_summary"] == "writeback_ticket_gone=1"
+
+
+@pytest.mark.parametrize(
+    ("script", "end", "code"),
+    [
+        ([NOT_FOUND], "gone", "writeback_ticket_gone"),
+        ([BAD_PAYLOAD, OK], "counted", "writeback_rejected"),
+        ([TOO_LARGE, OK], "counted", "writeback_rejected"),
+        ([BAD_PAYLOAD, BAD_PAYLOAD], "rejected", "writeback_rejected"),  # the fallback is refused too
+    ],
+    ids=["404", "400-then-counted", "413-then-counted", "400-twice"],
+)
+def test_a_completed_write_back_the_os_refused_marks_the_run_partial(
+    world: OsWorld, script: list, end: str, code: str
+) -> None:
+    summary, _entry = one_completed(world, script)
+    assert summary.tickets[0]["writeback"] == end and summary.codes == {code: 1}
+    assert summary.tickets_processed == 1  # the draft is in place
+    assert summary.partial is True
+
+
+@pytest.mark.parametrize("refusal", [BAD_PAYLOAD, TOO_LARGE, NOT_FOUND], ids=["400", "413", "404"])
+def test_a_failed_write_back_the_os_refused_marks_the_run_partial(world: OsWorld, refusal: dict) -> None:
+    summary, _entry = one_failed(world, [refusal, OK])
+    assert len(posts(world)) == 1
+    assert summary.partial is True
+
+
+def test_a_refused_write_back_for_a_ticket_no_entry_was_built_for_marks_the_run_partial(world: OsWorld) -> None:
+    world.os_api.script = [dict(NOT_FOUND)]
+    unbundled = [{"os_ticket_id": osm.T3_OS_ID, "signal": os_pass._signal(osm._payload(2))}]
+    summary = finalize(world, [], result_of(), unbundled=unbundled)
+    assert summary.codes == {"writeback_ticket_gone": 1} and summary.partial is True
+
+
+def test_the_answers_that_are_not_a_refusal_leave_the_status_alone(world: OsWorld) -> None:
+    """409 (the OS already holds a completed pass: `writeback_conflict`) and a
+    422 whose re-read finds no signal left (`writeback_signal_gone`) are kept
+    exactly as they were, for a completed and for a failed write-back."""
+    summary, _entry = one_completed(world, [CONFLICT])
+    assert summary.codes == {"writeback_conflict": 1} and summary.partial is False
+    world.os_api.calls.clear()
+    summary, _entry = one_completed(world, [SIGNAL_AHEAD], index=2)  # the re-read finds no ticket
+    assert summary.codes == {"writeback_signal_gone": 1} and summary.partial is False
+    summary, _entry = one_failed(world, [CONFLICT])
+    assert summary.tickets[0]["writeback"] == "rejected" and summary.partial is False
+
+
+def test_the_write_back_answer_names_the_status_that_refused_it(world: OsWorld) -> None:
+    entry = make_entry(0)
+    done = {"outcome": "completed", "classification": dict(CLASSIFICATION)}
+
+    def ended(script: list, result: dict = done) -> dict:
+        world.os_api.script = [dict(step) for step in script]
+        return os_pass.post_ticket_writeback(world.os_api, entry, result, RUN_ID, "os", sleep=world.sleeps.append)
+
+    assert ended([OK])["refused"] is None
+    assert ended([CONFLICT])["refused"] is None  # processed: the OS already holds it
+    assert ended([NOT_FOUND])["refused"] == 404
+    assert ended([BAD_PAYLOAD, OK])["refused"] == 400
+    assert ended([TOO_LARGE, OK])["refused"] == 413
+    assert ended([SIGNAL_AHEAD])["refused"] is None  # no ticket on the re-read: nothing left to report
+    assert ended([CONFLICT], {"outcome": "failed", "failure_reason_code": "other"})["refused"] == 409
+    assert sorted(ended([OK])) == ["codes", "end", "refused"]
+
+
 def test_a_ticket_whose_draft_cannot_be_written_makes_the_run_partial(world: OsWorld) -> None:
     world.draft_errors[osm.T2_OS_ID] = RuntimeError(EXC_MARKER)
     world.run()
