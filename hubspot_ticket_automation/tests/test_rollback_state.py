@@ -1008,3 +1008,153 @@ def test_the_finaliser_hands_the_state_path_to_the_one_writer_and_never_reads_it
     }
     assert not called & {"_read_state", "_load_state", "_merge_state", "_replace_state", "unprocessed_candidates"}
     assert "state" + ".json" not in text
+
+
+# ===========================================================================
+# ROLLBACK REACHES EVERY TICKET (review CR-41)
+#
+# The HubSpot path selects `hs_lastmodifieddate > last_run_at`, then dedupes by
+# fingerprint. An `os` pass only knows the tickets it LISTED. A ticket it never
+# listed (parked after two failed passes, beyond the per-run cap, not mirrored
+# yet) has no fingerprint, so a search window moved past its modified time
+# would hide it from the HubSpot path for good. The rule: an `os` pass writes
+# fingerprints only. `last_run_at` belongs to the HubSpot path alone.
+#
+# These tests drive the real candidate rule (`pregate_tickets.hubspot_candidates`)
+# over the state the finalizer wrote, against a search that APPLIES the window
+# filter: a fake that answers the same hits whatever the window says cannot see
+# this defect.
+# ===========================================================================
+
+NOON = "2026-10-09T12:00:00.000Z"
+ELEVEN = "2026-10-09T11:00:00.000Z"
+UNLISTED_HS_ID = "9300000000777"  # a HubSpot ticket no `os` pass ever listed
+
+
+class FilteringSearch:
+    """HubSpot's tickets/search, as far as the candidate rule relies on it:
+    only tickets modified AFTER the body's `hs_lastmodifieddate GT` value,
+    oldest first, cut to the body's `limit`. Called like `hubspot_api._request`."""
+
+    def __init__(self, tickets: dict) -> None:
+        self.tickets = dict(tickets)  # HubSpot id -> hs_lastmodifieddate
+        self.windows: list[int] = []
+
+    def __call__(self, method: str, path: str, token: Any = None, body: Any = None) -> dict:
+        assert (method, path) == ("POST", SEARCH_PATH)
+        window = body["filterGroups"][0]["filters"][0]
+        assert window["propertyName"] == "hs_lastmodifieddate" and window["operator"] == "GT"
+        self.windows.append(window["value"])
+        hits = sorted(
+            (source.iso_to_ms(modified), ticket_id, modified)
+            for ticket_id, modified in self.tickets.items()
+            if source.iso_to_ms(modified) > window["value"]
+        )
+        return {
+            "results": [
+                {"id": ticket_id, "properties": {"hs_lastmodifieddate": modified}}
+                for _ms, ticket_id, modified in hits[: body["limit"]]
+            ]
+        }
+
+
+def after_the_flip(world: OsWorld, tickets: dict) -> dict:
+    """The HubSpot path's decision after a switch back to `hubspot`: its own
+    loader over the file the finalizer wrote, its own candidate rule, and a
+    HubSpot that holds `tickets` and honours the search window."""
+    state = osm.pg._load_state(world.state_path)
+    search = FilteringSearch(tickets)
+    decision = osm.pg.hubspot_candidates("hubspot", HUBSPOT_SETTINGS, state, "test-token", transport=search)
+    assert len(search.windows) == 1
+    return decision
+
+
+def test_the_filtering_search_honours_the_window_it_is_asked_with(world: OsWorld) -> None:
+    # the fake's own rule, so a green result below cannot come from a fake that returns everything
+    world.state_path.write_text(json.dumps({"last_run_at": NOON, "ticket_fingerprints": {}}), encoding="utf-8")
+    decision = after_the_flip(world, {"1": ELEVEN, "2": NOON, "3": plus_ms(NOON, 1)})
+    assert decision["candidates"] == ["3"]  # GT: neither the earlier ticket nor the one AT the window's start
+
+
+def test_a_flip_back_selects_the_ticket_the_os_pass_never_listed_and_not_the_completed_one(world: OsWorld) -> None:
+    """The review's probe, as the acceptance case. One completed ticket modified
+    at 12:00, one ticket the pass never listed modified at 11:00."""
+    empty_state(world)
+    done = make_entry(0, payload_edit=lambda payload: payload.update(hubspot_updated_at=NOON))
+
+    summary = finalize(world, [done], all_completed(done))
+
+    assert summary.tickets[0]["writeback"] == os_pass.WB_PROCESSED
+    state = read(world.state_path)
+    assert state["ticket_fingerprints"] == {osm.T1_HS_ID: code_written(STAMP, NOON)}
+
+    decision = after_the_flip(world, {osm.T1_HS_ID: NOON, UNLISTED_HS_ID: ELEVEN})
+    assert decision["candidates"] == [UNLISTED_HS_ID]  # the unlisted ticket IS selected
+    assert decision["matched"] == [
+        {"id": UNLISTED_HS_ID, "hs_lastmodifieddate": ELEVEN, "deduped": False},
+        {"id": osm.T1_HS_ID, "hs_lastmodifieddate": NOON, "deduped": True},  # completed: not processed again
+    ]
+    assert decision["decision"] == "run_agent"
+
+    # ... and a completed ticket HubSpot reports a NEWER modified time for is picked up again
+    changed = plus_ms(STAMP, 1)
+    decision = after_the_flip(world, {osm.T1_HS_ID: changed, UNLISTED_HS_ID: ELEVEN})
+    assert decision["candidates"] == [UNLISTED_HS_ID, osm.T1_HS_ID]
+    assert state["last_run_at"] == STORED_LAST_RUN  # the pass wrote a fingerprint and moved nothing
+
+
+def test_a_flip_back_selects_a_ticket_that_was_parked_before_a_later_pass_completed_another(world: OsWorld) -> None:
+    """A parked ticket is exactly what a rollback is for. Ticket 1 fails its
+    pass and is then no longer listed (the OS parks it); a later pass completes
+    ticket 3, which HubSpot modified AFTER ticket 1. Ticket 1 must still be
+    inside the HubSpot search after the switch back."""
+    empty_state(world)
+    parked, later = make_entry(0), make_entry(2)
+    assert source.iso_to_ms(T1_UPDATED) < source.iso_to_ms(T3_UPDATED)
+
+    finalize(world, [parked], result_of(failed(parked)))  # the pass that failed it
+    finalize(world, [later], all_completed(later))  # a pass that no longer lists it
+
+    state = read(world.state_path)
+    assert set(state["ticket_fingerprints"]) == {osm.T3_HS_ID}
+    decision = after_the_flip(world, {osm.T1_HS_ID: T1_UPDATED, osm.T3_HS_ID: T3_UPDATED})
+    assert decision["candidates"] == [osm.T1_HS_ID]
+    assert state["last_run_at"] == STORED_LAST_RUN
+
+
+@pytest.mark.parametrize("stored", ["", "garbage", None, "2026-09-01T00:00:00Z"])
+def test_an_os_pass_leaves_last_run_at_exactly_as_it_found_it(world: OsWorld, stored: Any) -> None:
+    """Readable or not, present or not: the key is the HubSpot path's. With an
+    unreadable stored value the old rule wrote the newest completed ticket's
+    time outright, the same jump with no stored window to hold it back."""
+    before = {"run_count": 7, "ticket_fingerprints": {}}
+    if stored is not None:
+        before["last_run_at"] = stored
+    world.state_path.write_text(json.dumps(before), encoding="utf-8")
+    entries = [make_entry(0), make_entry(2)]
+
+    finalize(world, entries, all_completed(*entries))
+
+    after = read(world.state_path)
+    assert set(after["ticket_fingerprints"]) == {osm.T1_HS_ID, osm.T3_HS_ID}
+    assert {key: value for key, value in after.items() if key != "ticket_fingerprints"} == {
+        key: value for key, value in before.items() if key != "ticket_fingerprints"
+    }
+
+
+def test_no_code_hands_the_state_writer_a_search_window() -> None:
+    """Structural: every call of `merge_fingerprints` in the package passes the
+    path and the entries and nothing else, and the rule that computed a window
+    is gone, so a later edit cannot quietly start moving `last_run_at` again."""
+    package = Path(os_pass.__file__).resolve().parent.parent
+    calls = []
+    for folder in ("ticket_pipeline", "scripts", "packn_os_hubspot_client"):
+        for module in sorted((package / folder).glob("*.py")):
+            for node in ast.walk(ast.parse(module.read_text(encoding="utf-8"))):
+                if not isinstance(node, ast.Call):
+                    continue
+                name = node.func.attr if isinstance(node.func, ast.Attribute) else getattr(node.func, "id", "")
+                if name == "merge_fingerprints":
+                    calls.append((module.name, len(node.args), [keyword.arg for keyword in node.keywords]))
+    assert calls == [("os_pass.py", 2, [])]
+    assert not hasattr(os_pass, "_window_start")
