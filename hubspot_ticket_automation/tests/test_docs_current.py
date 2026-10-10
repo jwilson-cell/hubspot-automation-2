@@ -412,6 +412,10 @@ def test_the_readme_states_the_limit_of_removing_the_hubspot_tools() -> None:
         "can leave two pending drafts",
         "start a hand-run through the wrapper",
         "`rollback_entries_unreadable`",
+        # a dry run posts nothing to /tasks, from the finalizer or the forwarder (review WR-47)
+        "A dry run posts no action items",
+        "`would_action_item_posts`",
+        "posts nothing when it cannot read `dry_run`",
         # counts
         "show no HubSpot call counts",
     ],

@@ -154,7 +154,7 @@ def _no_child_process(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
 
 @pytest.fixture(autouse=True)
 def _no_real_file_and_a_clean_counter(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, tmp_path_factory: pytest.TempPathFactory
 ) -> Iterator[None]:
     """The two clients' file paths point at nothing, HubSpot's pacing is off,
     and the per-process call counter starts and ends at zero."""
@@ -165,7 +165,13 @@ def _no_real_file_and_a_clean_counter(
     # the action-item poster and forwarder (plan 17): no secret, no ingest URL,
     # no queue and no seen-set of the real checkout is ever opened
     monkeypatch.setattr(poster, "SECRET_PATH", nowhere / "action_ingest_secret.txt")
-    monkeypatch.setattr(poster, "SETTINGS_PATH", nowhere / "settings.yaml")
+    # The forwarder posts only when it has READ `dry_run: false` (review WR-47),
+    # so its settings file is a temp one that says exactly that and holds no
+    # ingest URL: the real poster would still find nowhere to send.
+    # (In its own temp directory: tests list what a run left under `tmp_path`.)
+    live_settings = tmp_path_factory.mktemp("forwarder-settings") / "settings.yaml"
+    live_settings.write_text("dry_run: false\n", encoding="utf-8")
+    monkeypatch.setattr(poster, "SETTINGS_PATH", live_settings)
     monkeypatch.setattr(forwarder, "QUEUE_PATH", nowhere / "pending_actions.json")
     monkeypatch.setattr(forwarder, "SEEN_PATH", nowhere / ".action_items_forwarded.json")
     monkeypatch.setattr(hubspot_api, "_acquire_rate_token", lambda: None)

@@ -63,10 +63,25 @@ the ticket, the newest record is an earlier pass's.
 The retry file's path is derived from the seen-set's, so one injected path
 moves both. Every write here goes through a temp file and a rename.
 
+A DRY RUN POSTS NOTHING (review WR-47)
+This script runs after EVERY ticket run, and the skills queue a record for a
+drafted ticket whatever `dry_run` says. So it reads `dry_run` from
+config/settings.yaml itself (`read_dry_run`: the same YAML parser and the same
+truthiness the `os` finalizer uses, so the two halves of one tick cannot
+disagree) and posts only when it has read `false`:
+
+    false     posts, as described above
+    true      posts nothing, marks nothing seen, drops no retry entry; one
+              line counts what it would have forwarded. The queue is not
+              changed, so the first live run posts what is still unseen.
+    unknown   the file cannot be read as a mapping, or there is no parser:
+              treated as a dry run (`dry_run_unknown`). No answer is not "live".
+
 Non-blocking: never raises out; logs a one-line summary and exits 0 so it can
-never break the cron pipeline. Stdlib + the existing post_action_items module
-only — no new dependencies (sibling CLAUDE.md invariant). It logs ids, codes
-and counts; never an envelope or an item's text.
+never break the cron pipeline. The standard library, PyYAML (already a
+requirement of the scripts, imported only by `read_dry_run`) and the existing
+post_action_items module — no new dependencies (sibling CLAUDE.md invariant).
+It logs ids, codes and counts; never an envelope or an item's text.
 """
 from __future__ import annotations
 
@@ -228,6 +243,33 @@ def _retry_ids(ticket_id: str, entry) -> tuple:
     return os_ticket_id, (pass_id if valid_pass_id(pass_id) else None)
 
 
+def read_dry_run():
+    """Is this a dry run? True or False from `dry_run` in config/settings.yaml,
+    or None when that cannot be told.
+
+    The file is the poster's own `SETTINGS_PATH` (the one settings file), read
+    with the parser the `os` finalizer's loader uses (`yaml.safe_load`, an
+    empty file being `{}`) and judged the same way (`bool(settings.get(
+    "dry_run"))`), so an absent key is False here as it is there. None: the
+    file is missing or unreadable, is not YAML, is not a mapping, or PyYAML
+    cannot be imported. The caller treats None as a dry run."""
+    failure = None
+    loaded = None
+    try:
+        import yaml  # lazy: only this function needs it
+
+        with open(poster.SETTINGS_PATH, encoding="utf-8") as handle:
+            loaded = yaml.safe_load(handle) or {}
+    except Exception as exc:  # noqa: BLE001 — whatever stopped the read, there is no answer
+        failure = type(exc).__name__
+    if failure is None and not isinstance(loaded, dict):
+        failure = "not_a_mapping"
+    if failure is not None:
+        _log(f"dry_run not readable from settings ({failure})")
+        return None
+    return bool(loaded.get("dry_run"))
+
+
 def _record_items(rec) -> tuple:
     """(ticket key, action items) of one queue record, or ("", []) when it is
     not a record this script forwards."""
@@ -268,11 +310,16 @@ def main(queue_path=None, seen_path=None) -> int:
         _log(f"{queue.name} is not a JSON array — nothing to forward.")
         return 0
 
+    # Nothing is posted unless this is KNOWN not to be a dry run (WR-47).
+    dry_run = read_dry_run()
+    posting = dry_run is False
+
     seen = load_seen(seen_file)
     retry = load_retry(seen_file)
     newest = newest_record_of_pass_held_keys(records, retry)
 
     forwarded = already = errors = superseded = 0
+    would_items = would_envelopes = 0
     fresh_keys: set[str] = set()
     sent_under: dict[str, object] = {}  # key -> the pass id its entry held when it was sent
 
@@ -313,8 +360,13 @@ def main(queue_path=None, seen_path=None) -> int:
             groups.setdefault(ids, []).append(it)
 
         for (os_ticket_id, pass_id), group in groups.items():
+            if not posting:
+                # counted, never handed to the poster: nothing leaves this script
+                would_items += len(group)
+                would_envelopes += 1
+                continue
             result = poster.post_action_items(
-                hubspot_id, group, dry_run=False, os_ticket_id=os_ticket_id, pass_id=pass_id
+                hubspot_id, group, dry_run, os_ticket_id=os_ticket_id, pass_id=pass_id
             )
             result = result if isinstance(result, dict) else {}
             # Confirm the body reports errors == 0 before marking an item seen;
@@ -355,6 +407,15 @@ def main(queue_path=None, seen_path=None) -> int:
             _log("could not persist seen-state; OS idempotency still dedups")
         # only an entry that still names the pass that was confirmed
         forget_retry(fresh_keys, seen_file, passes=sent_under)
+
+    if not posting:
+        why = "dry_run" if dry_run is True else "dry_run_unknown"
+        _log(
+            f"{why}: nothing posted. would_forward={would_items} would_envelopes={would_envelopes} "
+            f"already_delivered={already} records={len(records)}"
+            + (f" superseded={superseded}" if superseded else "")
+        )
+        return 0
 
     _log(
         f"done: forwarded={forwarded} already_delivered={already} "
