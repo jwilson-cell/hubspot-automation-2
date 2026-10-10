@@ -258,6 +258,77 @@ def test_skill_step_4_5_writes_the_result_file_under_the_wrapper() -> None:
     assert "routine_name='tickets-process'," in step
 
 
+# A zero-ticket run ends with a result file too (review WR-51). Step 1 said "If
+# zero tickets, write a short run log ... and exit cleanly", and the wrapper
+# note called that "a normal clean exit". Under the wrapper a clean exit with no
+# file at PACKN_RESULT_PATH is `failure / agent_exited_abnormally`: a healthy
+# no-op tick on the pre-gate's fail-open branch painted a failed run on the card.
+
+ZERO_TICKET_MARKER = "The zero-ticket result file:"
+
+
+def zero_ticket_result_of_the_skill() -> dict:
+    """The JSON object the skill itself shows for a zero-ticket run: the first
+    fenced `json` block after ZERO_TICKET_MARKER in Step 4.5."""
+    import json
+
+    step = _section(_skill(), "### 4.5.", level="### ")
+    assert ZERO_TICKET_MARKER in step, "Step 4.5 shows the zero-ticket result file"
+    after = step[step.index(ZERO_TICKET_MARKER) :]
+    opening = after.index("```json") + len("```json")
+    return json.loads(after[opening : after.index("```", opening)])
+
+
+def test_skill_step_1_sends_a_zero_ticket_run_to_the_result_file() -> None:
+    step = _section(_skill(), "### 1.", level="### ")
+    sentence = next(p for p in step.split("\n\n") if p.startswith("If zero tickets"))
+    assert "and exit cleanly." not in step  # the old instruction: a run log, then nothing
+    assert "run log" in sentence and "no new tickets" in sentence
+    assert "go to Step 4.5" in sentence
+    assert "`status` `success`" in sentence and "both counts 0" in sentence
+    assert "empty `tickets` list" in sentence
+    assert "Do not exit before Step 4.5" in sentence
+
+
+def test_skill_wrapper_note_no_longer_calls_a_zero_ticket_exit_complete_without_a_result() -> None:
+    step_0 = _section(_skill(), "## Step 0")
+    assert "a zero-ticket result here remains a normal\n> clean exit." not in step_0
+    assert "a zero-ticket result here is still a normal run" in step_0
+    assert "it ends with the result file of Step 4.5" in step_0
+
+
+def test_skill_says_every_run_under_the_wrapper_ends_with_the_result_file() -> None:
+    text = _skill()
+    opening = text[text.index("**Under the wrapper.**") : text.index("## HubSpot tool names on the droplet")]
+    assert "Every run under the wrapper ends with that result file" in opening
+    assert "a run that finds no ticket included" in opening
+    failure = text[text.index("## Failure behavior") :]
+    assert "write the result file (Step 4.5) before you exit" in failure
+    assert "recorded as a failure" in failure
+
+
+def test_the_skills_zero_ticket_result_is_one_the_wrapper_reads_as_a_clean_success(tmp_path: Path) -> None:
+    """The object the skill shows, written as the skill says, read by the
+    wrapper's own reader: complete, `success`, zeros. The doc cannot drift
+    from what the wrapper accepts."""
+    import json
+
+    shown = zero_ticket_result_of_the_skill()
+    assert sorted(shown) == ["drafts_created", "error_summary", "run_id", "status", "tickets", "tickets_processed"]
+    run_id = rt.new_run_id()
+    shown["run_id"] = run_id  # the skill writes PACKN_RUN_ID there
+    path = tmp_path / "result.json"
+    path.write_text(json.dumps(shown), encoding="utf-8")
+
+    assert rt.read_result_file(path, run_id) == {
+        "state": rt.RESULT_COMPLETE,
+        "status": "success",
+        "tickets_processed": 0,
+        "drafts_created": 0,
+        "summary": None,
+    }
+
+
 def test_skill_result_file_keeps_message_text_out_of_the_summary() -> None:
     step = _section(_skill(), "### 4.5.", level="### ")
     assert "codes, counts and ticket ids only" in step

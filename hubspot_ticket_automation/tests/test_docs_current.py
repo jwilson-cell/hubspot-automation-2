@@ -170,6 +170,16 @@ def test_the_command_describes_the_result_file_and_the_two_ways_it_is_started() 
     assert "bash scripts/run_tickets.sh" in text
 
 
+def test_the_command_sends_a_zero_ticket_run_to_the_result_file() -> None:
+    """Review WR-51: under the wrapper a run that finds no ticket still ends
+    with the result file; an exit without one is recorded as a failure."""
+    steps = _numbered_steps(_md(COMMAND))
+    fetch = next(step for step in steps.values() if step.startswith("Fetch active-queue tickets"))
+    assert "If the search returns no ticket" in fetch
+    assert "status `success`, both counts 0, an empty `tickets` list" in fetch
+    assert "never exit before the result file is written" in fetch
+
+
 def test_the_command_says_shadow_asks_nothing_new_of_the_agent() -> None:
     text = _md(COMMAND)
     assert "In `shadow` you do exactly what you do in `hubspot`." in text

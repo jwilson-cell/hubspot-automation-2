@@ -2637,6 +2637,28 @@ def test_a_pregate_that_failed_open_launches_the_agent_and_reports_no_observatio
     assert EXC_MARKER not in json.dumps(record)
 
 
+def test_a_zero_ticket_tick_whose_pregate_failed_open_is_a_success_in_shadow_too(shadow: ShadowWorld) -> None:
+    """Review WR-51, through the shadow runner: it launches through the same
+    launch-and-map rule, so the zero-ticket result file is a normal record."""
+    _search_failed(shadow)
+    shadow.agent.result = agent_result()  # status success, both counts 0, no ticket
+    shadow.run()
+    record = shadow.record
+    assert (record["status"], record["tickets_processed"], record["drafts_created"]) == ("success", 0, 0)
+    assert record["failure_reason_code"] is None
+    assert record["error_summary"] == "source_shadow_skipped:pregate_search_failed"
+
+
+def test_an_agent_that_exits_0_with_no_result_file_is_a_failure_in_shadow_too(shadow: ShadowWorld) -> None:
+    _search_failed(shadow)
+    shadow.agent.result = None  # exits 0, writes nothing
+    shadow.run()
+    record = shadow.record
+    assert (record["status"], record["failure_reason_code"]) == ("failure", "agent_exited_abnormally")
+    assert record["error_summary"].startswith("agent_exited_abnormally; result_missing")
+    assert shadow.writebacks == []
+
+
 def test_a_full_deduped_page_is_compared_with_nothing_selected(shadow: ShadowWorld) -> None:
     """The pre-gate launches the agent on a full page of deduped hits (fail-open),
     and what it knows is still a fact worth reporting: every hit, deduped."""

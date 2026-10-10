@@ -1237,6 +1237,82 @@ def test_fail_open_full_page_all_deduped_still_launches_the_agent(world: World) 
     _assert_fails_open(world, "page_full")
 
 
+# A zero-ticket tick on a fail-open branch (review WR-51). The pre-gate could
+# not rule work out, so the agent is launched; its own search then finds
+# nothing. The corrected skill writes the zero-ticket result file, and the
+# wrapper records a normal success. An agent that exits 0 with NO result file
+# is still a failure: that reading is deliberate, and both are pinned here.
+
+ZERO_TICKET_RESULT = {
+    "status": "success",
+    "tickets_processed": 0,
+    "drafts_created": 0,
+    "error_summary": None,
+    "tickets": [],
+}
+
+
+def _fail_open(world: World, reason: str) -> None:
+    if reason == "settings_unreadable":
+        world.settings = OSError("settings.yaml is not readable")
+    elif reason == "active_stages_empty":
+        world.settings = dict(SETTINGS, active_stages=[])
+    elif reason == "token_missing":
+        world.token = None
+    elif reason == "search_failed":
+        world.transport = fakes.FakeHubSpotTransport()  # nothing canned: the search answers None
+    else:  # pragma: no cover - a typo in a test's own table
+        raise AssertionError(reason)
+    assert pg.decide("hubspot", world.deps())["reason"] == reason
+
+
+FAIL_OPEN_REASONS = ["settings_unreadable", "active_stages_empty", "token_missing", "search_failed"]
+
+
+def test_the_zero_ticket_result_these_tests_use_is_the_one_the_skill_shows() -> None:
+    from tests.test_wrappers import zero_ticket_result_of_the_skill
+
+    shown = zero_ticket_result_of_the_skill()
+    assert {key: value for key, value in shown.items() if key != "run_id"} == ZERO_TICKET_RESULT
+
+
+@pytest.mark.parametrize("reason", FAIL_OPEN_REASONS)
+def test_a_zero_ticket_tick_on_a_fail_open_branch_is_a_normal_success_record(world: World, reason: str) -> None:
+    _fail_open(world, reason)
+    world.agent = Agent(0, result=dict(ZERO_TICKET_RESULT))
+
+    assert world.run() == 0
+    assert world.launch_attempts == 1
+    record = world.record
+    assert (record["status"], record["tickets_processed"], record["drafts_created"]) == ("success", 0, 0)
+    assert record["failure_reason_code"] is None and record["error_summary"] is None
+    assert record["source_mode"] == "hubspot"
+
+
+@pytest.mark.parametrize("reason", FAIL_OPEN_REASONS)
+def test_an_agent_that_exits_0_with_no_result_file_is_a_failure_on_a_fail_open_branch_too(
+    world: World, reason: str
+) -> None:
+    """Deliberate. Every path of the skill ends with a result file, so a clean
+    exit without one means the agent stopped before its last step. Reading it
+    as an idle success would hide a dead agent behind a green record."""
+    _fail_open(world, reason)
+    world.agent = Agent(0)  # exits 0, writes nothing
+
+    assert world.run() == 0
+    record = world.record
+    assert (record["status"], record["failure_reason_code"]) == ("failure", "agent_exited_abnormally")
+    assert record["error_summary"] == "agent_exited_abnormally; result_missing"
+    assert (record["tickets_processed"], record["drafts_created"]) == (0, 0)
+
+
+def test_the_launch_rule_states_why_a_clean_exit_with_no_result_file_is_a_failure() -> None:
+    doc = " ".join((rt.launch_and_collect.__doc__ or "").split())
+    assert "exit 0, no result file" in doc
+    assert "Deliberate" in doc and "zero-ticket" in doc
+    assert "never read as an idle success" in doc
+
+
 def test_a_settings_cap_that_is_not_a_number_still_launches_the_agent(world: World) -> None:
     world.settings = dict(SETTINGS, per_run_cap="many")
     _assert_fails_open(world, "settings_unreadable")
