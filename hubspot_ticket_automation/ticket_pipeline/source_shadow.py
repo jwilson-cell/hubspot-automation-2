@@ -23,8 +23,22 @@ directory and logs under its own tag. Every name here says `source_shadow`,
 shadow is touched is `_engine_classification`, which READS an artifact that
 step wrote during this same run so a ticket is not classified twice.
 
-THE COMPARISON CORE (this half of the module)
----------------------------------------------
+THE RUNNER
+----------
+`run_source_shadow(ctx, deps)` is the mode's runner, registered under the
+setting's value in `run_tickets.RUNNER_SPECS`. Its docstring gives the order of
+one run, exactly what the run writes to the OS, and what an OS failure does
+(nothing, to the HubSpot half). In short: the OS list is fetched FIRST, the
+HubSpot path then runs as it does in `hubspot` mode, the observation is posted
+before the agent starts, and after the agent each pass it completed for a
+ticket the OS knows is written back with the mode word `shadow`.
+
+The runner writes no draft (every draft of the run is the agent's own) and
+never touches the HubSpot path's own state file, which the agent keeps in this
+mode exactly as it does in `hubspot` mode.
+
+THE COMPARISON CORE
+-------------------
     resolve_hubspot_candidates  asks the OS, once per HubSpot candidate, which
                                 OS ticket it is and which client signal it is
                                 awaiting us through. A 404 (the mirror has not
@@ -110,7 +124,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Optional
 
-from ticket_pipeline import os_bundle, os_pass, run_types
+from ticket_pipeline import os_bundle, os_pass, run_types, source
+from ticket_pipeline.run_types import Deps, RunContext, RunOutcome
 
 _ROOT = Path(__file__).resolve().parent.parent
 
@@ -812,21 +827,540 @@ def build_observation(run_id: Any, started_at: Any, settings: Any, hubspot_side:
     }
 
 
-def _build_classify(settings: Any) -> Callable[[dict], Any]:
-    """RED skeleton (task 2)."""
-    return lambda context: None
+# ===========================================================================
+# THE RUNNER (`shadow` mode)
+# ===========================================================================
+
+# Codes of the runner, for the run record's summary. The first takes a cause:
+#   source_shadow_skipped:<list code>[:<detail>]   the OS list could not be had
+#   source_shadow_skipped:pregate_<reason>         the pre-gate failed open, so
+#                                                  what HubSpot selects is unknown
+#   source_shadow_skipped:settings_unreadable
+#   source_shadow_skipped:classify_unavailable     see the module docstring
+SOURCE_SHADOW_SKIPPED = "source_shadow_skipped"
+SOURCE_SHADOW_OBSERVATION_REFUSED = "source_shadow_observation_refused"  # :<the route's error, or the status>
+SOURCE_SHADOW_OBSERVATION_FAILED = "source_shadow_observation_failed"  # :<the client's code>
+SOURCE_SHADOW_COMPARISON_FAILED = "source_shadow_comparison_failed"  # :<exception class>
+SOURCE_SHADOW_CACHE_UNWRITABLE = "source_shadow_cache_unwritable"
+SOURCE_SHADOW_WRITEBACKS_SKIPPED = "source_shadow_writebacks_skipped"  # :settings_unreadable
+SOURCE_SHADOW_FINALISE_TICKET_ERROR = "source_shadow_finalise_ticket_error"
+SOURCE_SHADOW_FINALISE_FAILED = "source_shadow_finalise_failed"  # :<exception class>
+
+# The pre-gate reasons after which code knows what the HubSpot path selected.
+_KNOWN_SELECTION_REASONS = ("candidates", "page_full", "none")
+_CODE_RE = re.compile(r"[a-z][a-z0-9_]{0,63}")
+_RERUN_PASS_PREFIX = f"{os_bundle.RERUN_CYCLE_PREFIX}:"
 
 
-def _build_hubspot_hydrate(settings: Any, read_token: Callable[[], Any]) -> Callable[[str], Any]:
-    """RED skeleton (task 2)."""
-    return lambda hubspot_ticket_id: None
+class _Notes:
+    """Codes for the run record's summary, in the order they happened: a flag
+    is written bare, a counted code as `code=n`."""
+
+    def __init__(self) -> None:
+        self._entries: dict[str, Optional[int]] = {}
+
+    def flag(self, code: str) -> None:
+        self._entries.setdefault(code, None)
+
+    def count(self, code: str, n: int = 1) -> None:
+        self._entries[code] = (self._entries.get(code) or 0) + n
+
+    def merge(self, codes: Any) -> None:
+        for code, n in codes.items() if isinstance(codes, dict) else []:
+            self.count(code, n)
+
+    def summary(self) -> Optional[str]:
+        parts = [code if n is None else f"{code}={n}" for code, n in self._entries.items()]
+        return "; ".join(parts) or None
 
 
-def _build_thread_fetch(settings: Any, read_token: Callable[[], Any]) -> Callable[[str], Any]:
-    """RED skeleton (task 2)."""
-    return lambda hubspot_ticket_id: None
+def _join(*parts: Optional[str]) -> Optional[str]:
+    return "; ".join(part for part in parts if part) or None
 
 
-def run_source_shadow(ctx: Any, deps: Any) -> Any:
-    """The `shadow` mode runner. RED skeleton (task 2): no behaviour yet."""
-    return None
+def _orchestrator() -> Any:
+    """scripts/run_tickets.py, for the `hubspot` runner's own steps (the run
+    context, the child environment, the launch-and-map rule). Looked up when a
+    run needs them, never imported at load and never for a type: the types are
+    run_types', so it does not matter which copy of the script answers."""
+    return importlib.import_module("run_tickets")
+
+
+def _hubspot_api() -> Any:
+    return importlib.import_module("ticket_pipeline.hubspot_api")
+
+
+def _build_classify(settings: dict) -> Callable[[dict], Any]:
+    """The classify step both sides go through: `llm.classify`, the small
+    model, with the real categories config (D-05). Imported here, on first
+    use: a run that compares nothing never loads the model library."""
+    import yaml
+
+    from ticket_pipeline import llm
+
+    with (_ROOT / "config" / "categories.yaml").open(encoding="utf-8") as handle:
+        categories_cfg = yaml.safe_load(handle) or {}
+
+    def classify(context: dict) -> Any:
+        return llm.classify(context, settings, categories_cfg, [])
+
+    return classify
+
+
+def _build_hubspot_hydrate(settings: dict, read_token: Callable[[], Any]) -> Callable[[str], Any]:
+    """Hydration of one HubSpot candidate the engine shadow did not classify in
+    this run: one single-ticket search (the pre-gate's search asks for the
+    modified time only), then hydration's own function. Raises LookupError when
+    there is no token or HubSpot returns no such ticket."""
+
+    def hydrate_one(hubspot_ticket_id: str) -> Any:
+        if not (isinstance(hubspot_ticket_id, str) and _HUBSPOT_ID_RE.fullmatch(hubspot_ticket_id)):
+            raise LookupError("not a HubSpot ticket id")
+        token = read_token()
+        if not token:
+            raise LookupError("no HubSpot token")
+        hs = _hubspot_api()
+        answer = hs.search_tickets(
+            {
+                "filterGroups": [
+                    {"filters": [{"propertyName": "hs_object_id", "operator": "EQ", "value": hubspot_ticket_id}]}
+                ],
+                "properties": hs.TICKET_BASE_PROPERTIES + list(settings.get("ticket_custom_properties") or []),
+                "limit": 1,
+            },
+            token,
+        )
+        hits = answer.get("results") if isinstance(answer, dict) else None
+        if not (isinstance(hits, list) and hits and isinstance(hits[0], dict)):
+            raise LookupError("HubSpot returned no such ticket")
+        return os_bundle.hydrate.hydrate_ticket(hits[0], settings, token)
+
+    return hydrate_one
+
+
+def _build_thread_fetch(settings: dict, read_token: Callable[[], Any]) -> Callable[[str], Any]:
+    """`os` mode's own thread fetch (two requests, one counted email_thread),
+    for a HubSpot-linked ticket only the OS selected."""
+
+    def fetch(hubspot_ticket_id: str) -> Any:
+        return os_bundle.fetch_thread(hubspot_ticket_id, settings, read_token())
+
+    return fetch
+
+
+def _token_reader(deps: Deps) -> Callable[[], Any]:
+    """The HubSpot token, read at most once for the comparison and only when a
+    ticket needs it."""
+    box: dict = {}
+
+    def read() -> Any:
+        if "token" not in box:
+            token: Any = None
+            failure: Optional[str] = None
+            try:
+                token = deps.read_hubspot_token()
+            except Exception as e:  # noqa: BLE001 - no token, then: no HubSpot request
+                failure = type(e).__name__
+            if failure is not None:
+                _log(f"hubspot token unreadable: error={failure}")
+            box["token"] = token if isinstance(token, str) and token.strip() else None
+        return box["token"]
+
+    return read
+
+
+def _settings(deps: Deps) -> Optional[dict]:
+    loaded: Any = None
+    failure: Optional[str] = None
+    try:
+        loaded = deps.load_settings()
+    except Exception as e:  # noqa: BLE001 - the pre-gate decides what that means for the HubSpot path
+        failure = type(e).__name__
+    if failure is not None:
+        _log(f"settings unreadable: error={failure}")
+    return loaded if isinstance(loaded, dict) else None
+
+
+def _comparison_list(api: Any) -> tuple[Optional[list], Optional[str], Optional[str]]:
+    """The OS's unprocessed list, asked with COMPARISON_LIMIT: (payloads, None,
+    None), or (None, the cause for the summary, the list code). This is the
+    snapshot the whole comparison is made against (RESEARCH Pitfall 7)."""
+    code: Optional[str] = None
+    detail: Optional[str] = None
+    answer: Any = None
+    try:
+        answer = api.fetch_unprocessed(COMPARISON_LIMIT)
+    except Exception as e:  # noqa: BLE001 - whatever stopped the list, the HubSpot path goes on
+        raised = getattr(e, "code", None)
+        if raised in os_pass.LIST_FAILURE_CODES:
+            code = raised
+        else:
+            code, detail = os_pass.LIST_ERROR, type(e).__name__
+    payloads: list = []
+    if code is None:
+        payloads, problem = os_pass._list_payloads(answer)
+        if problem is not None:
+            code, detail = os_pass.LIST_ERROR, problem
+    if code is not None:
+        cause = f"{code}:{detail}" if detail else code
+        _log(f"OS list not available ({cause}): no comparison this run; the HubSpot path goes on")
+        return None, cause, code
+    _log(f"OS list answered: tickets={len(payloads)} limit={COMPARISON_LIMIT}")
+    return payloads[:COMPARISON_LIMIT], None, None
+
+
+def _rerun_refs(reruns: Any) -> set:
+    """The tickets a pending rerun names, by the orchestrator's own rule for
+    which rerun rows get a run-context entry."""
+    refs: set = set()
+    for row in reruns if isinstance(reruns, (list, tuple)) else []:
+        if isinstance(row, dict) and row.get("ticket_id") not in (None, "") and row.get("id") not in (None, ""):
+            refs.add(str(row["ticket_id"]))
+    return refs
+
+
+def _lay_signals(context: dict, resolved: dict, reruns: Any) -> None:
+    """Lay each resolved candidate's client signal over the run context, as its
+    draft's cycle key: the agent's own draft step then goes through the atomic
+    replace, keyed as an `os` pass would key it.
+
+    Precedence: a rerun's entry wins over the signal; the signal wins over a
+    rollback entry (`hubspot:<run id>`). A candidate the OS did not resolve, or
+    reported no signal for, keeps whatever the context already holds for it:
+    a rollback entry, or nothing, which is today's plain draft write."""
+    reran = _rerun_refs(reruns)
+    for hubspot_id, known in resolved.items():
+        signal = known.get("signal") if isinstance(known, dict) else None
+        if hubspot_id in reran or not isinstance(signal, dict):
+            continue
+        context[hubspot_id] = {
+            "os_ticket_id": known.get("os_ticket_id"),
+            "cycle_key": signal["id"],
+            "signal_at": signal["at"],
+            "signal_id": signal["id"],
+        }
+
+
+def _compare_and_post(
+    ctx: RunContext, deps: Deps, api: Any, settings: dict, decision: dict, resolved: dict, os_list: list, notes: _Notes
+) -> None:
+    """Compare, keep the cache, build the observation and post it. Raises
+    whatever goes wrong outside the post itself; `_observe` turns that into a code."""
+    read_origin = getattr(deps, "read_os_origin", None) or _tickets_api().read_os_origin
+    origin = read_origin()
+    read_token = _token_reader(deps)
+    cache_file = seen_cache_path(deps.root)
+    cache = load_seen_cache(cache_file)
+    known = dict(cache)
+
+    result = compare_sources(
+        dict(decision, resolved=resolved),
+        os_list,
+        ComparisonDeps(
+            classify=_build_classify(settings),
+            hydrate_hubspot_context=_build_hubspot_hydrate(settings, read_token),
+            fetch_hubspot_thread=_build_thread_fetch(settings, read_token),
+            engine_classification=lambda hubspot_id: _engine_classification(deps.root, hubspot_id, ctx.started_at),
+            settings=settings,
+            os_origin=origin,
+            cache=cache,
+        ),
+    )
+    notes.merge(result.codes)
+
+    if cache != known:
+        failure: Optional[str] = None
+        try:
+            save_seen_cache(cache_file, cache)
+        except Exception as e:  # noqa: BLE001 - the cost is one more classify call per ticket, next run
+            failure = type(e).__name__
+        if failure is not None:
+            notes.flag(SOURCE_SHADOW_CACHE_UNWRITABLE)
+            _log(f"{SOURCE_SHADOW_CACHE_UNWRITABLE}: error={failure}")
+
+    if result.classifier_unavailable:
+        notes.flag(f"{SOURCE_SHADOW_SKIPPED}:classify_unavailable")
+        _log("classifier unavailable: no observation is posted for this run")
+        return
+
+    body = build_observation(ctx.run_id, ctx.started_at, settings, result.hubspot_side, result.os_side)
+    verdict: Any = None
+    failure = None
+    cause = ""
+    try:
+        verdict = api.post_source_shadow_observations(body)
+    except Exception as e:  # noqa: BLE001 - whatever stopped the post, it is a code
+        raised = getattr(e, "code", None)
+        failure = raised if raised in os_pass.LIST_FAILURE_CODES else os_pass.LIST_ERROR
+        cause = type(e).__name__
+    if failure is not None:
+        notes.flag(f"{SOURCE_SHADOW_OBSERVATION_FAILED}:{failure}")
+        _log(f"observation not posted: code={failure} cause={cause}")
+        return
+    status = verdict.get("status") if isinstance(verdict, dict) else None
+    status = status if isinstance(status, int) and not isinstance(status, bool) else None
+    if status is not None and 200 <= status < 300:
+        _log(
+            f"observation posted: run={ctx.run_id} replayed={verdict.get('replayed') is True} "
+            f"hubspot_selected={len(body['hubspot']['selected'])} os_selected={len(body['os']['selected'])}"
+        )
+        return
+    error = verdict.get("error") if isinstance(verdict, dict) else None
+    if isinstance(error, str) and _CODE_RE.fullmatch(error):
+        detail = error
+    else:
+        detail = str(status) if status is not None else "unknown"
+    notes.flag(f"{SOURCE_SHADOW_OBSERVATION_REFUSED}:{detail}")
+    _log(f"observation refused: status={status} detail={detail}")
+
+
+def _observe(
+    ctx: RunContext, deps: Deps, api: Any, settings: Any, decision: dict, resolved: dict, os_list: list, notes: _Notes
+) -> None:
+    """The comparison half of a run, inside one guard: whatever happens here is
+    a code in the summary and never changes the HubSpot path (threat T-93-58)."""
+    reason = decision.get("reason")
+    if reason not in _KNOWN_SELECTION_REASONS:
+        named = reason if isinstance(reason, str) and _CODE_RE.fullmatch(reason) else "unknown"
+        notes.flag(f"{SOURCE_SHADOW_SKIPPED}:pregate_{named}")
+        _log(f"the pre-gate failed open ({named}): what HubSpot selects is unknown, so nothing is compared")
+        return
+    if not isinstance(settings, dict):
+        notes.flag(f"{SOURCE_SHADOW_SKIPPED}:settings_unreadable")
+        return
+    failure: Optional[str] = None
+    try:
+        _compare_and_post(ctx, deps, api, settings, decision, resolved, os_list, notes)
+    except Exception as e:  # noqa: BLE001 - the measuring half never fails a run
+        failure = type(e).__name__
+    if failure is not None:
+        notes.flag(f"{SOURCE_SHADOW_COMPARISON_FAILED}:{failure}")
+        _log(f"{SOURCE_SHADOW_COMPARISON_FAILED}: error={failure}")
+
+
+def _result_tickets(path: Any) -> list:
+    """The per-ticket entries of the agent's result file. Read only after the
+    orchestrator's own reader judged the file complete."""
+    try:
+        loaded = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError, RecursionError):
+        return []
+    tickets = loaded.get("tickets") if isinstance(loaded, dict) else None
+    return tickets if isinstance(tickets, list) else []
+
+
+def _finalise_ticket(
+    ctx: RunContext, deps: Deps, api: Any, item: dict, hubspot_id: str, known: dict, context: dict, notes: _Notes
+) -> None:
+    """Report one HubSpot-path pass to the OS, through the two helpers `os`
+    mode's finaliser uses, with the mode word `shadow`:
+
+        completed, with a draft id        a `completed` write-back; then its
+                                          action items, named by the OS ticket
+                                          id, with the draft's cycle key as the
+                                          pass id
+        completed, with NO draft id       a `failed` write-back with
+                                          draft_write_failed: a ticket is never
+                                          reported processed without its draft
+        failed                            a `failed` write-back with the mapped code
+
+    A completed entry whose classification the contract refuses gets no
+    write-back (its draft is in place, so it is not a failed pass) and a code.
+    The items are posted by this function only when the pass id is stable (the
+    client signal's id, or a rerun's key); otherwise they are left to the
+    forwarder, exactly as in `hubspot` mode."""
+    held = context.get(hubspot_id)
+    cycle_key = held.get("cycle_key") if isinstance(held, dict) else None
+    signal = known.get("signal")
+    entry = {
+        "ref": hubspot_id,
+        "hubspot_ticket_id": hubspot_id,
+        "os_ticket_id": known.get("os_ticket_id"),
+        "signal": signal,
+        "cycle_key": cycle_key,
+    }
+    drafted = False
+    ticket_result: Optional[dict] = None
+    if item.get("outcome") == os_pass.OUTCOME_COMPLETED:
+        drafted = _text(item.get("draft_id")) is not None
+        if not drafted:
+            ticket_result = {"outcome": os_pass.OUTCOME_FAILED, "failure_reason_code": os_pass.DRAFT_WRITE_FAILED}
+        else:
+            classification = os_pass.normalise_classification(item.get("classification"))
+            if classification is None:
+                notes.count(os_pass.CLASSIFICATION_UNUSABLE)
+                _log(f"{os_pass.CLASSIFICATION_UNUSABLE}: ticket={entry['os_ticket_id']}")
+            else:
+                ticket_result = {"outcome": os_pass.OUTCOME_COMPLETED, "classification": classification}
+    else:
+        # the write-back builder maps the agent's own code into the OS's six (`other` for the rest)
+        code = item.get("failure_reason_code") if item.get("outcome") == os_pass.OUTCOME_FAILED else None
+        ticket_result = {"outcome": os_pass.OUTCOME_FAILED, "failure_reason_code": code}
+
+    if ticket_result is not None:
+        wrote = os_pass.post_ticket_writeback(api, entry, ticket_result, ctx.run_id, source.MODE_SHADOW)
+        for code in wrote["codes"]:
+            notes.count(code)
+
+    signal_id = signal.get("id") if isinstance(signal, dict) else None
+    stable = isinstance(cycle_key, str) and (cycle_key == signal_id or cycle_key.startswith(_RERUN_PASS_PREFIX))
+    if drafted and stable:
+        sent = os_pass.post_ticket_action_items(entry, item.get("action_items"), deps.seen_path)
+        for code in sent["codes"]:
+            notes.count(code)
+
+
+def _finalise(
+    ctx: RunContext, deps: Deps, api: Any, settings: Any, outcome: RunOutcome, resolved: dict, context: dict, notes: _Notes
+) -> None:
+    """After the agent: write back what the HubSpot path did with each ticket
+    the OS resolved before the launch. Each ticket inside its own guard; nothing
+    here changes the outcome's status or counts.
+
+    Nothing is written back when the agent left no complete result (an agent
+    outage must not count against every candidate), in a dry run, or for a
+    ticket the result does not name (the agent applies its own dedupe: a
+    candidate it skipped is not a failed pass)."""
+    if not resolved or outcome.failure_reason_code is not None:
+        return
+    if not isinstance(settings, dict):
+        notes.flag(f"{SOURCE_SHADOW_WRITEBACKS_SKIPPED}:settings_unreadable")
+        return
+    if settings.get("dry_run"):
+        _log(f"dry run: no write-back and no action-item post (resolved={len(resolved)})")
+        return
+    named: set = set()
+    for item in _result_tickets(ctx.result_path):
+        hubspot_id = item.get("ref") if isinstance(item, dict) else None
+        if not isinstance(hubspot_id, str) or hubspot_id in named:
+            continue
+        named.add(hubspot_id)
+        known = resolved.get(hubspot_id)
+        if not isinstance(known, dict):
+            continue  # the mirror had not seen it: today's behaviour, nothing written back
+        failure: Optional[str] = None
+        try:
+            _finalise_ticket(ctx, deps, api, item, hubspot_id, known, context, notes)
+        except Exception as e:  # noqa: BLE001 - one ticket never stops the others
+            failure = type(e).__name__
+        if failure is not None:
+            notes.count(SOURCE_SHADOW_FINALISE_TICKET_ERROR)
+            _log(f"{SOURCE_SHADOW_FINALISE_TICKET_ERROR}: ticket={known.get('os_ticket_id')} error={failure}")
+
+
+def run_source_shadow(ctx: RunContext, deps: Deps) -> RunOutcome:
+    """`shadow` mode: the HubSpot path, authoritative and unchanged, plus the
+    source comparison. Registered in `run_tickets.RUNNER_SPECS["shadow"]`.
+
+    In order:
+
+        0. the routine gate. Paused: one `skipped` outcome, nothing asked.
+        1. THE OS LIST, first, with limit 100: the snapshot the comparison is
+           made against. If it cannot be had the comparison is skipped for
+           this run (a code) and the HubSpot path goes on.
+        2. the HubSpot decision, by the one candidate rule (`deps.decide`),
+           exactly as the `hubspot` runner asks it.
+        3. each candidate is asked of the OS's single-ticket route (which OS
+           ticket, which client signal). Skipped when the list was refused for
+           its signature or its secret: the OS would refuse these too.
+        4. when the agent will run: the run context, started from the rollback
+           entries exactly as the `hubspot` runner starts it, then each resolved
+           candidate's signal laid over it, then the reruns over that; and the
+           engine-shadow step, as the `hubspot` runner runs it.
+        5. THE COMPARISON and THE OBSERVATION, inside one guard. Posted before
+           the agent, so before every write-back of this run: the OS computes
+           its reasons at ingest.
+        6. the agent, through the `hubspot` runner's own launch-and-map rule,
+           with its command, its model and no tool restriction.
+        7. the write-backs and the action items of what the agent completed.
+
+    WHAT A `shadow` RUN WRITES TO THE OS
+        - one observation (step 5);
+        - per ticket the agent's result names AND the OS resolved in step 3: a
+          write-back with source mode `shadow` (`completed`, or `failed`), and
+          for a completed one with a stable pass id its action-item envelope
+          with the OS ticket id and the pass id.
+    Nothing is written for a ticket only the OS selected. This runner writes no
+    draft: every draft of the run is the agent's own, so the OS half cannot add
+    a second one. It never writes the HubSpot path's own state file either; in
+    this mode the agent keeps that file, as in `hubspot` mode.
+
+    WHAT AN OS FAILURE DOES
+    Nothing to the HubSpot half. The outcome's status, counts and failure code
+    are the agent's own in every case; a failure of the comparison, of a lookup
+    or of a write-back is a code appended to `error_summary`. `hubspot_calls`
+    stays None, as in `hubspot` mode: the agent's calls cannot be observed.
+    """
+    orchestrator = _orchestrator()
+    if not deps.read_routine_enabled(run_types.ROUTINE):
+        _log("routine paused (or gate unreachable): nothing is asked of anyone")
+        return RunOutcome(status=run_types.STATUS_SKIPPED, error_summary=orchestrator.SUMMARY_ROUTINE_PAUSED)
+
+    notes = _Notes()
+    settings = _settings(deps)
+    api = getattr(deps, "os_api", None)
+    if api is None:
+        api = _tickets_api()
+
+    # 1. the OS list, FIRST
+    os_list, cause, list_code = _comparison_list(api)
+    if cause is not None:
+        notes.flag(f"{SOURCE_SHADOW_SKIPPED}:{cause}")
+
+    # 2. the HubSpot decision, as the hubspot runner asks it
+    decision = deps.decide(ctx.mode, deps)
+    kind = decision.get("decision") if isinstance(decision, dict) else None
+    if kind == "paused":
+        return RunOutcome(status=run_types.STATUS_SKIPPED, error_summary=orchestrator.SUMMARY_ROUTINE_PAUSED)
+    decision = decision if isinstance(decision, dict) else {}
+
+    # 3. which OS ticket is each candidate?
+    resolved: dict = {}
+    if decision.get("reason") in _KNOWN_SELECTION_REASONS and list_code not in os_pass.NO_RETRY_CODES:
+        lookup_codes: dict = {}
+        resolved = resolve_hubspot_candidates(decision.get("candidates"), deps, lookup_codes)
+        notes.merge(lookup_codes)
+
+    # 4. the run context and the engine-shadow step, when the agent will run.
+    # `no_work` is the only answer that does not launch: this path is fail-open.
+    launch = kind != "no_work"
+    context: dict = {}
+    env: Any = None
+    context_note: Optional[str] = None
+    if launch:
+        reruns = decision.get("reruns")
+        context, context_note = orchestrator.build_run_context(ctx, deps, reruns)
+        _lay_signals(context, resolved, reruns)
+        orchestrator.write_run_context(ctx, context)
+        env = orchestrator.child_environment(ctx, deps)
+        step_failure: Optional[str] = None
+        try:
+            deps.engine_shadow_step(env)
+        except Exception as e:  # noqa: BLE001 - the engine shadow never fails a run
+            step_failure = type(e).__name__
+        if step_failure is not None:
+            _log(f"engine_shadow_step_failed:{step_failure}")
+
+    # 5. the comparison and the observation, before the agent and its write-backs
+    if cause is None:
+        _observe(ctx, deps, api, settings, decision, resolved, os_list or [], notes)
+
+    if not launch:
+        return RunOutcome(status=run_types.STATUS_SUCCESS, error_summary=notes.summary())
+
+    # 6. the agent: the hubspot runner's command and its launch-and-map rule
+    outcome = orchestrator.launch_and_collect(
+        ctx, deps, orchestrator.agent_command(), env, [context_note] if context_note else []
+    )
+
+    # 7. what the HubSpot path did, reported to the OS
+    failure: Optional[str] = None
+    try:
+        _finalise(ctx, deps, api, settings, outcome, resolved, context, notes)
+    except Exception as e:  # noqa: BLE001 - reporting never changes the outcome
+        failure = type(e).__name__
+    if failure is not None:
+        notes.flag(f"{SOURCE_SHADOW_FINALISE_FAILED}:{failure}")
+        _log(f"{SOURCE_SHADOW_FINALISE_FAILED}: error={failure}")
+    outcome.error_summary = _join(outcome.error_summary, notes.summary())
+    return outcome

@@ -2297,6 +2297,23 @@ def test_a_run_whose_agent_left_no_result_writes_nothing_back(shadow: ShadowWorl
     assert len(shadow.observations) == 1  # it was posted before the agent was launched
 
 
+def test_an_incomplete_result_writes_nothing_back_whatever_its_entries_say(shadow: ShadowWorld) -> None:
+    """A result file with no status is not a result (the orchestrator's own
+    rule). Its entries are not acted on: an agent that died mid-write must not
+    get a ticket reported processed, or counted toward parking."""
+
+    def dies_mid_write(command: Any, env: Any) -> int:
+        unfinished = {"tickets_processed": 2, "drafts_created": 1, "tickets": [done(B_HS_ID, "draft-B"), broke(H_HS_ID)]}
+        Path(env[run_types.RESULT_PATH_ENV]).write_text(json.dumps(unfinished), encoding="utf-8")
+        return 0
+
+    shadow.agent = dies_mid_write
+    shadow.run()
+    assert shadow.record["status"] == "failure"
+    assert shadow.record["failure_reason_code"] == "agent_exited_abnormally"
+    assert shadow.writebacks == [] and shadow.ingest.posts == []
+
+
 def test_an_agent_that_cannot_be_started_is_the_hubspot_paths_failure_record(shadow: ShadowWorld) -> None:
     def cannot_start(command: Any, env: Any) -> int:
         raise FileNotFoundError(f"no such command {EXC_MARKER}")
@@ -2499,6 +2516,64 @@ def test_a_finaliser_that_raises_is_a_code_and_the_agents_outcome_stands(
     assert (record["status"], record["tickets_processed"], record["drafts_created"]) == ("partial", 1, 1)
     assert record["error_summary"] == f"{AGENT_SUMMARY_ONE_FAILED}; source_shadow_finalise_ticket_error=2"
     assert EXC_MARKER not in json.dumps(record)
+
+
+def test_a_result_that_cannot_be_read_for_the_write_backs_is_a_code_and_the_outcome_stands(
+    shadow: ShadowWorld, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def explode(path: Any) -> list:
+        raise RuntimeError(f"result {EXC_MARKER}")
+
+    monkeypatch.setattr(source_shadow, "_result_tickets", explode)
+    shadow.run()
+    record = shadow.record
+    assert (record["status"], record["tickets_processed"], record["drafts_created"]) == ("partial", 1, 1)
+    assert record["error_summary"] == f"{AGENT_SUMMARY_ONE_FAILED}; source_shadow_finalise_failed:RuntimeError"
+    assert shadow.writebacks == []
+
+
+def test_settings_that_cannot_be_read_by_the_runner_compare_nothing_and_write_nothing_back(shadow: ShadowWorld) -> None:
+    """Without settings the runner knows neither the cap and stages to report
+    nor whether this is a dry run: no observation, and no write-back."""
+    deps = shadow.deps()
+    loads: list = []
+
+    def load_settings() -> dict:
+        loads.append(1)
+        if len(loads) == 1:  # the runner's own read fails; the pre-gate's, a moment later, does not
+            raise RuntimeError(f"yaml {EXC_MARKER}")
+        return shadow.settings
+
+    deps.load_settings = load_settings
+    rt.run(deps)
+    record = shadow.record
+    assert shadow.observations == [] and shadow.writebacks == [] and shadow.ingest.posts == []
+    assert shadow.launch_attempts == 1
+    assert shadow.agent.contexts == [{B_HS_ID: B_ENTRY, H_HS_ID: H_ENTRY}]
+    assert (record["status"], record["drafts_created"]) == ("partial", 1)
+    assert record["error_summary"] == (
+        f"{AGENT_SUMMARY_ONE_FAILED}; source_shadow_skipped:settings_unreadable; "
+        "source_shadow_writebacks_skipped:settings_unreadable"
+    )
+
+
+def test_a_decision_that_raises_is_the_orchestrators_failure_record_as_in_hubspot_mode(
+    make_shadow_world: Callable[..., ShadowWorld],
+) -> None:
+    def explode(mode: str, deps: Any) -> dict:
+        raise RuntimeError(f"pre-gate {EXC_MARKER}")
+
+    records = []
+    for name, mode in (("plain", "hubspot"), ("compared", "shadow")):
+        world = make_shadow_world(name, mode=mode)
+        world.decide = explode
+        world.run()
+        records.append(world.record)
+        assert world.launch_attempts == 0 and world.writebacks == [] and world.observations == []
+    plain, compared = records
+    assert compared["status"] == plain["status"] == "failure"
+    assert compared["error_summary"] == plain["error_summary"] == "runner_exception:RuntimeError"
+    assert compared["source_mode"] == "shadow"
 
 
 # -------------------------------------------------- the HubSpot side, when it is not known
