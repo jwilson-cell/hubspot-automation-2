@@ -42,6 +42,24 @@ already holds it: a later pass re-created the item and its post is still owed.
 A record with no retry entry is sent exactly as before; a record whose key is
 uuid-shaped (a ticket with no HubSpot id) is sent as `os_ticket_id`.
 
+WHICH RECORD A PASS'S RETRY IS RESENT FROM (review WR-46)
+The queue keeps one record per pass of a ticket, oldest first, and no record
+names its pass. An entry that names a pass is owed ONE post: that pass's. So
+it is resent from the NEWEST record of its ticket that holds the action type,
+the record the owed pass's run appended, and never from an older one: an
+older record's item under the new pass id would deliver a stale item as the
+current one and leave the current one unsent. Older records' items of such a
+key are not sent at all (`superseded` in the summary line). The pass is part
+of the entry's identity in the other direction too: a confirmation drops the
+entry only while it still names the pass that was confirmed, so an entry a
+newer pass wrote meanwhile is kept. An entry that names no pass (its cycle key
+was not one the OS accepts) is matched as before: the first record holding the
+action type.
+
+The limit, stated: the file holds ids, so what is resent is the queue's copy
+of the item, found by position. If the owed pass's run queued no record for
+the ticket, the newest record is an earlier pass's.
+
 The retry file's path is derived from the seen-set's, so one injected path
 moves both. Every write here goes through a temp file and a rename.
 
@@ -177,10 +195,21 @@ def remember_retry(entries, seen_path=None) -> bool:
     return _write_json(retry_path(seen_path), held)
 
 
-def forget_retry(keys, seen_path=None) -> bool:
-    """Drop the entries of confirmed keys. Nothing is written when none is held."""
+def forget_retry(keys, seen_path=None, passes=None) -> bool:
+    """Drop the entries of confirmed keys. Nothing is written when none is held.
+
+    `passes`, when given, maps a key to the `pass_id` its entry held when the
+    confirmed post was made (None for an entry with none, or for no entry).
+    The pass is part of an entry's identity: an entry is dropped only while it
+    still names that pass. One that another run has since replaced with a newer
+    pass is a different post, still owed, and is kept. With no `passes` the
+    keys are dropped whatever they name."""
     held = load_retry(seen_path)
-    dropped = [key for key in keys if key in held]
+    dropped = [
+        key
+        for key in keys
+        if key in held and (passes is None or held[key].get("pass_id") == passes.get(key))
+    ]
     if not dropped:
         return True
     for key in dropped:
@@ -199,6 +228,38 @@ def _retry_ids(ticket_id: str, entry) -> tuple:
     return os_ticket_id, (pass_id if valid_pass_id(pass_id) else None)
 
 
+def _record_items(rec) -> tuple:
+    """(ticket key, action items) of one queue record, or ("", []) when it is
+    not a record this script forwards."""
+    if not isinstance(rec, dict):
+        return "", []
+    ticket_id = str(rec.get("ticket_id") or "").strip()
+    items = rec.get("action_items") or []
+    if not ticket_id or not isinstance(items, list):
+        return "", []
+    return ticket_id, items
+
+
+def newest_record_of_pass_held_keys(records, retry) -> dict:
+    """key -> the index of the NEWEST queue record that holds an item of that
+    key, for every key whose retry entry names a pass the OS accepts.
+
+    That record is the one a pass's retry is resent from (see the module
+    docstring). A key whose entry names no pass is not in the answer: it is
+    matched by the earlier rule."""
+    newest: dict[str, int] = {}
+    for index, rec in enumerate(records):
+        ticket_id, items = _record_items(rec)
+        for it in items:
+            if not (isinstance(it, dict) and it.get("action_type")):
+                continue
+            key = _key(ticket_id, str(it["action_type"]))
+            entry = retry.get(key)
+            if isinstance(entry, dict) and valid_pass_id(entry.get("pass_id")):
+                newest[key] = index
+    return newest
+
+
 def main(queue_path=None, seen_path=None) -> int:
     queue = Path(queue_path) if queue_path is not None else QUEUE_PATH
     seen_file = _seen_path(seen_path)
@@ -209,32 +270,37 @@ def main(queue_path=None, seen_path=None) -> int:
 
     seen = load_seen(seen_file)
     retry = load_retry(seen_file)
+    newest = newest_record_of_pass_held_keys(records, retry)
 
-    forwarded = already = errors = 0
+    forwarded = already = errors = superseded = 0
     fresh_keys: set[str] = set()
+    sent_under: dict[str, object] = {}  # key -> the pass id its entry held when it was sent
 
-    for rec in records:
-        if not isinstance(rec, dict):
-            continue
-        ticket_id = str(rec.get("ticket_id") or "").strip()
-        items = rec.get("action_items") or []
-        if not ticket_id or not isinstance(items, list) or not items:
+    for index, rec in enumerate(records):
+        ticket_id, items = _record_items(rec)
+        if not ticket_id or not items:
             continue
 
         # Forward only items not already delivered (by ticket + action_type) —
         # and any item the retry file still holds: its post is owed even when an
-        # earlier pass marked the key delivered.
-        fresh = [
-            it
-            for it in items
-            if isinstance(it, dict)
-            and it.get("action_type")
-            and (
-                _key(ticket_id, str(it["action_type"])) not in seen
-                or _key(ticket_id, str(it["action_type"])) in retry
-            )
-        ]
-        already += len(items) - len(fresh)
+        # earlier pass marked the key delivered. An item whose entry names a
+        # pass is owed from ONE record, the newest that holds it (WR-46); the
+        # same key in an older record is another pass's item and is not sent.
+        fresh = []
+        stale = 0
+        for it in items:
+            if not (isinstance(it, dict) and it.get("action_type")):
+                continue
+            key = _key(ticket_id, str(it["action_type"]))
+            if key in newest:
+                if newest[key] != index:
+                    stale += 1
+                elif key in retry:
+                    fresh.append(it)
+            elif key not in seen or key in retry:
+                fresh.append(it)
+        superseded += stale
+        already += len(items) - len(fresh) - stale
         if not fresh:
             continue
 
@@ -260,7 +326,9 @@ def main(queue_path=None, seen_path=None) -> int:
                 for it in group:
                     key = _key(ticket_id, str(it["action_type"]))
                     fresh_keys.add(key)
-                    retry.pop(key, None)
+                    entry = retry.pop(key, None)
+                    if key not in sent_under:
+                        sent_under[key] = entry.get("pass_id") if isinstance(entry, dict) else None
                 status = result.get("status", "")
                 _log(
                     f"ticket {ticket_id}: forwarded {len(group)} item(s) "
@@ -285,11 +353,12 @@ def main(queue_path=None, seen_path=None) -> int:
     if fresh_keys:
         if not mark_forwarded(fresh_keys, seen_file):
             _log("could not persist seen-state; OS idempotency still dedups")
-        forget_retry(fresh_keys, seen_file)
+        # only an entry that still names the pass that was confirmed
+        forget_retry(fresh_keys, seen_file, passes=sent_under)
 
     _log(
         f"done: forwarded={forwarded} already_delivered={already} "
-        f"errors={errors} records={len(records)}"
+        f"errors={errors} records={len(records)}" + (f" superseded={superseded}" if superseded else "")
     )
     return 0
 

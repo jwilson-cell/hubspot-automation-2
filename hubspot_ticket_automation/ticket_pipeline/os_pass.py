@@ -1161,7 +1161,9 @@ def post_ticket_action_items(
            leave the retry file. Anything else, a 200 with errors above zero
            included, leaves both as they are, with the code
            action_items_unconfirmed: the forwarder, which runs after every
-           pass, resends the same envelope with the same pass id.
+           pass, resends this pass's items with the same pass id, from the
+           newest queue record of the ticket that holds them (never an
+           earlier pass's record; review WR-46).
     In a dry run the poster's own dry-run path is taken and no file is written.
     """
     usable = [
@@ -1194,7 +1196,8 @@ def post_ticket_action_items(
     )
     if forwarder.confirmed(result):
         forwarder.mark_forwarded(keys, seen_path)
-        forwarder.forget_retry(keys, seen_path)
+        # only this pass's entries: one a newer pass wrote meanwhile is still owed
+        forwarder.forget_retry(keys, seen_path, passes={key: pass_id for key in keys})
         return {"end": ITEMS_CONFIRMED, "items": len(usable), "codes": codes}
     codes.append(ACTION_ITEMS_UNCONFIRMED)
     mode = result.get("mode") if isinstance(result, dict) else None
