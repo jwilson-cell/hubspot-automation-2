@@ -559,6 +559,21 @@ def test_the_readme_grant_section_defers_to_the_helper_readme() -> None:
     assert section
     assert "`packn_os_hubspot_client/README.md`" in section
     assert "complete, current list" in section
+    # the count it gives for today is the helper's own
+    assert "reaches seven tables today" in section
+    assert len(_tables_the_helper_touches()) == 7
+
+
+def test_the_skills_own_description_no_longer_says_it_sends_to_the_customer() -> None:
+    text = _md(SKILL)
+    assert text.startswith("---\nname: hubspot-tickets\ndescription: ")
+    description = text.split("\n")[2]
+    lowered = description.lower()
+    assert "auto-send" not in lowered
+    assert "internal draft note" not in lowered
+    assert "pending draft in Pack'N OS" in description
+    assert "Nothing is sent to a customer" in description
+    assert "`hubspot` or `shadow`" in description
 
 
 def test_the_readme_says_which_copy_of_the_helper_is_live() -> None:

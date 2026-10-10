@@ -88,9 +88,10 @@ this at boot time. Default split: AUTOMATION=3, OS=2.
 
 ### Postgres role + grants (run ONCE pre-cutover by lconner against the prod DB)
 
-This is the list as it stood at the Phase 4 cutover. The role has gained grants
+This list, and the privilege audit table below it, are as they stood at the
+Phase 4 / 4.1 cutover, when the role had four tables. The role has gained grants
 since (the schedule report, Run now requests, the complaint mirror, and the two
-Phase 93 grants). The complete, current list is in
+Phase 93 grants) and reaches seven tables today. The complete, current list is in
 `packn_os_hubspot_client/README.md`; use that file when creating or auditing the
 role.
 

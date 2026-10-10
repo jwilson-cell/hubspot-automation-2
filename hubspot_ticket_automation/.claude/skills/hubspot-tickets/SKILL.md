@@ -1,6 +1,6 @@
 ---
 name: hubspot-tickets
-description: Process new/updated HubSpot help desk tickets — classify, draft a reply grounded in the local 3PL KB, then either (a) auto-send the reply to the customer via Gmail + log it as a HubSpot email engagement when the ticket is form-sourced with a Mispack or Carrier Issue topic, or (b) post it as an internal draft note and queue the ticket for the hourly digest for reviewer send. Action items route to either immediate urgent email or the hourly digest queue. Use when the user asks to run the ticket automation, process the ticket queue, or when invoked on cron.
+description: Process new/updated HubSpot help desk tickets when the ticket source is `hubspot` or `shadow` — classify, draft a reply grounded in the local 3PL KB, and write it as a pending draft in Pack'N OS for an operator to approve. Nothing is sent to a customer and no note is posted on the HubSpot ticket. Action items route to either an immediate urgent email or the digest queue. Use when the user asks to run the ticket automation, process the ticket queue, or when started by the wrapper on cron.
 ---
 
 # HubSpot Tickets — Processing Skill
