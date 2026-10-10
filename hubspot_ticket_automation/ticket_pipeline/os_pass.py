@@ -34,6 +34,20 @@ from the OS thread (`thread_source: "os_fallback"`) and the run goes on.
 
 The cron's local dedup file is not read here: selection is the OS's.
 
+ROLLBACK (Plan 93-23)
+---------------------
+That file still matters the moment the owner switches back to `hubspot`: the
+HubSpot path trusts it at once. So the finalizer's last step hands the file's
+path, unread, to the one writer (`source.merge_fingerprints`) with a
+fingerprint for every HubSpot-linked ticket this pass completed: a null note
+count, `processed_at` = the instant the pass finished (taken after the number
+backfill, the pass's own HubSpot write), and the OS's copy of HubSpot's
+modified time. Such a ticket is not a HubSpot candidate after a switch back,
+and is one again as soon as HubSpot reports a change later than that instant.
+A ticket with no HubSpot id is not recorded: HubSpot can never select it. A
+state write that fails is a code in the summary and nothing else: in this mode
+the OS's marker is the authority, the file only protects a rollback.
+
 WHAT THE TOOL RESTRICTION DOES AND DOES NOT DO (runbook tag D-10-RESIDUAL)
 --------------------------------------------------------------------------
 `--disallowedTools "mcp__hubspot"` removes the HubSpot MCP server's tools from
@@ -97,7 +111,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from . import hubspot_api as hs
-from . import os_bundle, run_types
+from . import os_bundle, run_types, source
 from .run_types import Deps, RunContext, RunOutcome
 
 ROUTINE = run_types.ROUTINE
@@ -735,6 +749,9 @@ ITEMS_DRY_RUN = "dry_run"
 FINALIZE_TICKET_ERROR = "finalize_ticket_error"
 FINALIZE_SETTINGS_UNREADABLE = "finalize_settings_unreadable"
 FINALIZE_FAILED = "finalize_failed"
+# The HubSpot path's state file could not be kept current (Plan 93-23). A code
+# only: it never changes a run's status or counts.
+ROLLBACK_STATE_UNWRITABLE = "rollback_state_unwritable"
 # A refused signature and a secret the OS does not hold are not retried: the
 # same request would be refused again.
 NO_RETRY_CODES = ("signature_rejected", "secret_missing")
@@ -1355,6 +1372,98 @@ def _finalize_ticket(run: _Pass, entry: dict, record: dict, ticket: dict) -> Non
     _backfill(run, entry, ticket)
 
 
+def _window_start(done: list, held: list, blind: bool) -> Optional[str]:
+    """Where the HubSpot search window may start after this pass, or None for
+    "leave it where it is".
+
+    `done`: the HubSpot modified times (the OS's copies) of the linked tickets
+    this pass completed. `held`: those of the linked tickets it listed and did
+    NOT complete. `blind`: a ticket was listed of which no HubSpot time is known.
+
+    The answer is the latest `done` time that is still BEFORE every `held`
+    time. The HubSpot search only returns tickets modified after the window's
+    start, and a ticket left uncompleted has no fingerprint: a start at or past
+    its time would hide it from the HubSpot path for good. With an uncompleted
+    ticket whose time is unknown, the start does not move at all."""
+    if blind:
+        return None
+    floor: Optional[int] = None
+    for value in held:
+        ms = source.iso_to_ms(value)
+        if ms is None:
+            return None
+        floor = ms if floor is None else min(floor, ms)
+    best: Optional[str] = None
+    best_ms: Optional[int] = None
+    for value in done:
+        ms = source.iso_to_ms(value)
+        if ms is None or (floor is not None and ms >= floor):
+            continue
+        if best_ms is None or ms > best_ms:
+            best, best_ms = value, ms
+    return best
+
+
+def _keep_rollback_state(run: _Pass, bundle_entries: list, unbundled: Any) -> None:
+    """The finalizer's last step: record the completed HubSpot-linked tickets in
+    the HubSpot path's state file, so a switch back to `hubspot` processes none
+    of them again (SPEC R15).
+
+    A ticket is recorded when it has a HubSpot id, its draft is in place and
+    the OS holds its completed pass (`WB_PROCESSED`: a 200, or a 409). Its
+    fingerprint's `processed_at` is ONE instant for the whole pass, read from
+    the run's clock here, after every ticket's last step: the pass's own
+    HubSpot write (the number backfill) is then never later than it. A ticket
+    with no HubSpot id is skipped. Any other linked ticket only holds the
+    search window open (`_window_start`).
+
+    Nothing is written in a dry run, or when no ticket qualifies. The file is
+    written, never read for a decision. A failure here is a code in the summary
+    and a log line with the exception's class: the run's status and counts are
+    what they were, because in this mode the OS's marker is the authority."""
+    summary = run.summary
+    if summary.dry_run:
+        return
+    failure: Optional[str] = None
+    answer: dict = {}
+    count = 0
+    try:
+        completed: list = []
+        held: list = []
+        for entry, ticket in zip(bundle_entries, summary.tickets):
+            hubspot_id = _id_text(entry.get("hubspot_ticket_id"))
+            if hubspot_id is None or not (hubspot_id.isascii() and hubspot_id.isdigit()):
+                continue  # HubSpot can never select it: there is nothing to record
+            context = entry.get("ticket_context")
+            updated = context.get("hs_lastmodifieddate") if isinstance(context, dict) else None
+            if ticket.get("drafted") and ticket.get("writeback") == WB_PROCESSED:
+                completed.append((hubspot_id, updated))
+            else:
+                held.append(updated)
+        if not completed:
+            return
+        finished = _iso_ms(run.deps.now())
+        entries = {
+            hubspot_id: source.fingerprint_entry(finished, updated) for hubspot_id, updated in completed
+        }
+        count = len(entries)
+        answer = source.merge_fingerprints(
+            run.deps.state_path,
+            entries,
+            _window_start([updated for _id, updated in completed], held, bool(unbundled)),
+        )
+    except Exception as e:  # noqa: BLE001 — the state file only protects a rollback
+        failure = type(e).__name__
+    if failure is not None:
+        summary.note(ROLLBACK_STATE_UNWRITABLE)
+        _log(f"{ROLLBACK_STATE_UNWRITABLE}:{failure} tickets={count}")
+        return
+    _log(
+        f"rollback state kept: tickets={count} written={answer.get('written')} "
+        f"window_moved={answer.get('last_run_at_moved')}"
+    )
+
+
 def finalize_os_run(
     ctx: RunContext,
     deps: Deps,
@@ -1383,6 +1492,9 @@ def finalize_os_run(
 
     Steps 3 to 5 are for a ticket whose draft is in place; a failed ticket gets
     its `failed` write-back and nothing else.
+
+    Then, once for the pass: the completed HubSpot-linked tickets are recorded
+    in the HubSpot path's state file (`_keep_rollback_state`, Plan 93-23).
 
     `result` None (the agent did not launch, or left no complete result) is a
     RUN-level failure: no draft exists to write and no ticket is reported
@@ -1458,6 +1570,10 @@ def finalize_os_run(
         if failure is not None:
             summary.note(FINALIZE_TICKET_ERROR)
             _log(f"{FINALIZE_TICKET_ERROR}:{failure} ticket={entry.get('os_ticket_id')}")
+
+    # Last, once: the HubSpot path's state, for a rollback (Plan 93-23). Not
+    # reached by the two early returns above, which persisted no ticket.
+    _keep_rollback_state(run, bundle_entries, unbundled)
 
     _log(
         f"finalized: tickets={len(summary.tickets)} processed={summary.tickets_processed} "

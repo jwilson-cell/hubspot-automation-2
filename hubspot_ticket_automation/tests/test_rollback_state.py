@@ -44,7 +44,17 @@ from tests.test_os_mode_run import (  # noqa: F401 - fixtures, used by name
     world,
 )
 from tests.helpers import fakes
-from tests.test_os_finalize import CONFLICT, E, completed, failed, finalize, make_entry, posts, result_of
+from tests.test_os_finalize import (
+    CONFLICT,
+    E,
+    completed,
+    failed,
+    finalize,
+    make_entry,
+    posts,
+    result_of,
+    run_context,
+)
 from ticket_pipeline import os_pass, source
 
 REAL_STATE_PATH = osm.REAL_STATE_PATH.resolve()
@@ -719,6 +729,22 @@ def test_last_run_at_stops_short_of_a_linked_ticket_the_run_did_not_complete(wor
     assert window_start < source.iso_to_ms(T3_UPDATED) and decision["candidates"] == [osm.T3_HS_ID]
 
 
+def test_last_run_at_does_not_move_onto_the_time_of_an_uncompleted_ticket(world: OsWorld) -> None:
+    # The HubSpot search asks for tickets modified AFTER the start: a start exactly
+    # at an uncompleted ticket's time would hide it as surely as one past it.
+    empty_state(world)
+    same_time = make_entry(0, payload_edit=lambda payload: payload.update(hubspot_updated_at=T3_UPDATED))
+    entries = [same_time, make_entry(2)]
+
+    finalize(world, entries, result_of(completed(same_time), failed(entries[1])))
+
+    state = read(world.state_path)
+    assert state["ticket_fingerprints"] == {osm.T1_HS_ID: code_written(STAMP, T3_UPDATED)}
+    assert state["last_run_at"] == STORED_LAST_RUN
+    decision, window_start = flip_to_hubspot(world, [(osm.T3_HS_ID, T3_UPDATED)])
+    assert window_start < source.iso_to_ms(T3_UPDATED) and decision["candidates"] == [osm.T3_HS_ID]
+
+
 def test_last_run_at_does_not_move_back_or_without_a_readable_time(world: OsWorld) -> None:
     empty_state(world, last_run_at="2026-10-09T09:00:00Z")  # later than both tickets' times
     entries = [make_entry(0), make_entry(2)]
@@ -793,6 +819,26 @@ def test_a_dry_run_leaves_the_state_file_untouched(world: OsWorld) -> None:
 
     assert summary.dry_run is True and summary.tickets_processed == 2
     assert world.state_path.read_bytes() == before
+
+
+def test_the_state_step_itself_refuses_a_dry_run(world: OsWorld) -> None:
+    # A dry run never marks a ticket drafted, so the test above cannot tell the
+    # step's own dry-run rule from that. Here the step is handed a dry-run
+    # summary that (wrongly) claims a processed ticket: still nothing is written.
+    before = world.state_path.read_bytes()
+    entry = make_entry(0)
+    claimed = {"ref": entry["ref"], "drafted": True, "writeback": os_pass.WB_PROCESSED}
+
+    def step(dry_run: bool) -> None:
+        summary = os_pass.FinalizeSummary(dry_run=dry_run, tickets=[dict(claimed)])
+        run = os_pass._Pass(run_context(world), world.deps(), world.os_api, summary, world.settings, {}, None)
+        os_pass._keep_rollback_state(run, [entry], ())
+        assert summary.codes == {}
+
+    step(dry_run=True)
+    assert world.state_path.read_bytes() == before
+    step(dry_run=False)  # the same call, live, does write: the dry-run rule is what held it
+    assert read(world.state_path)["ticket_fingerprints"][osm.T1_HS_ID]["num_notes"] is None
 
 
 def test_a_state_write_that_fails_is_a_code_and_changes_nothing_else(
