@@ -1152,7 +1152,13 @@ def test_the_sweep_skips_an_entry_that_reports_itself_a_link_or_a_junction(
             return False
 
     listing = Listing([Entry(as_link, link=True), Entry(as_junction, junction=True), Entry(plain)])
-    monkeypatch.setattr(os, "scandir", lambda _path: listing)
+    real_scandir = os.scandir
+
+    def scandir(path: Any = ".") -> Any:
+        # only the scratch root's own listing is replaced: the removal lists directories too
+        return listing if Path(path) == world.scratch_root else real_scandir(path)
+
+    monkeypatch.setattr(os, "scandir", scandir)
 
     assert rt.sweep_stale_scratch(world.root, RUN_STARTED) == 1
     assert as_link.is_dir() and as_junction.is_dir() and not plain.exists()
