@@ -2,10 +2,32 @@
 
 Public functions (called by the existing automation's SKILL.md cron skill):
     read_routine_enabled(routine_name) -> bool
+    read_ticket_source_mode() -> dict
+        (Phase 93: {"found": bool, "value": <stored JSON>} for the app_settings
+         row `ticket_source_mode`. Raises on a database error — NOT fail-closed
+         into a value; ticket_pipeline/source.py owns the decision.)
     write_run_record(routine_name, status, error_summary, tickets_processed,
-                     drafts_created, started_at_iso, finished_at_iso) -> None
+                     drafts_created, started_at_iso, finished_at_iso, *,
+                     run_id=None, source_mode=None, failure_reason_code=None,
+                     hubspot_calls=None) -> None
+        (Phase 93: the four keyword-only values are optional. Without them the
+         statement is the one this function always sent.)
     write_draft(ticket_id, routine_name, draft_body, model, prompt_version,
                 hubspot_ticket_snapshot) -> str  (draft_id, idempotent on D-05 triple)
+    replace_pending_draft(*, draft_key, os_ticket_id, routine_name, draft_body,
+                          model, base_prompt_version, cycle_key,
+                          hubspot_ticket_snapshot) -> dict
+        (Phase 93: this cycle's draft in, the ticket's other pending drafts
+         superseded, in one transaction under a per-ticket advisory lock.
+         Returns {"draft_id", "created", "superseded"}.)
+    write_cron_draft(ticket_id, routine_name, draft_body, model, prompt_version,
+                     hubspot_ticket_snapshot) -> str
+        (Phase 93: what the cron calls. write_draft when the run context names
+         no cycle for the ticket, replace_pending_draft when it does.)
+    rollback_cycle_entries(run_id, routine_name="tickets-process") -> dict
+        (Phase 93: the run-context entries a HubSpot-mode run needs so that it
+         replaces, instead of adding beside, a draft an os/shadow pass left
+         pending. One SELECT, no write.)
     read_pending_drafts(routine_name, since_hours=48) -> list[dict]
         (Phase 4.1 D-02.b - digest skill reads pending drafts via this helper
          instead of scraping HubSpot draft engagement PACKN_METADATA_V1 blocks)
@@ -42,7 +64,9 @@ Threat-register notes (T-04-* in the plan):
 
 import json
 import logging
+import os
 import subprocess
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -88,6 +112,38 @@ def read_routine_enabled(routine_name: str) -> bool:
             extra={"routine": routine_name},
         )
         return False
+
+
+def read_ticket_source_mode() -> dict:
+    """Read the `ticket_source_mode` row of app_settings (Phase 93, D-01).
+
+    Returns whether a row exists AND its stored JSON value, as two keys:
+
+        {"found": False, "value": None}       no row
+        {"found": True,  "value": <stored>}   a row; <stored> is the jsonb value as
+                                              psycopg loads it, and can itself be
+                                              None when the row holds a JSON null
+
+    The two keys are why this is not a bare value: "no row" means the cron reads
+    HubSpot, while "a row holding null" is an unrecognised setting that must stop
+    the run. Returning the value alone would make them the same None.
+
+    This function decides nothing and has no default: ticket_pipeline/source.py
+    turns the pair into a mode. Unlike read_routine_enabled above, a database
+    error is NOT caught here — it propagates, and the caller reports the setting
+    as unreadable. Folding it into a safe-looking value would let a cron that
+    cannot read its setting run against the wrong source.
+    """
+    with get_pool().connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT value FROM app_settings WHERE tenant_id = %s AND key = %s",
+                (TENANT_ID, "ticket_source_mode"),
+            )
+            row = cur.fetchone()
+    if row is None:
+        return {"found": False, "value": None}
+    return {"found": True, "value": row["value"]}
 
 
 def write_draft(
@@ -157,6 +213,327 @@ def write_draft(
             )
             existing = cur.fetchone()
             return str(existing["id"]) if existing else ""
+
+
+# ---------------------------------------------------------------------------
+# Phase 93 (plan 14) — one pending draft per ticket, replaced atomically.
+#
+# SPEC R12: when a ticket is processed again, the earlier pending draft becomes
+# `superseded` and exactly one pending draft exists. The insert of the new row
+# and the supersede of the old ones are ONE transaction under a per-ticket
+# advisory lock, so no committed state has zero or two pending drafts.
+#
+# How a second pass gets a row of its own without changing the unique key
+# (tenant, routine, ticket, prompt version): the processing cycle rides in the
+# prompt version, as `<base>#<cycle key>`. The cycle key is the id of the client
+# signal the pass consumed, `rerun:<request id>` for an operator rerun, and
+# `hubspot:<run id>` for a HubSpot-mode pass that replaces a cycle-keyed draft.
+#
+# The lock key is the string the OS's on-demand draft route hashes
+# (src/app/api/tasks/reply-draft/route.ts), so a cron pass and an operator's
+# on-demand draft for the same ticket wait for each other.
+#
+# write_draft above is untouched: a ticket with no cycle is written exactly as
+# before, statement for statement.
+#
+# Grant: the supersede needs column-level update rights on `state`,
+# `superseded_at`, `superseded_by_draft_id` and `updated_at` of the drafts table
+# (OS migration 0181; listed in this package's README). It assigns those four
+# columns and no other.
+# ---------------------------------------------------------------------------
+
+DRAFT_LOCK_PREFIX = "task_reply_draft"
+ROLLBACK_CYCLE_PREFIX = "hubspot"
+CYCLE_SEPARATOR = "#"
+RUN_CONTEXT_ENV = "PACKN_RUN_CONTEXT"
+
+DRAFT_LOCK_SQL = "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))"
+
+_REPLACE_INSERT_SQL = """
+    INSERT INTO automation_drafts
+      (id, tenant_id, routine_name, ticket_id, os_ticket_id, draft_body, model,
+       prompt_version, hubspot_ticket_snapshot, state)
+    VALUES (%s::uuid, %s, %s, %s, %s::uuid, %s, %s, %s, %s::jsonb, 'pending')
+    ON CONFLICT (tenant_id, routine_name, ticket_id, prompt_version)
+      DO NOTHING
+    RETURNING id
+    """
+
+# The only statement in this module that changes an existing draft row.
+_SUPERSEDE_SQL = """
+    UPDATE automation_drafts
+       SET state = 'superseded',
+           superseded_at = now(),
+           superseded_by_draft_id = %s::uuid,
+           updated_at = now()
+     WHERE tenant_id = %s
+       AND state = 'pending'
+       AND deleted_at IS NULL
+       AND id <> %s::uuid
+       AND (ticket_id = %s OR os_ticket_id = %s::uuid)
+    """
+
+_EXISTING_CYCLE_SQL = """
+    SELECT id FROM automation_drafts
+    WHERE tenant_id = %s AND routine_name = %s
+      AND ticket_id = %s AND prompt_version = %s
+    """
+
+_ROLLBACK_SELECT_SQL = """
+    SELECT DISTINCT ticket_id, os_ticket_id
+      FROM automation_drafts
+     WHERE tenant_id = %s
+       AND routine_name = %s
+       AND state = 'pending'
+       AND deleted_at IS NULL
+       AND strpos(prompt_version, %s) > 0
+     ORDER BY ticket_id
+    """
+
+
+def draft_lock_key(draft_key: str) -> str:
+    """The text the per-ticket advisory lock hashes: `task_reply_draft:<tenant>:<key>`."""
+    return f"{DRAFT_LOCK_PREFIX}:{TENANT_ID}:{draft_key}"
+
+
+def _required_text(name: str, value: object) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{name} must be a non-empty string")
+    return value
+
+
+def _optional_uuid(name: str, value: object) -> Optional[str]:
+    """None, or the canonical text of a uuid. Anything else is a ValueError."""
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError(f"{name} must be a uuid string or None")
+    try:
+        return str(uuid.UUID(value))
+    except ValueError:
+        raise ValueError(f"{name} must be a uuid string or None") from None
+
+
+def replace_pending_draft(
+    *,
+    draft_key: str,
+    os_ticket_id: Optional[str],
+    routine_name: str,
+    draft_body: str,
+    model: str,
+    base_prompt_version: str,
+    cycle_key: str,
+    hubspot_ticket_snapshot: dict,
+) -> dict:
+    """Write this cycle's draft and supersede the ticket's other pending drafts.
+
+    Arguments (all keyword-only):
+        draft_key            the text ticket key: the HubSpot id when the ticket
+                             has one, else the OS id as text (the OS's
+                             draftTicketKeyValue rule)
+        os_ticket_id         the OS ticket id (uuid text), written at insert;
+                             None only when it is not known
+        base_prompt_version  the real prompt version, e.g. `v3.3.0`; the row is
+                             written with `<base>#<cycle_key>`
+        cycle_key            what this pass is a response to (see the block
+                             comment above)
+
+    Returns {"draft_id": str, "created": bool, "superseded": int}.
+        created True   a new pending row was inserted; `superseded` other live
+                       pending drafts of the ticket were superseded and point at
+                       it. They are matched by the same text key, or by the same
+                       OS ticket id when one was given, across every routine: an
+                       operator's unsent on-demand draft is replaced too.
+        created False  this cycle already has a row (a replay): its id is
+                       returned and nothing is changed.
+
+    Sent, approved, rejected, superseded and soft-deleted drafts are never
+    touched.
+
+    One pool connection, one transaction, one commit. The first statement takes
+    the ticket's advisory transaction lock, which the commit (or a rollback)
+    releases.
+
+    Raises:
+        ValueError: a snapshot without `category` or `captured_at` (the rule
+            write_draft applies), an empty key, a base version that already
+            carries a cycle, or an OS id that is not a uuid. Nothing is sent to
+            the database in any of these cases.
+    """
+    if not isinstance(hubspot_ticket_snapshot, dict):
+        raise ValueError("hubspot_ticket_snapshot must be a dict")
+    if "category" not in hubspot_ticket_snapshot:
+        raise ValueError(
+            "hubspot_ticket_snapshot must include 'category' key for D-07 similarity scope"
+        )
+    if "captured_at" not in hubspot_ticket_snapshot:
+        raise ValueError(
+            "hubspot_ticket_snapshot must include 'captured_at' ISO timestamp"
+        )
+    draft_key = _required_text("draft_key", draft_key)
+    routine_name = _required_text("routine_name", routine_name)
+    cycle_key = _required_text("cycle_key", cycle_key)
+    base_prompt_version = _required_text("base_prompt_version", base_prompt_version)
+    if CYCLE_SEPARATOR in base_prompt_version:
+        raise ValueError("base_prompt_version already carries a cycle key")
+    os_id = _optional_uuid("os_ticket_id", os_ticket_id)
+
+    new_id = str(uuid.uuid4())
+    prompt_version = f"{base_prompt_version}{CYCLE_SEPARATOR}{cycle_key}"
+
+    with get_pool().connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(DRAFT_LOCK_SQL, (draft_lock_key(draft_key),))
+            cur.execute(
+                _REPLACE_INSERT_SQL,
+                (
+                    new_id,
+                    TENANT_ID,
+                    routine_name,
+                    draft_key,
+                    os_id,
+                    draft_body,
+                    model,
+                    prompt_version,
+                    json.dumps(hubspot_ticket_snapshot),
+                ),
+            )
+            inserted = cur.fetchone()
+            if inserted:
+                cur.execute(
+                    _SUPERSEDE_SQL,
+                    (new_id, TENANT_ID, new_id, draft_key, os_id),
+                )
+                result = {
+                    "draft_id": str(inserted["id"]),
+                    "created": True,
+                    "superseded": cur.rowcount,
+                }
+            else:
+                # A replay: this cycle already has its row. Nothing is superseded.
+                cur.execute(
+                    _EXISTING_CYCLE_SQL,
+                    (TENANT_ID, routine_name, draft_key, prompt_version),
+                )
+                existing = cur.fetchone()
+                if not existing:
+                    raise RuntimeError(
+                        "replace_pending_draft: the insert conflicted but no row has this cycle"
+                    )
+                result = {"draft_id": str(existing["id"]), "created": False, "superseded": 0}
+            conn.commit()
+    return result
+
+
+def load_run_context() -> dict:
+    """The run context the orchestrator wrote, or an empty map.
+
+    The file named by PACKN_RUN_CONTEXT holds one JSON object:
+
+        { "<draft key>": { "os_ticket_id": str | null, "cycle_key": str | null,
+                           "signal_at": str | null, "signal_id": str | null } }
+
+    No variable, a file that cannot be read, text that is not JSON, or JSON that
+    is not an object all give {}. With {} every draft is written the plain way.
+    """
+    path = os.environ.get(RUN_CONTEXT_ENV)
+    if not path:
+        return {}
+    try:
+        loaded = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError) as e:
+        logger.warning("run_context_unusable: %s", type(e).__name__)
+        return {}
+    if not isinstance(loaded, dict):
+        logger.warning("run_context_unusable: not an object")
+        return {}
+    return loaded
+
+
+def write_cron_draft(
+    ticket_id: str,
+    routine_name: str,
+    draft_body: str,
+    model: str,
+    prompt_version: str,
+    hubspot_ticket_snapshot: dict,
+) -> str:
+    """What the cron calls to write a draft: write_draft, or the atomic replace.
+
+    Same positional parameters and same return value (the draft id) as
+    write_draft. The run context decides which:
+
+        no entry for this ticket, or an entry with no cycle key
+            -> write_draft(...), unchanged: a plain call with no statement
+               before or after it
+        an entry with a cycle key
+            -> replace_pending_draft under that cycle, with the entry's
+               `os_ticket_id` and `prompt_version` as the base version
+
+    A cycle key that is present but unusable (an OS id that is not a uuid, a
+    blank key) raises ValueError. It is not written the plain way, because a
+    plain row beside a cycle-keyed one is a second pending draft.
+    """
+    entry = load_run_context().get(str(ticket_id))
+    cycle_key = entry.get("cycle_key") if isinstance(entry, dict) else None
+    if not (isinstance(cycle_key, str) and cycle_key):
+        return write_draft(
+            ticket_id, routine_name, draft_body, model, prompt_version, hubspot_ticket_snapshot
+        )
+    result = replace_pending_draft(
+        draft_key=str(ticket_id),
+        os_ticket_id=entry.get("os_ticket_id"),
+        routine_name=routine_name,
+        draft_body=draft_body,
+        model=model,
+        base_prompt_version=prompt_version,
+        cycle_key=cycle_key,
+        hubspot_ticket_snapshot=hubspot_ticket_snapshot,
+    )
+    return result["draft_id"]
+
+
+def rollback_cycle_entries(run_id: str, routine_name: str = "tickets-process") -> dict:
+    """Run-context entries for the tickets a HubSpot-mode run must REPLACE.
+
+    SPEC R12 / R15 (runbook tag R-ROLLBACK-ONE-DRAFT). A draft left pending by an
+    `os` or `shadow` pass has a cycle-suffixed prompt version, so a HubSpot-mode
+    pass that inserted under the bare version would sit beside it. A HubSpot-mode
+    run calls this once and puts the result in its run context; write_cron_draft
+    then replaces, under the cycle key `hubspot:<run_id>`, for exactly these
+    tickets, and writes every other ticket as before.
+
+    One entry per text ticket key that has a live pending draft of `routine_name`
+    whose prompt version carries a cycle:
+
+        { "<draft key>": { "os_ticket_id": <the row's, or None>,
+                           "cycle_key": "hubspot:<run_id>",
+                           "signal_at": None, "signal_id": None } }
+
+    One tenant-qualified SELECT. It writes nothing, and it needs only the read
+    on the drafts table the role already has. A database error propagates: the
+    caller decides what a run does when it cannot know.
+    """
+    run_id = _required_text("run_id", run_id)
+    routine_name = _required_text("routine_name", routine_name)
+    with get_pool().connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(_ROLLBACK_SELECT_SQL, (TENANT_ID, routine_name, CYCLE_SEPARATOR))
+            rows = cur.fetchall()
+    entries: dict = {}
+    for row in rows:
+        key = row["ticket_id"]
+        os_id = str(row["os_ticket_id"]) if row["os_ticket_id"] is not None else None
+        known = entries.get(key)
+        if known is not None and (known["os_ticket_id"] is not None or os_id is None):
+            continue
+        entries[key] = {
+            "os_ticket_id": os_id,
+            "cycle_key": f"{ROLLBACK_CYCLE_PREFIX}:{run_id}",
+            "signal_at": None,
+            "signal_id": None,
+        }
+    return entries
 
 
 # ---------------------------------------------------------------------------
@@ -379,6 +756,68 @@ def read_pending_drafts(routine_name: str, since_hours: int = 48) -> list[dict]:
         return []
 
 
+# ---------------------------------------------------------------------------
+# Phase 93 (plan 14) — the run record's four optional values (SPEC R14).
+#
+# `automation_runs` gained `source_mode`, `failure_reason_code` and
+# `hubspot_calls` in OS migration 0181, and the cron sets the row's `id` to its
+# own run id (there is no separate run-id column). The cron's role can INSERT
+# into the table and nothing else, so there is no RETURNING and no read-back.
+#
+# Deploy-order guard (the write_complaints precedent): a cron that reaches a
+# database the OS has not migrated yet must still write its record. Whether the
+# new columns exist is asked once per process through information_schema, which
+# needs no grant of its own, and cached here: None = not asked yet.
+# ---------------------------------------------------------------------------
+_RUN_RECORD_PHASE93_COLUMNS: Optional[bool] = None
+
+_RUN_RECORD_PREFLIGHT_SQL = (
+    "SELECT 1 FROM information_schema.columns "
+    "WHERE table_name = 'automation_runs' "
+    "AND column_name = %s"
+)
+
+_RUN_RECORD_EXTENDED_SQL = """
+    INSERT INTO automation_runs
+      (id, tenant_id, routine_name, status, started_at, finished_at,
+       tickets_processed, drafts_created, error_summary,
+       source_mode, failure_reason_code, hubspot_calls)
+    VALUES (COALESCE(%s::uuid, gen_random_uuid()), %s, %s, %s,
+            %s::timestamptz, %s::timestamptz, %s, %s, %s,
+            %s, %s, %s::jsonb)
+    """
+
+# The old column list plus the id: what an un-migrated database can take.
+_RUN_RECORD_WITH_ID_SQL = """
+    INSERT INTO automation_runs
+      (id, tenant_id, routine_name, status, started_at, finished_at,
+       tickets_processed, drafts_created, error_summary)
+    VALUES (%s::uuid, %s, %s, %s, %s::timestamptz, %s::timestamptz, %s, %s, %s)
+    """
+
+
+def _run_record_columns_present() -> bool:
+    """Does `automation_runs` have the Phase 93 columns? Asked once per process.
+
+    A database error propagates and nothing is cached: the caller's record is
+    then not written, which the caller reports.
+    """
+    global _RUN_RECORD_PHASE93_COLUMNS
+    if _RUN_RECORD_PHASE93_COLUMNS is None:
+        with get_pool().connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(_RUN_RECORD_PREFLIGHT_SQL, ("source_mode",))
+                present = cur.fetchone() is not None
+        _RUN_RECORD_PHASE93_COLUMNS = present
+    return _RUN_RECORD_PHASE93_COLUMNS
+
+
+def _optional_text(name: str, value: object) -> Optional[str]:
+    if value is not None and not isinstance(value, str):
+        raise ValueError(f"{name} must be a string or None")
+    return value
+
+
 def write_run_record(
     routine_name: str,
     status: str,  # 'success' | 'failure' | 'skipped' | 'partial'
@@ -387,6 +826,11 @@ def write_run_record(
     drafts_created: int,
     started_at_iso: str,
     finished_at_iso: Optional[str],
+    *,
+    run_id: Optional[str] = None,
+    source_mode: Optional[str] = None,
+    failure_reason_code: Optional[str] = None,
+    hubspot_calls: Optional[dict] = None,
 ) -> None:
     """INSERT into automation_runs.
 
@@ -395,9 +839,78 @@ def write_run_record(
     per Assumption A5).
 
     Returns None - signature is fire-and-forget; failures raise.
+
+    Phase 93 keyword-only values, all optional:
+        run_id               a uuid string; becomes the row's `id`, so a second
+                             record for the same run is refused by the primary
+                             key (one record per run)
+        source_mode          the mode the run was in (`hubspot`, `shadow`, `os`)
+        failure_reason_code  why a failed run failed, as a code
+        hubspot_calls        {"kinds": {...}, "raw_requests": n}, stored as JSON
+
+    Called with none of the four (the seven positional arguments, as before),
+    the statement and its parameters are the ones this function always sent.
+    With any of them: one INSERT that names the new columns when the database
+    has them, and otherwise the old column list plus the id, without the three
+    values. A value of the wrong kind is a ValueError before any statement.
     """
     if error_summary and len(error_summary) > 8000:
         error_summary = "...[truncated]\n" + error_summary[-8000:]
+    if not (
+        run_id is None
+        and source_mode is None
+        and failure_reason_code is None
+        and hubspot_calls is None
+    ):
+        run_id = _optional_uuid("run_id", run_id)
+        source_mode = _optional_text("source_mode", source_mode)
+        failure_reason_code = _optional_text("failure_reason_code", failure_reason_code)
+        if hubspot_calls is not None and not isinstance(hubspot_calls, dict):
+            raise ValueError("hubspot_calls must be a dict or None")
+        statement: Optional[str] = None
+        parameters: tuple = ()
+        if _run_record_columns_present():
+            statement = _RUN_RECORD_EXTENDED_SQL
+            parameters = (
+                run_id,
+                TENANT_ID,
+                routine_name,
+                status,
+                started_at_iso,
+                finished_at_iso,
+                tickets_processed,
+                drafts_created,
+                error_summary,
+                source_mode,
+                failure_reason_code,
+                json.dumps(hubspot_calls) if hubspot_calls is not None else None,
+            )
+        else:
+            logger.warning(
+                "run_record_columns_absent: the run record is written without "
+                "source_mode, failure_reason_code and hubspot_calls",
+                extra={"routine": routine_name},
+            )
+            if run_id is not None:
+                statement = _RUN_RECORD_WITH_ID_SQL
+                parameters = (
+                    run_id,
+                    TENANT_ID,
+                    routine_name,
+                    status,
+                    started_at_iso,
+                    finished_at_iso,
+                    tickets_processed,
+                    drafts_created,
+                    error_summary,
+                )
+        if statement is not None:
+            with get_pool().connection() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(statement, parameters)
+                    conn.commit()
+            return
+        # No new column and no run id: nothing differs from the old record.
     with get_pool().connection() as conn:
         with conn.cursor() as cur:
             cur.execute(

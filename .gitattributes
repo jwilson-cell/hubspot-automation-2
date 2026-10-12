@@ -5,3 +5,9 @@
 # bring-up).
 *.sh text eol=lf
 *.py text eol=lf
+
+# The read-contract fixtures are byte copies of Pack'N OS's
+# docs/contracts/fixtures/ and are pinned by checksum in
+# tests/test_contract_fixtures.py (Phase 93, plan 22). LF in every checkout,
+# so the bytes on disk are the bytes the OS wrote.
+hubspot_ticket_automation/tests/fixtures/*.json text eol=lf

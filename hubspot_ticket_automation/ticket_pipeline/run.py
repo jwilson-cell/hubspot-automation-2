@@ -6,6 +6,18 @@ so the two can never drift), runs hydrate -> classify -> draft -> extract per
 ticket, and writes one artifact per ticket plus a run summary under
 outputs/shadow/<run-ts>/.
 
+THE TICKET SOURCE MODE (Phase 93). This pipeline is one of the readers of the
+one source setting (ticket_pipeline/source.py). In `hubspot` and `shadow` mode
+it works as described above. In `os` mode HubSpot is not the source: it makes
+no HubSpot search and never calls hydrate_ticket — it runs classify -> draft ->
+extract over the ticket contexts it is handed (built from the OS's payload by
+the caller), or does nothing when it is handed none. A mode that cannot be
+established makes it do nothing; it is never read as `hubspot`.
+
+The setting `pipeline.shadow_enabled`, the log tag and the output directory
+are this pipeline's own in every mode. They are NOT the source setting: the
+source's `shadow` mode compares two ticket sources and writes nothing here.
+
 ZERO side effects: no state.json writes, no automation_drafts rows, no
 pending_actions queue, no urgent emails, no HubSpot property writes, no
 Sheets rows, no automation_runs records. The agent (which runs AFTER this in
@@ -17,6 +29,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 import time
 import traceback
@@ -35,7 +48,7 @@ from pregate_tickets import (  # noqa: E402 — single source of candidate truth
     unprocessed_candidates,
 )
 from ticket_pipeline import hubspot_api as hs  # noqa: E402
-from ticket_pipeline import hydrate, kb, llm  # noqa: E402
+from ticket_pipeline import hydrate, kb, llm, source  # noqa: E402
 
 SETTINGS_PATH = ROOT / "config" / "settings.yaml"
 CATEGORIES_PATH = ROOT / "config" / "categories.yaml"
@@ -82,12 +95,25 @@ def _is_auto_send(ctx: dict, categories_cfg: dict) -> bool:
 def process_ticket(
     ticket: dict, settings: dict, categories_cfg: dict, token: str
 ) -> dict:
-    """hydrate -> classify -> draft -> extract for one ticket. Raises on
-    unrecoverable errors; the caller isolates per-ticket failures."""
-    usages: list[dict] = []
+    """hydrate -> classify -> draft -> extract for one HubSpot search hit.
+    Raises on unrecoverable errors; the caller isolates per-ticket failures."""
     started = time.monotonic()
-
     ctx = hydrate.hydrate_ticket(ticket, settings, token)
+    return process_context(ctx, settings, categories_cfg, started=started)
+
+
+def process_context(
+    ctx: dict, settings: dict, categories_cfg: dict, started: float | None = None
+) -> dict:
+    """classify -> draft -> extract for a ticket context that is already built.
+
+    No HubSpot call and no hydration happen here: `os` mode hands in contexts
+    built from the OS's payload, and process_ticket hands in the one it just
+    hydrated. `started` lets process_ticket keep hydration in `elapsed_s`."""
+    usages: list[dict] = []
+    if started is None:
+        started = time.monotonic()
+
     classification = llm.classify(ctx, settings, categories_cfg, usages)
     category = classification["category"]
     kb_context = kb.load_kb_context(category, settings, categories_cfg)
@@ -112,18 +138,18 @@ def process_ticket(
     }
 
 
-def run_shadow(limit: int | None = None, ticket_id: str | None = None) -> int:
-    settings = _load_yaml(SETTINGS_PATH)
-    pipeline_cfg = settings.get("pipeline") or {}
-    if not pipeline_cfg.get("shadow_enabled") and ticket_id is None:
-        _log("pipeline.shadow_enabled is false — skipping")
-        return 0
+def _artifact_name(ticket_id: str) -> str:
+    """A file name for one ticket's artifact. A HubSpot id (digits) and an OS id
+    (a uuid) pass through unchanged; anything else in an id handed in from
+    outside is flattened, so an artifact can only land inside the run directory."""
+    return re.sub(r"[^A-Za-z0-9_-]", "_", ticket_id) or "unknown"
 
-    token = hs.read_token()
-    if token is None:
-        _log("hubspot token missing — skipping shadow run")
-        return 0
 
+def _hubspot_search_hits(
+    settings: dict, ticket_id: str | None, token: str
+) -> list[dict] | None:
+    """The HubSpot candidates, as before Phase 93: one search, then the
+    fingerprint dedupe. None means the search failed (already logged)."""
     try:
         state = json.loads(STATE_PATH.read_text(encoding="utf-8") or "{}")
     except (OSError, json.JSONDecodeError):
@@ -156,35 +182,87 @@ def run_shadow(limit: int | None = None, ticket_id: str | None = None) -> int:
         resp = hs.search_tickets(body, token)
         if resp is None:
             _log("hubspot search failed — skipping shadow run")
-            return 0
+            return None
         all_results = resp.get("results", [])
         wanted = set(
             unprocessed_candidates(all_results, state.get("ticket_fingerprints") or {})
         )
         results = [r for r in all_results if str(r.get("id")) in wanted]
 
+    return results
+
+
+def run_shadow(
+    limit: int | None = None,
+    ticket_id: str | None = None,
+    mode: str | None = None,
+    contexts: list[dict] | None = None,
+) -> int:
+    """One engine-shadow run. Always returns 0.
+
+    `mode` is the ticket source mode; None means "take it from
+    ticket_pipeline.source" (the value the orchestrator exported, else one read
+    of the setting). `contexts` are ready-built ticket contexts, used in `os`
+    mode only, where this function asks HubSpot nothing.
+    """
+    settings = _load_yaml(SETTINGS_PATH)
+    pipeline_cfg = settings.get("pipeline") or {}
+    if not pipeline_cfg.get("shadow_enabled") and ticket_id is None:
+        _log("pipeline.shadow_enabled is false — skipping")
+        return 0
+
+    try:
+        mode = source.current_mode() if mode is None else source.validate_mode(mode)
+    except source.SourceModeError as e:
+        # Never read as `hubspot`: with no mode there is no source to shadow.
+        _log(f"source mode not established ({e.code}) — skipping shadow run")
+        return 0
+
+    token: str | None = None
+    if mode == source.MODE_OS:
+        if ticket_id:
+            _log("--ticket searches HubSpot, which is not the source in os mode — skipping")
+            return 0
+        # (kind, item): a context needs no hydration and no HubSpot call
+        work = [("context", ctx) for ctx in (contexts or [])]
+    else:
+        if contexts:
+            _log("contexts are used in os mode only — ignoring them")
+        token = hs.read_token()
+        if token is None:
+            _log("hubspot token missing — skipping shadow run")
+            return 0
+        hits = _hubspot_search_hits(settings, ticket_id, token)
+        if hits is None:
+            return 0
+        work = [("ticket", hit) for hit in hits]
+
     cap = limit if limit is not None else int(pipeline_cfg.get("shadow_limit", 25))
-    results = results[:cap]
-    if not results:
+    work = work[:cap]
+    if not work:
         _log("no candidate tickets — nothing to shadow")
         return 0
 
     run_ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H-%M-%SZ")
     out_dir = SHADOW_DIR / run_ts
     out_dir.mkdir(parents=True, exist_ok=True)
-    _log(f"shadowing {len(results)} ticket(s) -> {out_dir}")
+    _log(f"shadowing {len(work)} ticket(s) -> {out_dir}")
 
     categories_cfg = _load_yaml(CATEGORIES_PATH)
     summary_rows = []
-    for ticket in results:
-        tid = str(ticket.get("id"))
+    for kind, item in work:
+        id_key = "ticket_id" if kind == "context" else "id"
+        tid = str(item.get(id_key)) if isinstance(item, dict) else "unknown"
         try:
-            artifact = process_ticket(ticket, settings, categories_cfg, token)
+            if kind == "context":
+                artifact = process_context(item, settings, categories_cfg)
+            else:
+                artifact = process_ticket(item, settings, categories_cfg, token)
         except Exception:
             _log(f"ticket {tid} failed:\n{traceback.format_exc()}")
             summary_rows.append({"ticket_id": tid, "status": "error"})
             continue
-        (out_dir / f"{tid}.json").write_text(
+        (out_dir / f"{_artifact_name(tid)}.json").write_text(
             json.dumps(artifact, indent=2, ensure_ascii=False), encoding="utf-8"
         )
         tokens_in = sum(u["input_tokens"] for u in artifact["usage"])

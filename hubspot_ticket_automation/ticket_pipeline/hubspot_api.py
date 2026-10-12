@@ -5,6 +5,27 @@ same private-app token file and the same cross-process rate-limit posture as
 scripts/backfill_complaints.py: attempt the Redis token bucket, then a hard
 0.34s sleep floor before EVERY call (the token degrades to passthrough
 without REDIS_URL, so the sleep is the real guard — T-20-05-01).
+
+THE ONE CHOKEPOINT, AND ITS COUNTER (Phase 93)
+----------------------------------------------
+Every HubSpot request made by code goes through `_request` in this module —
+the pipeline's, the pre-gate's (scripts/pregate_tickets.py has no request code
+of its own) and the `os`-mode steps'. Two numbers are kept per process:
+
+    raw_requests   one per HTTP attempt. A retry is a second request.
+    kinds          one per LOGICAL call, under one of CALL_KINDS. One thread
+                   fetch is two requests (association list, batch read) and ONE
+                   `email_thread` (decision Q7).
+
+`_request` counts raw attempts and nothing else. A kind is recorded once per
+logical operation, by the code that knows what the operation is:
+`search_tickets` records its own (`search` unless told otherwise); every other
+call site calls `record_call(kind)` once before its requests. Read the totals
+with `snapshot_calls()`; start a run with `reset_calls()`.
+
+The counter sees requests made by CODE. The agent's HubSpot calls go through
+MCP and are invisible here, which is why a run record carries counts for
+`os`-mode runs only.
 """
 from __future__ import annotations
 
@@ -14,7 +35,7 @@ import time
 import urllib.error
 import urllib.request
 from pathlib import Path
-from typing import Optional
+from typing import Any, Callable, Optional
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -50,6 +71,30 @@ EMAIL_PROPERTIES = [
 CONTACT_PROPERTIES = ["firstname", "lastname", "email", "phone"]
 COMPANY_PROPERTIES = ["name", "domain"]
 
+# The kinds of logical HubSpot call, in the order the Pack'N OS card lists them.
+CALL_KINDS = (
+    "search",
+    "ticket_read",
+    "contact_read",
+    "company_read",
+    "related_lookup",
+    "rerun_read",
+    "email_thread",
+    "number_backfill",
+)
+
+# Ticket properties code never writes (CLAUDE.md invariant 5: the automation does
+# not change a ticket's stage, owner or priority).
+PROTECTED_TICKET_PROPERTIES = (
+    "hs_pipeline",
+    "hs_pipeline_stage",
+    "hubspot_owner_id",
+    "hs_ticket_priority",
+)
+
+# Per-process totals. Read with snapshot_calls(), zero with reset_calls().
+_CALLS: dict[str, Any] = {"kinds": {kind: 0 for kind in CALL_KINDS}, "raw_requests": 0}
+
 
 def _log(msg: str) -> None:
     print(f"[pipeline.hubspot] {msg}", file=sys.stderr)
@@ -73,14 +118,56 @@ def _acquire_rate_token() -> None:
     time.sleep(RATE_FLOOR_S)
 
 
+def record_call(kind: str) -> None:
+    """Count one LOGICAL HubSpot call of `kind` (one of CALL_KINDS).
+
+    Call it once per operation, at the call site, before the operation's
+    requests — never once per request: a thread fetch is one `email_thread`.
+    An unknown kind is a ValueError, so a typo cannot open a ninth bucket.
+    """
+    if kind not in CALL_KINDS:
+        raise ValueError(f"not a HubSpot call kind: {kind!r}")
+    _CALLS["kinds"][kind] += 1
+
+
+def snapshot_calls() -> dict:
+    """The totals so far, as a copy: {"kinds": {<the eight>: n}, "raw_requests": n}."""
+    return {"kinds": dict(_CALLS["kinds"]), "raw_requests": _CALLS["raw_requests"]}
+
+
+def reset_calls() -> None:
+    """Zero every kind and the raw total (the start of a run)."""
+    for kind in CALL_KINDS:
+        _CALLS["kinds"][kind] = 0
+    _CALLS["raw_requests"] = 0
+
+
+def _default_opener(request: urllib.request.Request, timeout: Optional[float] = None):
+    """The real transport. Resolved at call time, so a test can replace it."""
+    return urllib.request.urlopen(request, timeout=timeout)
+
+
 def _request(
-    method: str, path: str, token: str, body: Optional[dict] = None
+    method: str,
+    path: str,
+    token: str,
+    body: Optional[dict] = None,
+    *,
+    opener: Optional[Callable[..., Any]] = None,
 ) -> Optional[dict]:
     """One HubSpot call with rate-limit floor + single retry on 429/5xx.
 
     Returns parsed JSON, or None on failure (callers treat None as
     "enrichment unavailable" and continue — parity with the agent's
-    log-and-continue failure posture)."""
+    log-and-continue failure posture).
+
+    Each HTTP attempt adds one to the raw request total; the retry is a second
+    request. No kind is recorded here — see the module docstring.
+
+    `opener` is the test seam: called as `opener(request, timeout=30)`, it
+    answers a context manager with `.read()`. Production code passes none and
+    gets urllib's urlopen."""
+    send = _default_opener if opener is None else opener
     url = f"{HUBSPOT_BASE}{path}"
     data = json.dumps(body).encode("utf-8") if body is not None else None
     for attempt in (1, 2):
@@ -88,8 +175,9 @@ def _request(
         req = urllib.request.Request(url, data=data, method=method)
         req.add_header("Authorization", f"Bearer {token}")
         req.add_header("Content-Type", "application/json")
+        _CALLS["raw_requests"] += 1
         try:
-            with urllib.request.urlopen(req, timeout=30) as resp:
+            with send(req, timeout=30) as resp:
                 raw = resp.read().decode("utf-8")
                 return json.loads(raw) if raw else {}
         except urllib.error.HTTPError as e:
@@ -104,8 +192,47 @@ def _request(
     return None
 
 
-def search_tickets(body: dict, token: str) -> Optional[dict]:
-    return _request("POST", "/crm/v3/objects/tickets/search", token, body)
+def search_tickets(
+    body: dict,
+    token: str,
+    kind: str = "search",
+    *,
+    transport: Optional[Callable[..., Any]] = None,
+) -> Optional[dict]:
+    """POST /crm/v3/objects/tickets/search, recorded as ONE call of `kind`.
+
+    `kind` defaults to `search`, so the pre-gate's and the pipeline's searches
+    are counted with no change at their call sites; a search that is really
+    something else (a related-ticket lookup) passes its own kind.
+
+    `transport` replaces the request function for this one call:
+    `transport(method, path, token, body)` -> the parsed answer or None."""
+    record_call(kind)
+    request = _request if transport is None else transport
+    return request("POST", "/crm/v3/objects/tickets/search", token, body)
+
+
+def update_ticket_properties(ticket_id: str, properties: dict, token: str) -> Optional[dict]:
+    """One PATCH on one ticket: `properties` is the name -> value map to write.
+
+    Returns the parsed answer, or None when the write failed. Records no kind:
+    the caller records the logical call (the number backfill is
+    `number_backfill`).
+
+    Refused with ValueError before any request: a ticket id that is not a
+    HubSpot id (digits — the id goes into the URL path), an empty or non-dict
+    `properties`, and any of PROTECTED_TICKET_PROPERTIES."""
+    ticket_ref = str(ticket_id) if ticket_id is not None else ""
+    if not (ticket_ref.isascii() and ticket_ref.isdigit()):
+        raise ValueError("update_ticket_properties needs a HubSpot ticket id (digits)")
+    if not isinstance(properties, dict) or not properties:
+        raise ValueError("update_ticket_properties needs a non-empty properties object")
+    protected = sorted(name for name in properties if name in PROTECTED_TICKET_PROPERTIES)
+    if protected:
+        raise ValueError(f"code never writes these ticket properties: {protected}")
+    return _request(
+        "PATCH", f"/crm/v3/objects/tickets/{ticket_ref}", token, {"properties": properties}
+    )
 
 
 def get_associated_ids(

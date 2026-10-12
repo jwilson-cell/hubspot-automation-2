@@ -215,6 +215,8 @@ chmod 600 /opt/packn/hubspot_ticket_automation/config/.secrets/*
 ls -la config/.secrets/   # expect 6 files, -rw-------, owned by packn:packn
 ```
 
+Two secret files are not copied from the laptop. They are created on the server by the owner, each holding the value the matching Pack'N OS environment variable has, with the same `chmod 600`: `action_ingest_secret.txt` (the action-item forward) and, since Phase 93, `tickets_api_secret.txt` (the Pack'N OS tickets routes; at least 32 characters). Neither value is ever committed or pasted into a chat. See the README, "Phase 93 — ticket source".
+
 Verify Gmail OAuth works through the helper:
 
 ```bash
@@ -239,7 +241,9 @@ claude mcp list
 
 **Important**: the env var name is `HUBSPOT_ACCESS_TOKEN`, NOT `PRIVATE_APP_ACCESS_TOKEN`. The latter is from HubSpot's own docs but doesn't match what this package actually reads.
 
-The MCP tool names exposed by `@hubspot/mcp-server` differ from the `mcp__claude_ai_HubSpot__*` names the skills were originally written against. Tools are now `mcp__hubspot__hubspot-search-objects`, `mcp__hubspot__hubspot-create-engagement`, etc. Claude adapts to the mismatch at runtime (and the skills fall back to direct REST calls using the same token if MCP is unavailable), so no skill edits are strictly required — but long-term it's cleaner to update the skill files to match the new tool names.
+**The server's name matters (Phase 93).** Keep the server registered under the name `hubspot`. When the ticket source is `os`, the wrapper launches the agent with `--disallowedTools mcp__hubspot`, which removes every tool of the server registered under the name `hubspot` from that agent. Under another name the flag removes nothing. The registration itself is not removed: the `hubspot` and `shadow` sources use these tools, and they are what a rollback uses, until Phase 94. Removing the tools closes the tool path, not the shell path — the agent still has Bash and the token file above is on the server — so what Phase 93 relies on is that code makes and counts every HubSpot request in that source, not that the agent cannot reach HubSpot.
+
+The MCP tool names exposed by `@hubspot/mcp-server` differ from the `mcp__claude_ai_HubSpot__*` names the skills were originally written against. Tools are now `mcp__hubspot__hubspot-search-objects`, `mcp__hubspot__hubspot-create-engagement`, etc. Claude adapts to the mismatch at runtime (and the skills fall back to direct REST calls using the same token if MCP is unavailable), so no skill edits are strictly required — but long-term it's cleaner to update the skill files to match the new tool names. That sentence is about the `hubspot-tickets` skill (ticket sources `hubspot` and `shadow`), which now says once, near its top, which prefix the server has. The `os`-mode skill contains no HubSpot instruction at all, so it has nothing to fall back to: in that source code makes the permitted HubSpot requests (the email thread of a HubSpot-linked ticket, and the fill of an empty order or tracking number) and counts them on the run record.
 
 ### Pre-authorize tool usage (critical for headless cron)
 
@@ -345,7 +349,7 @@ claude -p /packn-digest --model claude-sonnet-5 --dangerously-skip-permissions 2
 
 Expected outcomes:
 
-1. `/packn-tickets` → run log at `outputs/runs/<ISO>.md`. Any new/modified tickets get draft notes with `PACKN_METADATA_V1` blocks OR auto-sent replies for form Mispack/Carrier. Sheets sync runs.
+1. `bash scripts/run_tickets.sh` → one `automation_runs` record in Pack'N OS for the run, whatever happened to the agent. When there was work: a run log at `outputs/runs/<ISO>.md`, and each new/modified ticket gets a pending draft in Pack'N OS (`/automation/drafts`). Nothing is sent to a customer and no note is posted on the HubSpot ticket. Sheets sync runs.
 2. `/packn-digest` → Gmail send (message id on stdout) to `lconner + chansen`. Each included ticket gets a `[DIGESTED at …]` marker note in HubSpot.
 
 Cron:

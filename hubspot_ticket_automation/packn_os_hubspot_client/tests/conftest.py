@@ -13,11 +13,21 @@ Env vars expected (defaults below match docker-compose.yml host mapping):
 """
 
 import os
-from typing import Generator
+import urllib.parse
+import uuid
+from typing import Callable, Generator, Mapping, Optional
 
 import psycopg
 import pytest
 from psycopg.rows import dict_row
+
+# The suite-level network refusal lives with the pure suite's helpers (standard
+# library only). pytest puts hubspot_ticket_automation/ on sys.path for both test
+# roots, so the import resolves whichever root is run; if it ever does not, the
+# ImportError stops collection, which is louder than running with no guard.
+from tests.helpers import network_guard
+
+from packn_os_hubspot_client.tenant import TENANT_ID
 
 # Default points at the dev docker Postgres (port 5433 to match the
 # docker-compose host mapping that avoids the native Windows postgres on
@@ -38,6 +48,143 @@ def _set_test_env() -> None:
         os.environ["REDIS_URL"] = DEFAULT_REDIS_URL
     if "HUBSPOT_RATE_LIMIT_AUTOMATION" not in os.environ:
         os.environ["HUBSPOT_RATE_LIMIT_AUTOMATION"] = "3"
+
+
+# ---------------------------------------------------------------------------
+# Local-dev-database guard (Phase 93, plan 14; runbook tag R-LOCAL-DB-ONLY).
+#
+# `_set_test_env` above sets the database URL only when none is exported, so a
+# shell with another URL exported (a tunnel to prod, say) would have pointed
+# every test in this directory at that database: they insert tickets, drafts
+# and run records. The session fixture below refuses any URL that is not the
+# local dev Postgres and ABORTS the session. Aborting is deliberate: a skip
+# would be a green run that proved nothing, and a per-test error would still
+# let another test's fixture connect.
+#
+# Accepted residual: the rule judges host and port only. An SSH tunnel to
+# another database bound to local port 5433 would pass. That port is the dev
+# Docker Postgres's, so such a tunnel can bind there only while the dev
+# database is stopped; the runbook says never to bind one to 5433.
+# ---------------------------------------------------------------------------
+
+LOCAL_DB_HOSTS = ("localhost", "127.0.0.1")
+LOCAL_DB_PORT = 5433
+DB_GUARD_REFUSAL_TOKEN = "REFUSING_NON_LOCAL_DATABASE"
+DB_GUARD_EXIT_CODE = 97
+DB_URL_ENV = "PACKN_OS_DATABASE_URL"
+
+# libpq reads these from the environment when the URL does not give the same
+# parameter, and either one sends the connection somewhere the URL does not name.
+DB_REDIRECT_ENV = ("PGHOSTADDR", "PGSERVICE")
+
+# A query parameter of the URL that overrides where the connection goes.
+DB_REDIRECT_PARAMS = ("host", "hostaddr", "port", "service")
+
+
+class NonLocalDatabaseError(RuntimeError):
+    """The database URL the suite would use is not the local dev Postgres."""
+
+
+def _db_refusal(host: str, port: str, why: str) -> NonLocalDatabaseError:
+    """The one message shape: the token, the rule, then host and port only.
+
+    Never the user, the password, the database name, the URL or a parser's
+    error text (a parser quotes the piece it choked on, which can be a password).
+    """
+    hosts = " or ".join(LOCAL_DB_HOSTS)
+    return NonLocalDatabaseError(
+        f"{DB_GUARD_REFUSAL_TOKEN}: the helper's database tests run only against the "
+        f"local dev Postgres ({hosts}, port {LOCAL_DB_PORT}). The database URL in "
+        f"{DB_URL_ENV} has {host}, {port}: {why}. Nothing was connected to."
+    )
+
+
+def assert_local_dev_database(url: object, environ: Optional[Mapping[str, str]] = None) -> None:
+    """Raise NonLocalDatabaseError unless `url` is the local dev Postgres.
+
+    Accepted: a `postgres://` or `postgresql://` URL whose host is one of
+    LOCAL_DB_HOSTS and whose port is LOCAL_DB_PORT, with nothing in its query
+    string or in `environ` that sends the connection elsewhere.
+
+    Refused: any other host, any other port, no port, more than one host, a
+    keyword/value connection string, anything that is not a string, and a URL
+    the standard library cannot split cleanly.
+
+    `environ` defaults to no variables at all, so the function is pure; the
+    fixture passes the process environment.
+    """
+    unknown = ("host unknown", "port unknown")
+    if not isinstance(url, str) or not url.strip():
+        raise _db_refusal(*unknown, "it is not set to a URL")
+    try:
+        parts = urllib.parse.urlsplit(url.strip())
+        host = parts.hostname
+        port = parts.port
+    except ValueError:
+        raise _db_refusal(*unknown, "it cannot be read as a URL") from None
+    if parts.scheme.lower() not in ("postgres", "postgresql"):
+        raise _db_refusal(*unknown, "it is not a postgres:// URL")
+    if not host or "," in parts.netloc:
+        raise _db_refusal(*unknown, "it does not name exactly one host")
+    if "@" in parts.path or "@" in parts.query or "@" in parts.fragment:
+        # An unescaped / ? or # in the user part moves the real host out of the
+        # host position; what urlsplit calls the host is then a piece of the
+        # credentials. Say nothing about it.
+        raise _db_refusal(*unknown, "it cannot be read as a URL")
+
+    host_text = f"host {host!r}"
+    port_text = "no port" if port is None else f"port {port}"
+    redirects = sorted(
+        {
+            name.lower()
+            for name, _value in urllib.parse.parse_qsl(parts.query, keep_blank_values=True)
+            if name.lower() in DB_REDIRECT_PARAMS
+        }
+    )
+    if redirects:
+        raise _db_refusal(
+            host_text, port_text, f"its query string overrides {', '.join(redirects)}"
+        )
+    if host not in LOCAL_DB_HOSTS:
+        raise _db_refusal(host_text, port_text, "that host is not this machine's dev database")
+    if port != LOCAL_DB_PORT:
+        raise _db_refusal(host_text, port_text, f"the dev database listens on {LOCAL_DB_PORT}")
+    exported = [name for name in DB_REDIRECT_ENV if (environ or {}).get(name)]
+    if exported:
+        raise _db_refusal(
+            host_text,
+            port_text,
+            f"the environment variable {', '.join(exported)} is set and would redirect it",
+        )
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _require_local_dev_database(_set_test_env: None) -> None:
+    """Abort the session unless the database URL in use is the local dev one.
+
+    Takes `_set_test_env` so the default is in place first, and is session-scoped
+    and autouse so it runs before any fixture of any test here can connect.
+    """
+    try:
+        assert_local_dev_database(os.environ.get(DB_URL_ENV), os.environ)
+    except NonLocalDatabaseError as refusal:
+        pytest.exit(str(refusal), returncode=DB_GUARD_EXIT_CODE)
+
+
+@pytest.fixture(autouse=True)
+def _suite_refuses_the_network(monkeypatch: pytest.MonkeyPatch) -> Generator[None, None, None]:
+    """No test in the helper suite can open a connection that leaves this machine.
+
+    Phase 93, plan 14 (task zero). The same guard the pure suite installs; the
+    rule is in tests/helpers/network_guard.py. Loopback stays open, which is what
+    the Redis tests use. The database tests do not pass through it: psycopg's
+    binary driver connects inside libpq.
+    """
+    network_guard.install(monkeypatch)
+    yield
+    swallowed = network_guard.unanswered_refusals()
+    if swallowed:
+        pytest.fail(swallowed, pytrace=False)
 
 
 @pytest.fixture
@@ -121,3 +268,97 @@ def _cleanup(conn: psycopg.Connection) -> None:
             "DELETE FROM customer_complaints WHERE hubspot_ticket_id LIKE 'pytest-%'"
         )
     conn.commit()
+
+
+# ---------------------------------------------------------------------------
+# Phase 93 (plan 14) — a ticket row for the draft tests.
+#
+# automation_drafts.os_ticket_id is a foreign key to tickets, so a draft that
+# carries one needs a real ticket. These fixtures insert a minimal row under the
+# shared tenant on their own committed connection and remove it afterwards. The
+# row is recognisable two ways: its HubSpot id starts with `pytest-` (when it has
+# one) and its subject starts with SEEDED_TICKET_SUBJECT_PREFIX (always), which
+# is what the sweep before and after each test keys on.
+# ---------------------------------------------------------------------------
+
+SEEDED_TICKET_SUBJECT_PREFIX = "pytest-93-14-seeded"
+
+
+def _sweep_seeded_tickets(conn: psycopg.Connection) -> None:
+    """Remove the suite's drafts first (they point at the tickets), then the tickets."""
+    like = SEEDED_TICKET_SUBJECT_PREFIX + "%"
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            DELETE FROM automation_drafts
+            WHERE routine_name LIKE 'pytest-%%'
+               OR os_ticket_id IN (
+                    SELECT id FROM tickets WHERE tenant_id = %s AND subject LIKE %s
+               )
+            """,
+            (TENANT_ID, like),
+        )
+        cur.execute(
+            "DELETE FROM tickets WHERE tenant_id = %s AND subject LIKE %s",
+            (TENANT_ID, like),
+        )
+    conn.commit()
+
+
+@pytest.fixture
+def seeded_tickets(test_db_url: str) -> Generator[Callable[..., dict], None, None]:
+    """A factory: `make(with_hubspot_id=True)` inserts one ticket and returns
+
+        {"id": <OS uuid as text>, "hubspot_ticket_id": <"pytest-…" or None>,
+         "draft_key": <the text key a draft of this ticket is written under>}
+
+    `draft_key` follows the OS rule (draftTicketKeyValue): the HubSpot id when the
+    ticket has one, else the OS id as text.
+    """
+    conn = psycopg.connect(test_db_url, row_factory=dict_row)
+    _sweep_seeded_tickets(conn)
+
+    def make(with_hubspot_id: bool = True) -> dict:
+        ticket_id = str(uuid.uuid4())
+        hubspot_id = f"pytest-{uuid.uuid4().hex[:12]}" if with_hubspot_id else None
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO tickets
+                  (id, tenant_id, hubspot_ticket_id, source_of_record, channel, state, subject)
+                VALUES (%s, %s, %s, %s, %s, 'open', %s)
+                """,
+                (
+                    ticket_id,
+                    TENANT_ID,
+                    hubspot_id,
+                    "hubspot" if with_hubspot_id else "os",
+                    "hubspot_email" if with_hubspot_id else "portal",
+                    f"{SEEDED_TICKET_SUBJECT_PREFIX} {ticket_id}",
+                ),
+            )
+        conn.commit()
+        return {
+            "id": ticket_id,
+            "hubspot_ticket_id": hubspot_id,
+            "draft_key": hubspot_id if hubspot_id is not None else ticket_id,
+        }
+
+    try:
+        yield make
+    finally:
+        conn.rollback()
+        _sweep_seeded_tickets(conn)
+        conn.close()
+
+
+@pytest.fixture
+def seeded_ticket(seeded_tickets: Callable[..., dict]) -> dict:
+    """One ticket that has a HubSpot id (the common case)."""
+    return seeded_tickets()
+
+
+@pytest.fixture
+def seeded_ticket_without_hubspot_id(seeded_tickets: Callable[..., dict]) -> dict:
+    """One ticket with no HubSpot id: its draft key is its OS id as text."""
+    return seeded_tickets(with_hubspot_id=False)

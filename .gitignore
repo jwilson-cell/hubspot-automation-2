@@ -2,6 +2,19 @@
 # token, Gmail OAuth token, action-ingest HMAC secret all live here.
 hubspot_ticket_automation/config/.secrets/
 
+# The action-item forwarder's seen-set: "<ticket key>:<action type>" keys only; runtime state of the droplet, never tracked.
+hubspot_ticket_automation/config/.action_items_forwarded.json
+
+# The action-item retry file (Phase 93): ids only; written on the droplet beside the seen-set.
+hubspot_ticket_automation/config/.action_items_retry.json
+
+# Per-run OS bundles and context files — they hold ticket text and are deleted after each run.
+hubspot_ticket_automation/outputs/runs/os/
+
+# The source shadow's seen cache (Phase 93): OS ticket ids, signal ids and category slugs only. Its temp file lasts milliseconds.
+hubspot_ticket_automation/outputs/runs/source_shadow_seen.json
+hubspot_ticket_automation/outputs/runs/.source_shadow_seen.*.tmp
+
 # Python bytecode / test caches
 __pycache__/
 *.pyc

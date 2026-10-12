@@ -1,0 +1,91 @@
+{
+  "fixture_version": "1",
+  "hubspot_id_only": {
+    "type": "action_items",
+    "ticket_id": "9300000000001",
+    "items": [
+      {
+        "action_type": "file_carrier_claim",
+        "description": "File a lost-parcel claim with the carrier for FX-TRACK-1001.",
+        "owner_hint": "carrier",
+        "severity": "urgent",
+        "needs_hubspot_reply": false,
+        "claim_packet": {
+          "inferred_carrier": "FedEx",
+          "carrier_confidence": "high",
+          "claim_type": "lost",
+          "tracking_number": "FX-TRACK-1001",
+          "order_number": "FX-ORDER-1001",
+          "evidence_summary": "No carrier scan for six days."
+        }
+      },
+      {
+        "action_type": "request_missing_info_from_merchant",
+        "description": "Ask the merchant to confirm the declared value of the parcel.",
+        "owner_hint": "account_manager",
+        "severity": "normal",
+        "needs_hubspot_reply": true,
+        "blocking_info_needed": [
+          "declared value"
+        ]
+      }
+    ]
+  },
+  "both_ids_with_pass_id": {
+    "type": "action_items",
+    "ticket_id": "9300000000001",
+    "os_ticket_id": "0f8fad5b-d9cb-469f-a165-70867728950e",
+    "pass_id": "1c7d2e3f-4a5b-4c6d-9e8f-0a1b2c3d4e5f",
+    "items": [
+      {
+        "action_type": "file_carrier_claim",
+        "description": "File a lost-parcel claim with the carrier for FX-TRACK-1001.",
+        "owner_hint": "carrier",
+        "severity": "urgent",
+        "needs_hubspot_reply": false,
+        "claim_packet": {
+          "inferred_carrier": "FedEx",
+          "carrier_confidence": "high",
+          "claim_type": "lost",
+          "tracking_number": "FX-TRACK-1001",
+          "order_number": "FX-ORDER-1001",
+          "evidence_summary": "No carrier scan for six days."
+        }
+      },
+      {
+        "action_type": "request_missing_info_from_merchant",
+        "description": "Ask the merchant to confirm the declared value of the parcel.",
+        "owner_hint": "account_manager",
+        "severity": "normal",
+        "needs_hubspot_reply": true,
+        "blocking_info_needed": [
+          "declared value"
+        ]
+      }
+    ]
+  },
+  "os_id_only_with_pass_id": {
+    "type": "action_items",
+    "os_ticket_id": "7c9e6679-7425-40de-944b-e07fc1f90ae7",
+    "pass_id": "2d8e3f4a-5b6c-4d7e-8f9a-1b2c3d4e5f6a",
+    "items": [
+      {
+        "action_type": "warehouse_investigation",
+        "description": "Check the pick record for the unit the client reports missing.",
+        "owner_hint": "warehouse",
+        "severity": "normal",
+        "needs_hubspot_reply": false
+      }
+    ]
+  },
+  "pass_id_rule": {
+    "min_chars": 1,
+    "max_chars": 64,
+    "pattern": "^[A-Za-z0-9:_-]{1,64}$",
+    "examples": [
+      "1c7d2e3f-4a5b-4c6d-9e8f-0a1b2c3d4e5f",
+      "rerun:5e9a6b7c-8d0f-4a1b-9c2d-4e5f6a7b8c9d",
+      "hubspot:6f0b7c8d-9e1a-4b2c-8d3e-5f6a7b8c9d0e"
+    ]
+  }
+}

@@ -1,4 +1,4 @@
-"""POST extracted action items (and ticket-closed signals) to the Pack'N OS ingestion route.
+"""POST extracted action items to the Pack'N OS ingestion route.
 
 This is the cross-repo bridge for Phase 15.1: the hubspot-tickets skill extracts
 action items (see prompts/extract_actions.md), and this helper forwards each one to
@@ -24,8 +24,10 @@ Security / transport contract (mirrors the OS verify, Plan 15.1-04):
 Invariants (sibling CLAUDE.md):
     - Zero new Python dependencies — stdlib only (urllib.request, json, hashlib, hmac,
       pathlib). NO requests / httpx.
-    - dry_run default: when dry_run is true, this helper LOGS the payload + computed
-      signature and does NOT send. The SKILL step passes dry_run=True during the D-07
+    - dry_run default: when dry_run is true, this helper LOGS the envelope's type,
+      its item count, its byte length and the computed signature, and does NOT send.
+      It never logs or returns the envelope itself: the items' descriptions are
+      ticket text (Phase 93, plan 17). The SKILL step passes dry_run=True during the D-07
       parallel run (independent of the global settings.yaml dry_run, which is already
       false for the rest of the automation); the operator flips this step to live only
       after inspecting a dry-run pass (Task 3 checkpoint).
@@ -42,8 +44,6 @@ Invariants (sibling CLAUDE.md):
 CLI (manual testing only — `py` is the venv python on the droplet; use `py -3` on a Windows laptop):
     py scripts/post_action_items.py action-items <ticket_id> <items.json>   # dry-run
     py scripts/post_action_items.py action-items <ticket_id> <items.json> --send
-    py scripts/post_action_items.py ticket-closed <hubspot_ticket_id>          # dry-run
-    py scripts/post_action_items.py ticket-closed <hubspot_ticket_id> --send
 """
 from __future__ import annotations
 
@@ -139,7 +139,8 @@ def _post(envelope: dict, dry_run: bool) -> dict:
     """Sign + (conditionally) send one envelope. Never raises out.
 
     Returns a result dict:
-        dry-run    -> {"ok": True, "mode": "dry-run", "signature": ..., "payload": ...}
+        dry-run    -> {"ok": True, "mode": "dry-run", "signature": ..., "type": ...,
+                       "items": <count>, "bytes": <length of the signed body>}
         skipped    -> {"ok": False, "mode": "skipped", "reason": ...}
         live ok    -> {"ok": True, "mode": "sent", "status": 200, "response": {...}}
         live error -> {"ok": False, "mode": "error", "status": <int|None>, "error": ...}
@@ -154,16 +155,22 @@ def _post(envelope: dict, dry_run: bool) -> dict:
     signature = _sign(secret, data)
 
     if dry_run:
+        # A type, a count and a size. Never the payload: it holds the action
+        # items' descriptions, and this line goes to the cron log (and the
+        # returned dict to stdout, from the CLI).
+        items = envelope.get("items")
+        item_count = len(items) if isinstance(items, list) else 0
         _log(
             f"DRY-RUN — would POST type={envelope.get('type')} "
-            f"({len(data)} bytes) sig={signature}"
+            f"items={item_count} bytes={len(data)} sig={signature}"
         )
-        _log(f"DRY-RUN payload: {data.decode('utf-8')}")
         return {
             "ok": True,
             "mode": "dry-run",
             "signature": signature,
-            "payload": envelope,
+            "type": envelope.get("type"),
+            "items": item_count,
+            "bytes": len(data),
         }
 
     url = _read_os_ingest_url()
@@ -202,11 +209,55 @@ def _post(envelope: dict, dry_run: bool) -> dict:
         return {"ok": False, "mode": "error", "status": None, "error": repr(e)}
 
 
-def post_action_items(ticket_id: str, items: list[dict], dry_run: bool) -> dict:
+def _id_text(value) -> str | None:
+    """An id as text, or None when there is none (None, or blank)."""
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def build_envelope(ticket_id, items: list[dict], os_ticket_id=None, pass_id=None) -> dict:
+    """The action_items envelope for one ticket, keys in the contract's order.
+
+        {"type": "action_items", "ticket_id": "<HubSpot id>", "items": [...]}
+
+    plus, only when given, `os_ticket_id` (the Pack'N OS ticket id, a uuid) and
+    `pass_id` (the cron pass the items belong to: its cycle key alone). A key
+    with no value is OMITTED, never sent as null: the OS refuses null for each
+    of the three. With the HubSpot id alone the envelope is exactly what this
+    helper has always sent, byte for byte.
+
+    Pinned to Pack'N OS's docs/contracts/fixtures/action-items-envelope.v1.json
+    by tests/test_action_item_forwarding.py.
+    """
+    envelope: dict = {"type": "action_items"}
+    hubspot_id = _id_text(ticket_id)
+    if hubspot_id is not None:
+        envelope["ticket_id"] = hubspot_id
+    os_id = _id_text(os_ticket_id)
+    if os_id is not None:
+        envelope["os_ticket_id"] = os_id
+    pass_text = _id_text(pass_id)
+    if pass_text is not None:
+        envelope["pass_id"] = pass_text
+    envelope["items"] = items
+    return envelope
+
+
+def post_action_items(
+    ticket_id: str | None,
+    items: list[dict],
+    dry_run: bool,
+    os_ticket_id: str | None = None,
+    pass_id: str | None = None,
+) -> dict:
     """POST the action_items envelope for one ticket. Never raises out.
 
-    envelope shape (Plan 04 ActionIngestSchema discriminated union):
+    envelope shape (ActionIngestSchema; see build_envelope):
         {"type": "action_items", "ticket_id": "<numeric>", "items": [<extract_actions objects>]}
+    with `os_ticket_id` and `pass_id` added when given. At least one of the two
+    ticket ids is needed; with neither nothing is sent.
 
     `items` is forwarded verbatim from the extractor output (each object carries
     action_type / description / owner_hint / severity / needs_hubspot_reply, plus the
@@ -216,26 +267,10 @@ def post_action_items(ticket_id: str, items: list[dict], dry_run: bool) -> dict:
     if not items:
         # Nothing to forward — an empty extraction is valid (no invented work).
         return {"ok": True, "mode": "noop", "reason": "no_items"}
-    envelope = {
-        "type": "action_items",
-        "ticket_id": str(ticket_id),
-        "items": items,
-    }
-    return _post(envelope, dry_run)
-
-
-def post_ticket_closed(hubspot_ticket_id: str, dry_run: bool) -> dict:
-    """POST the ticket_closed signal for one observed-closed ticket. Never raises out.
-
-    envelope shape:
-        {"type": "ticket_closed", "hubspot_ticket_id": "<numeric>"}
-
-    The OS route auto-resolves that ticket's open hubspot_action_item tasks (D-15).
-    """
-    envelope = {
-        "type": "ticket_closed",
-        "hubspot_ticket_id": str(hubspot_ticket_id),
-    }
+    envelope = build_envelope(ticket_id, items, os_ticket_id=os_ticket_id, pass_id=pass_id)
+    if "ticket_id" not in envelope and "os_ticket_id" not in envelope:
+        _log("no ticket id for the envelope (neither a HubSpot id nor an OS id). Skipping.")
+        return {"ok": False, "mode": "skipped", "reason": "no_ticket_id"}
     return _post(envelope, dry_run)
 
 
@@ -246,7 +281,7 @@ def _cli() -> int:
     dry_run = not send_flag
 
     if not pos:
-        _log("usage: post_action_items.py {action-items|ticket-closed} ... [--send]")
+        _log("usage: post_action_items.py action-items <ticket_id> [items.json] [--send]")
         return 2
 
     mode = pos[0]
@@ -263,13 +298,8 @@ def _cli() -> int:
             if stdin:
                 items = json.loads(stdin)
         result = post_action_items(ticket_id, items, dry_run)
-    elif mode == "ticket-closed":
-        if len(pos) < 2:
-            _log("usage: post_action_items.py ticket-closed <hubspot_ticket_id> [--send]")
-            return 2
-        result = post_ticket_closed(pos[1], dry_run)
     else:
-        _log(f"unknown mode '{mode}' — expected action-items|ticket-closed")
+        _log(f"unknown mode '{mode}' — expected action-items")
         return 2
 
     print(json.dumps(result, indent=2, default=str))
