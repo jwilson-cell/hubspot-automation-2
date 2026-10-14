@@ -29,11 +29,13 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
+import shutil
 import sys
 import time
 import traceback
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -54,6 +56,16 @@ SETTINGS_PATH = ROOT / "config" / "settings.yaml"
 CATEGORIES_PATH = ROOT / "config" / "categories.yaml"
 STATE_PATH = ROOT / "config" / "state.json"
 SHADOW_DIR = ROOT / "outputs" / "shadow"
+
+# What the engine shadow leaves on disk (SEC-OPEN-2, owner ruling 2026-10-14).
+# Each artifact holds a ticket's full context and a draft, so the directory is
+# private to the cron's user (0700, files 0600), git-ignored, and a run
+# directory older than SHADOW_RETENTION_DAYS is removed at the start of each
+# engine-shadow step. The source shadow reads only directories of its own run
+# (source_shadow._engine_classification), so pruning older ones costs it nothing.
+SHADOW_RETENTION_DAYS = 30
+_RUN_DIR_FORMAT = "%Y-%m-%dT%H-%M-%SZ"
+_RUN_DIR_RE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}-[0-9]{2}-[0-9]{2}Z")
 
 
 def _log(msg: str) -> None:
@@ -138,6 +150,47 @@ def process_context(
     }
 
 
+def _write_private(path: Path, text: str) -> None:
+    """Write `text` to `path` readable by the cron's user only (0600), also
+    when the file already exists with a wider mode."""
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        if hasattr(os, "fchmod"):
+            os.fchmod(fh.fileno(), 0o600)
+        fh.write(text)
+
+
+def _make_private_dir(path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True)
+    os.chmod(path, 0o700)
+
+
+def prune_shadow_dir(now: datetime | None = None, base: Path | None = None) -> int:
+    """Remove engine-shadow run directories older than SHADOW_RETENTION_DAYS
+    and close the directory to other users. Only names in the run-directory
+    format are touched; anything else is left alone. Returns how many run
+    directories were removed. Never raises: a failure here must not stop the
+    shadow step, and the shadow step must never fail the cron."""
+    base = SHADOW_DIR if base is None else base
+    removed = 0
+    try:
+        if not base.is_dir():
+            return 0
+        os.chmod(base, 0o700)
+        now = datetime.now(timezone.utc) if now is None else now
+        floor = (now - timedelta(days=SHADOW_RETENTION_DAYS)).strftime(_RUN_DIR_FORMAT)
+        for entry in base.iterdir():
+            # fixed-width UTC names: text order is time order
+            if entry.is_dir() and not entry.is_symlink() and _RUN_DIR_RE.fullmatch(entry.name) and entry.name < floor:
+                shutil.rmtree(entry)
+                removed += 1
+    except OSError as e:
+        _log(f"pruning old shadow output failed ({type(e).__name__}); continuing")
+    if removed:
+        _log(f"removed {removed} shadow run director{'y' if removed == 1 else 'ies'} older than {SHADOW_RETENTION_DAYS} days")
+    return removed
+
+
 def _artifact_name(ticket_id: str) -> str:
     """A file name for one ticket's artifact. A HubSpot id (digits) and an OS id
     (a uuid) pass through unchanged; anything else in an id handed in from
@@ -205,6 +258,8 @@ def run_shadow(
     of the setting). `contexts` are ready-built ticket contexts, used in `os`
     mode only, where this function asks HubSpot nothing.
     """
+    # Before the enabled check, so turning the shadow off still ages out what it left.
+    prune_shadow_dir()
     settings = _load_yaml(SETTINGS_PATH)
     pipeline_cfg = settings.get("pipeline") or {}
     if not pipeline_cfg.get("shadow_enabled") and ticket_id is None:
@@ -243,9 +298,10 @@ def run_shadow(
         _log("no candidate tickets — nothing to shadow")
         return 0
 
-    run_ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H-%M-%SZ")
+    run_ts = datetime.now(timezone.utc).strftime(_RUN_DIR_FORMAT)
     out_dir = SHADOW_DIR / run_ts
-    out_dir.mkdir(parents=True, exist_ok=True)
+    _make_private_dir(SHADOW_DIR)
+    _make_private_dir(out_dir)
     _log(f"shadowing {len(work)} ticket(s) -> {out_dir}")
 
     categories_cfg = _load_yaml(CATEGORIES_PATH)
@@ -262,8 +318,9 @@ def run_shadow(
             _log(f"ticket {tid} failed:\n{traceback.format_exc()}")
             summary_rows.append({"ticket_id": tid, "status": "error"})
             continue
-        (out_dir / f"{_artifact_name(tid)}.json").write_text(
-            json.dumps(artifact, indent=2, ensure_ascii=False), encoding="utf-8"
+        _write_private(
+            out_dir / f"{_artifact_name(tid)}.json",
+            json.dumps(artifact, indent=2, ensure_ascii=False),
         )
         tokens_in = sum(u["input_tokens"] for u in artifact["usage"])
         tokens_out = sum(u["output_tokens"] for u in artifact["usage"])
@@ -299,9 +356,7 @@ def run_shadow(
             "cost_usd": round(sum(r["cost_usd"] for r in ok_rows), 4),
         },
     }
-    (out_dir / "_summary.json").write_text(
-        json.dumps(summary, indent=2), encoding="utf-8"
-    )
+    _write_private(out_dir / "_summary.json", json.dumps(summary, indent=2))
     _log(
         f"done: {summary['totals']['ok']} ok / {summary['totals']['error']} error, "
         f"{summary['totals']['tokens_in']} tokens in / {summary['totals']['tokens_out']} out, "

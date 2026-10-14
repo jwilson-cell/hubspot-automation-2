@@ -8,8 +8,18 @@ hubspot_ticket_automation/config/.action_items_forwarded.json
 # The action-item retry file (Phase 93): ids only; written on the droplet beside the seen-set.
 hubspot_ticket_automation/config/.action_items_retry.json
 
+# Their temp files, written and renamed by scripts/forward_action_items.py (SEC-OPEN-3): ids only.
+hubspot_ticket_automation/config/.action_items_forwarded.json.tmp
+hubspot_ticket_automation/config/.action_items_retry.json.tmp
+# The state file's temp file, written and renamed by ticket_pipeline/source.py (SEC-OPEN-3).
+hubspot_ticket_automation/config/.state.json.*.tmp
+
 # Per-run OS bundles and context files — they hold ticket text and are deleted after each run.
 hubspot_ticket_automation/outputs/runs/os/
+
+# The engine shadow's artifacts (SEC-OPEN-2): each holds a ticket's full context and a draft.
+# Private to the cron's user and removed after 30 days by ticket_pipeline/run.py.
+hubspot_ticket_automation/outputs/shadow/
 
 # The source shadow's seen cache (Phase 93): OS ticket ids, signal ids and category slugs only. Its temp file lasts milliseconds.
 hubspot_ticket_automation/outputs/runs/source_shadow_seen.json
