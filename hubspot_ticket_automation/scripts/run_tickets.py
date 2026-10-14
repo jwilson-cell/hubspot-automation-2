@@ -77,6 +77,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import traceback
@@ -101,6 +102,21 @@ CRON_MARKER = "run_tickets.sh"
 # run draft with the same model and the CLI default can never silently apply.
 AGENT_MODEL = "claude-sonnet-5"
 AGENT_SKILL = "/packn-tickets"
+
+# REV-OPEN-6 (owner ruling 2026-10-14). A run was found hung on the droplet for
+# 49 days (2026-08-24 to 2026-10-12): `claude -p` never returned, so the run
+# never wrote its record. The agent now gets at most AGENT_TIMEOUT_SECONDS; then
+# it and everything it started are stopped and the run records
+# agent_exited_abnormally. The longest successful run in the 120 days before
+# the ruling took 45 minutes. The engine-shadow step only writes comparison
+# artifacts, so it is simply given up on after its own, shorter limit.
+AGENT_TIMEOUT_SECONDS = 60 * 60
+AGENT_KILL_GRACE_SECONDS = 15
+ENGINE_SHADOW_TIMEOUT_SECONDS = 30 * 60
+
+
+class AgentTimedOut(Exception):
+    """The agent ran past AGENT_TIMEOUT_SECONDS and was stopped."""
 
 EXIT_RECORDED = 0
 EXIT_RECORD_UNWRITABLE = 1
@@ -214,20 +230,65 @@ def launch_agent(command: Sequence[str], env: Mapping[str, str]) -> int:
 
     Raises OSError when the command cannot be started at all (not found, not
     executable). The caller turns that into agent_launch_failed.
+
+    Raises AgentTimedOut when the agent is still running after
+    AGENT_TIMEOUT_SECONDS. The agent runs in its own session, so stopping it
+    stops its whole process group: the CLI's MCP servers and anything else it
+    started do not outlive the run.
     """
-    return subprocess.run(list(command), env=dict(env), cwd=str(ROOT), check=False).returncode
+    process = subprocess.Popen(
+        list(command), env=dict(env), cwd=str(ROOT), start_new_session=os.name == "posix"
+    )
+    try:
+        return process.wait(timeout=AGENT_TIMEOUT_SECONDS)
+    except subprocess.TimeoutExpired:
+        _stop_process_group(process)
+        raise AgentTimedOut() from None
+
+
+def _stop_process_group(process: "subprocess.Popen[Any]") -> None:
+    """SIGTERM to the agent's group, a grace period, then SIGKILL to whatever of
+    the group is left. Off POSIX (a developer's machine) only the agent itself."""
+
+    def signal_group(sig: int) -> None:
+        try:
+            if os.name == "posix":
+                os.killpg(process.pid, sig)
+            elif sig == signal.SIGTERM:
+                process.terminate()
+            else:
+                process.kill()
+        except OSError:  # the group is already gone
+            pass
+
+    signal_group(signal.SIGTERM)
+    try:
+        process.wait(timeout=AGENT_KILL_GRACE_SECONDS)
+    except subprocess.TimeoutExpired:
+        pass
+    signal_group(getattr(signal, "SIGKILL", signal.SIGTERM))
+    try:
+        process.wait(timeout=AGENT_KILL_GRACE_SECONDS)
+    except subprocess.TimeoutExpired:
+        _log("agent_still_running_after_kill")
 
 
 def run_engine_shadow_step(env: Mapping[str, str]) -> None:
     """The engine-shadow pipeline, as the shell wrapper ran it: one child, before
     the agent, over the same candidates. It is gated by its own setting
-    (pipeline.shadow_enabled), writes comparison artifacts only and always exits 0."""
-    subprocess.run(
-        [sys.executable, str(ROOT / "scripts" / "run_pipeline.py")],
-        env=dict(env),
-        cwd=str(ROOT),
-        check=False,
-    )
+    (pipeline.shadow_enabled), writes comparison artifacts only and always exits 0.
+    One that hangs is stopped after ENGINE_SHADOW_TIMEOUT_SECONDS and the run
+    goes on to the agent."""
+    try:
+        subprocess.run(
+            [sys.executable, str(ROOT / "scripts" / "run_pipeline.py")],
+            env=dict(env),
+            cwd=str(ROOT),
+            check=False,
+            timeout=ENGINE_SHADOW_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired:
+        _log("engine_shadow_timed_out")
 
 
 def child_environment(ctx: Any, deps: Any) -> dict[str, str]:
@@ -460,6 +521,8 @@ def launch_and_collect(
     """Launch the agent, then read its result file into a RunOutcome.
 
         the launcher raises                         failure / agent_launch_failed
+        the agent timed out, no complete result     failure / agent_exited_abnormally
+                                                    (its tickets_processed kept when readable)
         non-zero exit, no result file               failure / agent_launch_failed
         exit 0, no result file                      failure / agent_exited_abnormally
         a result that is not complete (any exit)    failure / agent_exited_abnormally
@@ -481,8 +544,11 @@ def launch_and_collect(
     types = _types()
     launch_failure: Optional[str] = None
     exit_code: Any = None
+    timed_out = False
     try:
         exit_code = deps.launch_agent(list(command), env)
+    except AgentTimedOut:
+        timed_out = True  # it started and ran: never a launch failure
     except Exception as e:  # noqa: BLE001 — whatever stopped the launch, the code is the same
         launch_failure = type(e).__name__
     if launch_failure is not None:
@@ -495,9 +561,11 @@ def launch_and_collect(
 
     clean_exit = exit_code == 0 and not isinstance(exit_code, bool)
     exit_note = None if clean_exit else f"agent_exit_code={exit_code if isinstance(exit_code, int) else 'unknown'}"
+    if timed_out:
+        exit_note = f"agent_timed_out={AGENT_TIMEOUT_SECONDS // 60}m"
     result = read_result_file(ctx.result_path, ctx.run_id)
     state = result["state"]
-    if state == RESULT_MISSING and not clean_exit:
+    if state == RESULT_MISSING and not clean_exit and not timed_out:
         _log(f"{types.AGENT_LAUNCH_FAILED}:{exit_note}")
         return types.RunOutcome(
             status=types.STATUS_FAILURE,

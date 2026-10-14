@@ -421,6 +421,19 @@ def _missing_status(w: World) -> None:
     w.agent = Agent(0, result=result)
 
 
+class TimesOut(Agent):
+    """An agent that ran past the timeout: the launcher stopped it (REV-OPEN-6).
+    It may have written a result before it hung."""
+
+    def __call__(self, command, env):
+        super().__call__(command, env)
+        raise rt.AgentTimedOut()
+
+
+def _agent_times_out(w: World) -> None:
+    w.agent = TimesOut(0)
+
+
 def _no_work(w: World) -> None:
     w.transport.respond(SEARCH_PATH, {"results": []})
 
@@ -474,6 +487,7 @@ CASES = [
     pytest.param(_exit_0_no_result, "failure", "agent_exited_abnormally", 1, id="exit-0-no-result"),
     pytest.param(_invalid_json, "failure", "agent_exited_abnormally", 1, id="invalid-json"),
     pytest.param(_missing_status, "failure", "agent_exited_abnormally", 1, id="missing-status"),
+    pytest.param(_agent_times_out, "failure", "agent_exited_abnormally", 1, id="agent-timed-out"),
     pytest.param(_no_work, "success", None, 0, id="no-work"),
     pytest.param(_paused, "skipped", None, 0, id="paused"),
     pytest.param(_rerun_only, "success", None, 1, id="rerun-only"),
@@ -545,6 +559,45 @@ def test_an_agent_that_exits_without_a_complete_result_is_agent_exited_abnormall
     assert world.record["status"] == "failure"
     assert world.record["failure_reason_code"] == "agent_exited_abnormally"
     assert world.record["tickets_processed"] == kept
+
+
+def test_an_agent_that_times_out_with_no_result_is_agent_exited_abnormally_not_a_launch_failure(
+    world: World,
+) -> None:
+    # REV-OPEN-6 (owner ruling 2026-10-14): a hung agent is stopped, and its run
+    # still ends in exactly one record, saying it stopped before it finished.
+    _agent_times_out(world)
+    assert world.run() == 0
+    assert world.record["status"] == "failure"
+    assert world.record["failure_reason_code"] == "agent_exited_abnormally"
+    assert world.record["tickets_processed"] == 0
+    assert f"agent_timed_out={rt.AGENT_TIMEOUT_SECONDS // 60}m" in world.record["error_summary"]
+
+
+def test_an_agent_that_times_out_mid_run_keeps_the_readable_count(world: World) -> None:
+    result = _result()
+    del result["status"]
+    world.agent = TimesOut(0, result=result)
+    world.run()
+    assert world.record["failure_reason_code"] == "agent_exited_abnormally"
+    assert world.record["tickets_processed"] == 3
+    assert "agent_timed_out=" in world.record["error_summary"]
+
+
+def test_an_agent_that_finished_its_result_and_then_hung_keeps_the_result_and_notes_the_timeout(
+    world: World,
+) -> None:
+    world.agent = TimesOut(0, result=_result())
+    world.run()
+    assert world.record["status"] == "success"
+    assert world.record["failure_reason_code"] is None
+    assert world.record["tickets_processed"] == 3
+    assert "agent_timed_out=" in world.record["error_summary"]
+
+
+def test_the_agent_timeout_sits_above_the_longest_run_seen() -> None:
+    # The longest successful run in the 120 days before 2026-10-14 took 45 min.
+    assert rt.AGENT_TIMEOUT_SECONDS >= 50 * 60
 
 
 def test_a_result_of_another_run_is_not_this_runs_result(world: World) -> None:
@@ -1704,25 +1757,29 @@ def test_launch_agent_starts_the_command_it_is_given_and_returns_its_exit_code(
     seen: list[tuple] = []
 
     class Done:
-        returncode = 7
+        pid = 4242
 
-    def fake_run(command, **kwargs):
-        seen.append((command, kwargs))
-        return Done()
+        def __init__(self, command, **kwargs):
+            seen.append((command, kwargs))
 
-    monkeypatch.setattr(subprocess, "run", fake_run)
+        def wait(self, timeout=None):
+            seen.append(("wait", timeout))
+            return 7
+
+    monkeypatch.setattr(subprocess, "Popen", Done)
     assert rt.launch_agent(("claude", "-p", "/x"), {"A": "1"}) == 7
-    ((command, kwargs),) = seen
+    (command, kwargs), waited = seen
     assert command == ["claude", "-p", "/x"]
     assert kwargs["env"] == {"A": "1"}
     assert kwargs["cwd"] == str(PACKAGE_ROOT)
-    assert kwargs.get("check") is False
+    assert kwargs["start_new_session"] is (os.name == "posix")  # its own group, stopped as one
+    assert waited == ("wait", rt.AGENT_TIMEOUT_SECONDS)
 
 
 def test_a_command_that_cannot_be_started_raises_out_of_launch_agent(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(subprocess, "run", _raiser(FileNotFoundError("claude")))
+    monkeypatch.setattr(subprocess, "Popen", _raiser(FileNotFoundError("claude")))
     with pytest.raises(OSError):
         rt.launch_agent(["claude"], {})
 
@@ -1738,6 +1795,7 @@ def test_the_engine_shadow_step_is_the_pipeline_script_as_a_child(
     assert kwargs["env"] == {"PACKN_SOURCE_MODE": "hubspot"}
     assert kwargs["cwd"] == str(PACKAGE_ROOT)
     assert kwargs.get("check") is False
+    assert kwargs["timeout"] == rt.ENGINE_SHADOW_TIMEOUT_SECONDS
 
 
 def test_the_fake_launcher_has_the_real_launchers_positional_parameters() -> None:

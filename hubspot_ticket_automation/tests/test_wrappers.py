@@ -29,9 +29,16 @@ RUN_TICKETS_SH = PACKAGE_ROOT / "scripts" / "run_tickets.sh"
 POLL_SH = PACKAGE_ROOT / "scripts" / "poll_manual_runs.sh"
 SKILL = PACKAGE_ROOT / ".claude" / "skills" / "hubspot-tickets" / "SKILL.md"
 
-ORCHESTRATOR_CALL = '.venv/bin/python scripts/run_tickets.py "$@" || RUN_STATUS=$?'
-FORWARD_CALL = ".venv/bin/python scripts/forward_action_items.py"
-COMPLAINTS_CALL = ".venv/bin/python scripts/write_complaints.py"
+# Each child closes the run lock's descriptor (9>&-), so nothing the run starts
+# can keep the lock after the wrapper has gone (REV-OPEN-6).
+ORCHESTRATOR_CALL = '.venv/bin/python scripts/run_tickets.py "$@" 9>&- || RUN_STATUS=$?'
+FORWARD_CALL = ".venv/bin/python scripts/forward_action_items.py 9>&-"
+COMPLAINTS_CALL = ".venv/bin/python scripts/write_complaints.py 9>&-"
+RUN_LOCK = 'RUN_LOCK="outputs/runs/.run_tickets.lock"'
+TAKE_LOCK = 'exec 9>"$RUN_LOCK"'
+TRY_LOCK = "flock -n -E 75 9; LOCK_STATUS=$?"
+LOCK_HELD = 'if [ "$LOCK_STATUS" -eq 75 ]; then'
+POLL_PROBE = 'flock -n -E 75 "$RUN_LOCK" true; LOCK_STATUS=$?'
 MANUAL_CALL = 'exec bash scripts/run_tickets.sh --manual-request "$REQUEST_ID"'
 
 
@@ -92,7 +99,11 @@ def test_the_two_post_steps_always_run_after_the_orchestrator() -> None:
     assert between == [FORWARD_CALL, COMPLAINTS_CALL]
     environment = commands.index("if [ -r /etc/environment ]; then set -a; . /etc/environment; set +a; fi")
     assert environment < orchestrator
-    assert not [line for line in commands[:complaints] if re.match(r"\s*(exit|return)\b", line)]
+    # the only early exit is the lock's skip, before the orchestrator starts
+    early_exits = [i for i, line in enumerate(commands[:complaints]) if re.match(r"\s*(exit|return)\b", line)]
+    assert len(early_exits) == 1 and early_exits[0] < orchestrator
+    assert commands[early_exits[0]].strip() == "exit 0"
+    assert commands[early_exits[0] - 2].strip() == LOCK_HELD
 
 
 def test_the_wrapper_exits_with_the_orchestrators_status() -> None:
@@ -116,6 +127,30 @@ def test_the_wrappers_header_says_why_the_filename_stays() -> None:
     assert "filename" in text and "crontab" in text
     # the crontab example still names this script
     assert "bash scripts/run_tickets.sh >> outputs/runs/cron-tickets.log 2>&1" in text
+
+
+def test_the_wrapper_takes_the_run_lock_before_anything_runs() -> None:
+    # REV-OPEN-6 (owner ruling 2026-10-14): one tickets run at a time. A tick
+    # that finds a run in flight is skipped; that run writes its own record.
+    commands = [line.strip() for line in _commands(RUN_TICKETS_SH)]
+    for line in (RUN_LOCK, "mkdir -p outputs/runs", TAKE_LOCK, TRY_LOCK, LOCK_HELD):
+        assert line in commands, line
+    assert commands.index(RUN_LOCK) < commands.index(TAKE_LOCK) < commands.index(TRY_LOCK)
+    assert commands.index(TRY_LOCK) < commands.index(ORCHESTRATOR_CALL)
+
+
+def test_a_lock_that_cannot_be_taken_for_another_reason_does_not_stop_the_run() -> None:
+    # Only flock's conflict code (75) skips the run. A missing flock or any
+    # other error runs as before rather than going silent.
+    text = _text(RUN_TICKETS_SH)
+    assert "-E 75" in text and "-eq 75" in text
+    assert "flock -n 9 ||" not in text and "if ! flock" not in text
+
+
+def test_no_child_of_the_wrapper_inherits_the_lock() -> None:
+    children = [line for line in _commands(RUN_TICKETS_SH) if line.strip().startswith(".venv/bin/python")]
+    assert len(children) == 3
+    assert all("9>&-" in line for line in children)
 
 
 # -------------------------------------------------------- poll_manual_runs.sh
@@ -142,6 +177,15 @@ def test_the_poll_script_still_claims_one_request_and_reads_its_id() -> None:
     assert "client.claim_pending_manual_run()" in text
     assert "REQUEST_ID=$(echo \"$CLAIMED\" | py -c \"import sys,json; print(json.load(sys.stdin)['request_id'])\")" in text
     assert text.index("REQUEST_ID=$(") < text.index(MANUAL_CALL)
+
+
+def test_run_now_waits_while_a_tickets_run_holds_the_lock() -> None:
+    # The request stays pending (it is not claimed) and is picked up by the
+    # first poll after the run in flight ends.
+    commands = [line.strip() for line in _commands(POLL_SH)]
+    assert RUN_LOCK in commands and POLL_PROBE in commands and LOCK_HELD in commands
+    text = _text(POLL_SH)
+    assert text.index(POLL_PROBE) < text.index("client.claim_pending_manual_run()")
 
 
 def test_the_poll_scripts_comments_describe_the_wrapper_not_the_old_launch() -> None:

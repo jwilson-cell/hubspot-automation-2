@@ -42,6 +42,18 @@ set -u
 
 cd "$(dirname "$0")/.."
 
+# While a tickets run holds its lock (scripts/run_tickets.sh, REV-OPEN-6), claim
+# nothing: the request stays pending and the first poll after that run ends
+# picks it up, instead of claiming it into a run that would be skipped. This
+# also holds back a `digest` request for the length of a tickets run. Only
+# flock's conflict code (75) waits; any other flock error goes on as before.
+RUN_LOCK="outputs/runs/.run_tickets.lock"
+mkdir -p outputs/runs
+flock -n -E 75 "$RUN_LOCK" true; LOCK_STATUS=$?
+if [ "$LOCK_STATUS" -eq 75 ]; then
+    exit 0
+fi
+
 # Atomically claim one pending request. Prints a JSON-ish line to stdout
 # on success ({routine: "...", request_id: "..."}) or nothing if the queue
 # is empty.

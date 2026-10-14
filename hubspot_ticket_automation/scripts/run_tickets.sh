@@ -47,6 +47,24 @@
 set -u
 cd "$(dirname "$0")/.."
 
+# One tickets run at a time (REV-OPEN-6, owner ruling 2026-10-14). Without it a
+# scheduled tick and a pressed Run now could overlap and list the same tickets.
+# A run that finds the lock held is skipped: the run in flight writes its own
+# record, and this one exits 0 so the cron line is not a failure. Only flock's
+# conflict code (75) skips; if the lock cannot be taken for any other reason
+# (no flock, a file error) the run goes ahead unlocked, as before, rather than
+# going silent. The lock lives on descriptor 9 of THIS shell only: every child
+# below closes it (9>&-), so nothing a run starts can hold it after the run.
+# The agent itself is time-limited by scripts/run_tickets.py.
+RUN_LOCK="outputs/runs/.run_tickets.lock"
+mkdir -p outputs/runs
+exec 9>"$RUN_LOCK"
+flock -n -E 75 9; LOCK_STATUS=$?
+if [ "$LOCK_STATUS" -eq 75 ]; then
+    echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] run_tickets: another tickets run is still in flight; this one is skipped"
+    exit 0
+fi
+
 # Cron daemons do NOT reliably inherit /etc/environment — source it explicitly
 # so PACKN_OS_DATABASE_URL resolves under cron's minimal env (Phase 20: without
 # this, the complaint writer would log-and-exit-0 forever under D-04's
@@ -56,18 +74,18 @@ if [ -r /etc/environment ]; then set -a; . /etc/environment; set +a; fi
 # 1) The orchestrator. Its exit status is kept and returned at the end; it does
 #    not decide whether the post steps run.
 RUN_STATUS=0
-.venv/bin/python scripts/run_tickets.py "$@" || RUN_STATUS=$?
+.venv/bin/python scripts/run_tickets.py "$@" 9>&- || RUN_STATUS=$?
 
 # 2) Deterministic forward: drain the queue the skill just wrote and POST each
 #    ticket's non-empty action_items to the OS ingestion route. Idempotent
 #    (forward-once seen-set + OS-side dedup) and non-blocking (always exits 0),
 #    so it can never fail the cron. Runs whatever the orchestrator returned
 #    (and on ticks with no agent launch it simply drains any leftovers).
-.venv/bin/python scripts/forward_action_items.py
+.venv/bin/python scripts/forward_action_items.py 9>&-
 
 # 3) Deterministic complaint mirror: re-scan outputs/kpi/mispack_log.csv and
 #    INSERT customer_complaints rows (ON CONFLICT DO NOTHING — Phase 20 D-02/D-04).
 #    Non-blocking (always exits 0) — can never fail the cron.
-.venv/bin/python scripts/write_complaints.py
+.venv/bin/python scripts/write_complaints.py 9>&-
 
 exit "$RUN_STATUS"
