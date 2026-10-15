@@ -69,7 +69,7 @@ Until set, default threshold in the automation is **$1,000**.
 > 2. The damaged product itself.
 > 3. The internal packaging — how it was padded when opened.
 >
-> Please send these within 10 calendar days of delivery so we stay inside the carrier's claim window. Once I have the photos I'll open the carrier claim and investigate our packaging record in parallel. I'll have a root-cause proposal and a credit/reship recommendation within 3 business days of receiving the full photo set.
+> Please send these within 10 calendar days of delivery so we stay inside the carrier's claim window. Once I have the photos I'll review our packing record and escalate a reship for review; any carrier claim runs separately on our side, so you won't be waiting on the carrier.
 
 **When Pack'N is clearly at fault (e.g., known mispack SOP failure):**
 > I've reviewed the wave record — this one's on us; the packaging spec wasn't followed for SKU {sku}. I'm escalating a reship at no cost to you {today/tomorrow} and flagging the packaging SOP for review so it doesn't recur. I'll confirm tracking within {timeline}.

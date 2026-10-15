@@ -11,7 +11,7 @@ Ticket context:
 
 Category: `{category}`
 
-Knowledge base context (retrieved docs):
+Knowledge base context (starts with the RULEBOOK for this ticket type, then the retrieved docs):
 ```
 {kb_context}
 ```
@@ -132,14 +132,14 @@ Rules:
    about the same issue, treat the current ticket as a re-open — your
    reply should not assume the prior resolution worked.
 
-## Category-specific hints
+## Ticket-type rulebook
 
-- `wismo_tracking` / `shipping_delay`: when `ssk_state` is present, use it as above. When absent, check carrier state in the KB — only recommend waiting if the carrier state genuinely warrants it. If `In Transit` with no scans for 3+ business days, propose filing a lost-package investigation.
-- `damaged_goods`: ask for the required photo set (see `kb/damage_claims.md`) unless the customer already sent them.
-- `mispack_wrong_item`: ask for order #, SKU received, SKU expected, and (if available) a photo of the shipping label.
-- `billing_invoice`: never quote rates from memory — if the KB has them, cite; if not, say a billing specialist will follow up.
-- `retailer_compliance`: treat chargebacks seriously; reference the specific routing-guide clause only if it's in the KB.
-- `other_unclassified`: keep it short, acknowledge receipt, ask for clarifying info, and flag as action item for human triage.
+The knowledge base context starts with a RULEBOOK: Pack'N's rules for every ticket, then the rules for this ticket's type. Use it this way:
+
+1. Find the row under "Situations" that matches this ticket, write the reply it describes, and flag the action item it names.
+2. Ask only for the "Ask for" items that are actually missing.
+3. Where the rulebook disagrees with a KB doc or with anything else in this prompt, the rulebook wins.
+4. A topic listed under "Not decided yet" gets "let me confirm with the team", never a guess.
 
 ## Output
 

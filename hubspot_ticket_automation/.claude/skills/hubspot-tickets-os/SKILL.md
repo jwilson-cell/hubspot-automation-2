@@ -186,6 +186,7 @@ If confidence < 0.5, force `category = other_unclassified` regardless of the mod
 
 #### 2c. Retrieve KB context
 
+- **First, the rulebook:** `kb/rulebook/_global.md` and `kb/rulebook/<category>.md` (e.g. `kb/rulebook/damaged_goods.md`). It is Pack'N's policy for the ticket type, generated from Pack'N OS; it is never cut by the KB cap below, and where it disagrees with a KB doc the rulebook wins. Follow its Situations rows when drafting (2d) and flag the action item each row names when extracting (2e).
 - Always include `kb/brand_voice.md` and `kb/glossary.md`.
 - Always include the KB file that matches the category (e.g., `damaged_goods` → `kb/damage_claims.md`). See mapping in `kb/categories.md`.
 - If relevant, also grep `kb/**/*.md` for any domain terms mentioned in the ticket (SKU, carrier name, retailer name).

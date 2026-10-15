@@ -6,7 +6,7 @@ Covers: `wismo_tracking`, `shipping_delay`, `address_recipient`.
 
 1. **In Transit, scans < 24h old** → normal. Reassure customer, no action needed beyond setting expectations.
 2. **In Transit, last scan 24–72h old** → still usually normal for ground. Acknowledge the gap, tell customer you're monitoring, but DO NOT promise an autonomous check-in on a specific future date (the system won't remind anyone). Frame the next step as customer-initiated: "reply back if you don't see an update in the next 24–48 hours and we'll escalate to the carrier."
-3. **In Transit, last scan 3+ business days old** → escalate. File a **carrier trace/investigation** with the carrier. Don't promise a reship until the trace results come back (typically 3–5 business days).
+3. **In Transit, last scan 3+ business days old** → escalate. File a **carrier trace/investigation** with the carrier, and escalate a reship/refund for review at the same time. The customer never waits on the trace (see `kb/rulebook/`).
 4. **Delivered, customer says not received** → check POD for signature, delivery location note, photo (if carrier captured one). Steps:
    - Ask customer to check with neighbors, household, leasing office.
    - Look at GPS coordinates on the POD if available.
@@ -50,7 +50,7 @@ Covers: `wismo_tracking`, `shipping_delay`, `address_recipient`.
 > Your order shipped on {date} via {carrier} tracking {number}. The most recent scan is {status} at {location} on {date}. For {carrier} ground this is still within the normal window. If there's no movement in the next 2–3 business days, reply back here and we'll open a trace immediately.
 
 **When delivered but not received:**
-> The carrier marked this delivered on {date} at {time}. Could you check with anyone who might have accepted it (household, office, neighbors, leasing office)? If you can't locate it after checking, reply here — we'll file a lost-package claim with {carrier} right away. The claim process itself takes about {X} business days to resolve once filed, and we'll align on reship or refund from there.
+> The carrier marked this delivered on {date} at {time}. Could you check with anyone who might have accepted it (household, office, neighbors, leasing office)? If you can't locate it after checking, reply here and we'll make it right. (Internally: the reship/refund is escalated for review and a lost-package claim is filed in parallel; the customer's resolution never waits on the claim.)
 
 **When it's a simple "still in transit, be patient":**
 > Tracking shows your order {current status} as of {last scan date}. For {carrier} ground service, {N}–{M} business days is normal. If you haven't seen an update past that window, reply back and we'll open a trace.
