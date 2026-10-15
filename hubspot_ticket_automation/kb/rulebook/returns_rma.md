@@ -1,4 +1,4 @@
-<!-- GENERATED from packn-os src/lib/tickets/reply-rulebook.ts (version 2026-10-15.1). Do not edit here: edit the OS file and run scripts/export-reply-rulebook.ts. -->
+<!-- GENERATED from packn-os src/lib/tickets/reply-rulebook.ts (version 2026-10-15.2). Do not edit here: edit the OS file and run scripts/export-reply-rulebook.ts. -->
 
 ## returns_rma: A return
 

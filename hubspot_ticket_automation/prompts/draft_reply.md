@@ -46,6 +46,13 @@ Knowledge base context (starts with the RULEBOOK for this ticket type, then the 
 
 If `{ticket_context}` contains an `ssk_state` object AND `ssk_state.found == true`, cite it directly — this is **live data from our WMS** and should anchor the reply instead of hedged boilerplate. Use these rules:
 
+**`ssk_state.sla_status` is the order's ship-window status from Pack'N's /sla, and it alone decides whether Pack'N missed its commitment** (the rulebook's ship-window rows). Never work it out yourself from dates in the ticket or the WMS data.
+
+- `late` (not shipped, past the window) or `shipped_late`: own the miss plainly.
+- `on_track`, `due_today`, `held` (pre-order, on hold or scheduled), `excused` or `shipped_on_time`: not a miss. Never apologise for one.
+- `not_scored`, `null`, or absent: say nothing about whether the order is late.
+- Never quote a ship-by date or a cutoff time, whatever the status.
+
 **If `ssk_state.order.fulfillment_status` is exactly `fulfilled` and `shipments[0]` has a `tracking_code`:**
 
 (`fulfilled` means FULLY fulfilled. A `partial` / `partially_fulfilled` / `partially fulfilled` status is NOT this branch — see the partial-fulfillment branch below. Never round a partial status up to "your order has been fulfilled".)

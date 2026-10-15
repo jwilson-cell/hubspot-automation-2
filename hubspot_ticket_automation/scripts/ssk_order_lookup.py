@@ -54,6 +54,7 @@ Output (stdout JSON):
           "updated_at": "..."
         }
       ],
+      "sla_status": "<the order's /sla verdict from Pack'N OS, or null; only when found=true>",
       "not_found_reason": "<string, only when found=false>"
     }
 
@@ -334,6 +335,26 @@ def _search_orders(needle: str, token: str, base_url: str) -> dict | None:
     return None
 
 
+def _sla_status(order_id: str) -> str | None:
+    """The order's /sla verdict from Pack'N OS (GET /api/tickets/order-sla), or
+    None. FAIL-OPEN, unlike the tickets client's own rule: a missing secret, an
+    unreachable OS or any refusal leaves the verdict null and the lookup goes
+    on; the drafter then says nothing about whether the order is late
+    (rulebook, shipping_delay). Logged to stderr as a code, never a body."""
+    if not order_id:
+        return None
+    if str(ROOT) not in sys.path:
+        sys.path.insert(0, str(ROOT))
+    try:
+        from packn_os_hubspot_client import tickets_api
+
+        return tickets_api.fetch_order_sla(order_id)
+    except Exception as err:  # noqa: BLE001 - fail-open by design
+        code = getattr(err, "code", type(err).__name__)
+        print(f"[ssk_order_lookup] sla_status unavailable: {code}", file=sys.stderr)
+        return None
+
+
 def _get_order(order_id: str, token: str, base_url: str) -> dict | None:
     data = _get(f"/orders/{order_id}", token, base_url)
     if not data:
@@ -417,6 +438,7 @@ def main() -> int:
         "merchant_scope": merchant_scope,
         "order": _normalize_order(order),
         "shipments": shipments,
+        "sla_status": _sla_status(order_id),
     }
     print(json.dumps(result, indent=2))
     return 0

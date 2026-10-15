@@ -1,4 +1,4 @@
-<!-- GENERATED from packn-os src/lib/tickets/reply-rulebook.ts (version 2026-10-15.1). Do not edit here: edit the OS file and run scripts/export-reply-rulebook.ts. -->
+<!-- GENERATED from packn-os src/lib/tickets/reply-rulebook.ts (version 2026-10-15.2). Do not edit here: edit the OS file and run scripts/export-reply-rulebook.ts. -->
 
 ## Every ticket type
 1. Open with one sentence restating the issue. Keep the reply to 80-200 words. No em dashes. Contractions are fine.

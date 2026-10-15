@@ -1,0 +1,23 @@
+{
+  "contract_version": "1",
+  "known_order": {
+    "contract_version": "1",
+    "ssk_order_id": "cmfixtureorder00000000001",
+    "verdict": "late"
+  },
+  "unknown_order": {
+    "contract_version": "1",
+    "ssk_order_id": "cmfixtureorder00000000002",
+    "verdict": null
+  },
+  "verdicts": [
+    "on_track",
+    "due_today",
+    "late",
+    "held",
+    "excused",
+    "not_scored",
+    "shipped_on_time",
+    "shipped_late"
+  ]
+}

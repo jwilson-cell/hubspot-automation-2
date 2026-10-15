@@ -1,10 +1,12 @@
 """Signed client for the Pack'N OS tickets routes (contract packn-tickets-v1).
 
 Phase 93. The cron gets its work list and its ticket data from the OS over
-four signed routes, and reports each pass back:
+four signed routes, and reports each pass back; a fifth (2026-10-15) answers
+one order's /sla verdict for the reply drafter:
 
     fetch_unprocessed(limit)                      GET  /api/tickets/unprocessed
     fetch_ticket(ticket_ref)                      GET  /api/tickets/<ref>
+    fetch_order_sla(ssk_order_id)                 GET  /api/tickets/order-sla
     post_classification(os_ticket_id, payload)    POST /api/tickets/<id>/classification
     post_source_shadow_observations(payload)      POST /api/tickets/source-shadow
 
@@ -101,6 +103,20 @@ _SOURCE_SHADOW_VERDICTS = {
 # A ticket ref is an OS uuid or a HubSpot numeric id. Anything else would need
 # encoding in the path, and the path is signed exactly as it is requested.
 _REF_PATTERN = re.compile(r"[A-Za-z0-9-]{1,64}")
+
+# GET /api/tickets/order-sla: the id rule and the closed verdict list, as the
+# contract states them (tests/fixtures/tickets-api-order-sla.v1.json).
+_SSK_ORDER_ID_PATTERN = re.compile(r"[A-Za-z0-9_-]{1,64}")
+ORDER_SLA_VERDICTS = (
+    "on_track",
+    "due_today",
+    "late",
+    "held",
+    "excused",
+    "not_scored",
+    "shipped_on_time",
+    "shipped_late",
+)
 _ERROR_BODY_CAP = 65536
 
 
@@ -495,6 +511,40 @@ def fetch_ticket(
     parsed = _json_object(route, status, raw)
     _log(f"{route} -> HTTP {status} count=1")
     return parsed
+
+
+def fetch_order_sla(
+    ssk_order_id: str,
+    *,
+    base_url: Optional[str] = None,
+    secret: Optional[str] = None,
+    now: Optional[Callable[[], float]] = None,
+    opener: Optional[Callable[..., Any]] = None,
+) -> Optional[str]:
+    """One order's /sla verdict (one of ORDER_SLA_VERDICTS), or None when /sla
+    knows nothing about the order. Raises TicketsApiError on every failure,
+    including a verdict outside the contract's list.
+
+    The request is exactly `/api/tickets/order-sla?contract_version=1&ssk_order_id=<id>`.
+    """
+    text = str(ssk_order_id)
+    if not _SSK_ORDER_ID_PATTERN.fullmatch(text):
+        raise ValueError("an SSK order id is 1-64 of A-Z a-z 0-9 _ -")
+    pairs = [("contract_version", CONTRACT_VERSION), ("ssk_order_id", text)]
+    route = "order_sla"
+    status, raw = _send(
+        route, "GET", "/api/tickets/order-sla", pairs, b"",
+        base_url=base_url, secret=secret, now=now, opener=opener,
+    )
+    if not 200 <= status < 300:
+        raise _refused(route, status)
+    parsed = _json_object(route, status, raw)
+    verdict = parsed.get("verdict")
+    if verdict is not None and verdict not in ORDER_SLA_VERDICTS:
+        _log(f"{route} -> HTTP {status} with a verdict outside the contract")
+        raise TicketsApiError("list_error", http_status=status)
+    _log(f"{route} -> HTTP {status} count={0 if verdict is None else 1}")
+    return verdict
 
 
 def post_classification(

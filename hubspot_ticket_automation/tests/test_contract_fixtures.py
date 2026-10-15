@@ -36,7 +36,14 @@ cron posts once per run while the ticket source setting is `shadow`:
 
     tickets-api-source-shadow.v1.json    POST /api/tickets/source-shadow
 
-It is pinned the same way, and the last part ties the cron's observation
+A seventh (2026-10-15) is one order's /sla verdict, which the order lookup
+(scripts/ssk_order_lookup.py) attaches to ssk_state.sla_status:
+
+    tickets-api-order-sla.v1.json        GET /api/tickets/order-sla
+
+Its verdict list is tickets_api.ORDER_SLA_VERDICTS, checked below.
+
+The source-shadow file is pinned the same way, and the last part ties the cron's observation
 builder (`source_shadow.build_observation`, plan 18) to it: built from the
 fixture's own inputs, the body equals the fixture key for key.
 
@@ -65,6 +72,7 @@ SLUGS_FIXTURE = "ticket-category-slugs.v1.json"
 CLASSIFICATION_FIXTURE = "tickets-api-classification.v1.json"
 ENVELOPE_FIXTURE = "action-items-envelope.v1.json"
 SOURCE_SHADOW_FIXTURE = "tickets-api-source-shadow.v1.json"
+ORDER_SLA_FIXTURE = "tickets-api-order-sla.v1.json"
 
 # The literals of 93-04-SUMMARY ("Fixtures"). Pack'N OS asserts the same three in
 # tests/unit/tickets/cron-contract.test.ts.
@@ -78,6 +86,7 @@ PINNED_CHECKSUMS = {
     ENVELOPE_FIXTURE: "3a69a7248dcc20e4695bc94900fb96a1621712896d2c43a4cf124f4f84677872",
     # 93-07-SUMMARY ("Fixture"): 1637 bytes. One source-shadow observation body.
     SOURCE_SHADOW_FIXTURE: "aaae17278097985cb9b5d98479e0df402b03d2229b937b58be6e23611bdb3abf",
+    ORDER_SLA_FIXTURE: "9926d340e81806da1687363ebf424564397b17091290fd22cdf407b15a63efa5",
 }
 
 # The four top-level keys of config/categories.yaml that are not categories.
@@ -523,3 +532,12 @@ def test_the_observations_limits_and_categories_are_the_contracts() -> None:
             expected["run_id"], OBSERVATION_STARTED_AT, OBSERVATION_SETTINGS, hubspot_side, os_side
         )
         assert built["hubspot"]["selected"][0]["category"] == slug
+
+
+def test_the_order_sla_verdicts_are_the_contracts() -> None:
+    from packn_os_hubspot_client import tickets_api
+
+    fixture = json.loads(read_fixture_text(ORDER_SLA_FIXTURE))
+    assert list(tickets_api.ORDER_SLA_VERDICTS) == fixture["verdicts"]
+    assert fixture["known_order"]["verdict"] in tickets_api.ORDER_SLA_VERDICTS
+    assert fixture["unknown_order"]["verdict"] is None
