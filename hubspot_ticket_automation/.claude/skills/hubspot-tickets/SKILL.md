@@ -17,7 +17,7 @@ Specifically:
 - **Do NOT fetch file URLs, file contents, or file IDs** via any MCP tool (HubSpot files API, URL fetchers, `WebFetch`, etc.) for attachments discovered on a ticket.
 - **If any MCP response returns image content blocks**, ignore the image payload entirely. Treat the response as text-only. Do not describe, analyze, or re-reference the image in subsequent turns.
 - **Detect attachment presence only** by checking whether `hs_num_associated_deals` / associated-files count is non-zero, or by noting that the ticket body mentions an attachment. Record this in `ticket_context.has_attachments: true` and include a reviewer note — nothing more.
-- **Draft language when attachments are present**: "Customer indicated files were attached — the draft reviewer should open the HubSpot ticket to view them before sending." Do not write "thanks for the screenshot" or otherwise pretend to have seen the file.
+- **Draft language when attachments are present**: the draft does not mention the attachment and never pretends to have seen it (no "thanks for the screenshot"). The reviewer opens the ticket to view the files; `has_attachments: true` tells them to.
 
 **If you encounter a `Could not process image` or similar image-processing error mid-run:** abandon the current ticket immediately, record the ticket_id in the run log under `skipped_image_error`, and move to the next ticket. Never retry an image-poisoned request.
 
@@ -534,11 +534,12 @@ If confidence < 0.5, force `category = other_unclassified` regardless of the mod
 
 Read `prompts/draft_reply.md`. Fill in `{ticket_context}`, `{kb_context}`, `{category}`. Produce a reply that:
 
-- Opens by restating what you understand the issue to be.
+- Is the email body only: plain text, no markdown or asterisks, no subject line, no preamble, no notes for the reviewer, no ticket ids.
+- Leads with the answer or the current status; it does not restate the customer's message.
 - References specific identifiers the customer provided (order #, PO#, tracking #).
 - Uses 3PL vocabulary where appropriate (SKU, ASN, wave, cycle count, disposition, BOL, POD).
 - Includes next steps or requests for missing info.
-- Ends with a standard sign-off from `brand_voice.md` (until Pack'N-specific sign-off is filled in, use a neutral placeholder).
+- Ends with "Pack'N Support" on its own line.
 - Never invents facts (rate numbers, SLA commitments, policies not in the KB). If the KB lacks it, say "let me confirm with the team" and add a corresponding action item.
 
 #### 2e. Extract action items

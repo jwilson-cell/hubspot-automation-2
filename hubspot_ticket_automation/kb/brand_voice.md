@@ -11,7 +11,7 @@
 
 ## Structure
 
-1. One-sentence restatement of the issue.
+1. The answer or the current status (don't restate their message).
 2. What Pack'N is doing about it, OR what you need from the customer to proceed.
 3. Timeline (when they'll hear back).
 4. Sign-off.
@@ -36,7 +36,7 @@
 Default placeholder used until filled:
 
 ```
-— Pack'N Support
+Pack'N Support
 ```
 
 ## Escalation contacts

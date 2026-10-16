@@ -1,4 +1,4 @@
-<!-- GENERATED from packn-os src/lib/tickets/reply-rulebook.ts (version 2026-10-15.2). Do not edit here: edit the OS file and run scripts/export-reply-rulebook.ts. -->
+<!-- GENERATED from packn-os src/lib/tickets/reply-rulebook.ts (version 2026-10-16.1). Do not edit here: edit the OS file and run scripts/export-reply-rulebook.ts. -->
 
 ## inbound_asn_receiving: My inbound had issues
 

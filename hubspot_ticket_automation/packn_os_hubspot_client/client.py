@@ -75,6 +75,7 @@ import psycopg
 from psycopg.rows import dict_row
 
 from .db import get_pool
+from .draft_text import clean_draft_body
 from .tenant import TENANT_ID
 
 logger = logging.getLogger(__name__)
@@ -175,6 +176,8 @@ def write_draft(
         raise ValueError(
             "hubspot_ticket_snapshot must include 'captured_at' ISO timestamp"
         )
+    # The stored draft is the email alone (2026-10-16).
+    draft_body = clean_draft_body(draft_body)
 
     with get_pool().connection() as conn:
         with conn.cursor() as cur:
@@ -377,6 +380,8 @@ def replace_pending_draft(
     if CYCLE_SEPARATOR in base_prompt_version:
         raise ValueError("base_prompt_version already carries a cycle key")
     os_id = _optional_uuid("os_ticket_id", os_ticket_id)
+    # The stored draft is the email alone (2026-10-16).
+    draft_body = clean_draft_body(draft_body)
 
     new_id = str(uuid.uuid4())
     prompt_version = f"{base_prompt_version}{CYCLE_SEPARATOR}{cycle_key}"

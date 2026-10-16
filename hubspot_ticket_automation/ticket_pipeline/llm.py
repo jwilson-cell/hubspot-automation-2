@@ -382,7 +382,10 @@ def draft(ticket_context: dict, category: str, kb_context: str, usages: list[dic
     )
     text, usage = _call(DRAFT_MODEL, DRAFT_MAX_TOKENS, prompt, thinking_disabled=True)
     usages.append(usage)
-    return text.strip()
+    # The draft is the email alone (2026-10-16): no markdown, no wrapper lines.
+    from packn_os_hubspot_client.draft_text import clean_draft_body
+
+    return clean_draft_body(text)
 
 
 def extract_actions(
